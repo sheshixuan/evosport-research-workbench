@@ -1,0 +1,477 @@
+"""Shared DB state for news workflow worker/API/orchestrator."""
+
+from __future__ import annotations
+
+from datetime import timedelta
+from utils.utcnow import utcnow
+from typing import Any, Optional
+
+from sqlalchemy import select, update
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from config import settings as app_settings
+from models.database import (
+    AppSettings,
+    NewsTradeIntent,
+    NewsWorkflowControl,
+    NewsWorkflowFinding,
+    NewsWorkflowSnapshot,
+)
+from services.event_bus import event_bus
+from services.shared_state import _commit_with_retry
+from services.market_tradability import get_market_tradability_map
+from utils.converters import format_iso_utc_z, parse_iso_datetime
+
+NEWS_SNAPSHOT_ID = "latest"
+NEWS_CONTROL_ID = "default"
+
+def _default_status() -> dict[str, Any]:
+    return {
+        "running": False,
+        "enabled": True,
+        "interval_seconds": 120,
+        "last_scan": None,
+        "next_scan": None,
+        "current_activity": "Waiting for news worker.",
+        "last_error": None,
+        "degraded_mode": False,
+        "budget_remaining": None,
+        "stats": {},
+    }
+
+
+async def write_news_snapshot(
+    session: AsyncSession,
+    status: dict[str, Any],
+    stats: Optional[dict[str, Any]] = None,
+) -> None:
+    has_last_scan = "last_scan" in status
+    has_next_scan = "next_scan" in status
+    has_last_error = "last_error" in status
+    has_budget_remaining = "budget_remaining" in status
+
+    last_scan = status.get("last_scan")
+    if has_last_scan and isinstance(last_scan, str):
+        last_scan = parse_iso_datetime(last_scan, naive=True) or utcnow()
+
+    next_scan = status.get("next_scan")
+    if has_next_scan and isinstance(next_scan, str):
+        next_scan = parse_iso_datetime(next_scan, naive=True)
+
+    result = await session.execute(select(NewsWorkflowSnapshot).where(NewsWorkflowSnapshot.id == NEWS_SNAPSHOT_ID))
+    row = result.scalar_one_or_none()
+    if row is None:
+        row = NewsWorkflowSnapshot(id=NEWS_SNAPSHOT_ID)
+        session.add(row)
+
+    row.updated_at = utcnow()
+    if has_last_scan:
+        row.last_scan_at = last_scan
+    if has_next_scan:
+        row.next_scan_at = next_scan
+    row.running = bool(status.get("running", True))
+    row.enabled = bool(status.get("enabled", True))
+    row.current_activity = status.get("current_activity")
+    row.interval_seconds = int(status.get("interval_seconds", 120))
+    if has_last_error:
+        row.last_error = status.get("last_error")
+    row.degraded_mode = bool(status.get("degraded_mode", False))
+    if has_budget_remaining:
+        row.budget_remaining_usd = status.get("budget_remaining")
+    row.stats_json = stats if stats is not None else (status.get("stats") or {})
+    await _commit_with_retry(session)
+
+    # Publish news events so the broadcaster can relay immediately.
+    try:
+        news_status_data = {
+            "running": bool(status.get("running", True)),
+            "enabled": bool(status.get("enabled", True)),
+            "interval_seconds": int(status.get("interval_seconds", 120)),
+            "last_scan": status.get("last_scan"),
+            "next_scan": status.get("next_scan"),
+            "current_activity": status.get("current_activity"),
+            "last_error": status.get("last_error"),
+            "degraded_mode": bool(status.get("degraded_mode", False)),
+        }
+        await event_bus.publish("news_workflow_status", news_status_data)
+        resolved_stats = stats if stats is not None else (status.get("stats") or {})
+        await event_bus.publish(
+            "news_workflow_update",
+            {
+                "status": news_status_data,
+                "findings": int(resolved_stats.get("findings", 0) or 0),
+                "intents": int(resolved_stats.get("intents", 0) or 0),
+                "pending_intents": 0,
+            },
+        )
+    except Exception:
+        pass  # fire-and-forget
+
+
+async def read_news_snapshot(session: AsyncSession) -> dict[str, Any]:
+    result = await session.execute(select(NewsWorkflowSnapshot).where(NewsWorkflowSnapshot.id == NEWS_SNAPSHOT_ID))
+    row = result.scalar_one_or_none()
+    if row is None:
+        return _default_status()
+
+    return {
+        "running": bool(row.running),
+        "enabled": bool(row.enabled),
+        "interval_seconds": int(row.interval_seconds or 120),
+        "last_scan": format_iso_utc_z(row.last_scan_at),
+        "next_scan": format_iso_utc_z(row.next_scan_at),
+        "current_activity": row.current_activity,
+        "last_error": row.last_error,
+        "degraded_mode": bool(row.degraded_mode),
+        "budget_remaining": row.budget_remaining_usd,
+        "stats": row.stats_json or {},
+    }
+
+
+async def get_news_status_from_db(session: AsyncSession) -> dict[str, Any]:
+    status = await read_news_snapshot(session)
+    pending = await count_pending_news_intents(session)
+    control = await read_news_control(session)
+    status["pending_intents"] = pending
+    status["paused"] = bool(control.get("is_paused", False))
+    status["requested_scan_at"] = (
+        control.get("requested_scan_at").isoformat() if control.get("requested_scan_at") else None
+    )
+    return status
+
+
+async def ensure_news_control(session: AsyncSession) -> NewsWorkflowControl:
+    result = await session.execute(select(NewsWorkflowControl).where(NewsWorkflowControl.id == NEWS_CONTROL_ID))
+    row = result.scalar_one_or_none()
+    if row is None:
+        row = NewsWorkflowControl(id=NEWS_CONTROL_ID)
+        session.add(row)
+        await _commit_with_retry(session)
+        await session.refresh(row)
+    return row
+
+
+async def read_news_control(session: AsyncSession) -> dict[str, Any]:
+    result = await session.execute(select(NewsWorkflowControl).where(NewsWorkflowControl.id == NEWS_CONTROL_ID))
+    row = result.scalar_one_or_none()
+    if row is None:
+        return {
+            "is_enabled": False,  # ships disabled; opt-in via Background Subsystems
+            "is_paused": False,
+            "scan_interval_seconds": 120,
+            "requested_scan_at": None,
+            "lease_owner": None,
+            "lease_expires_at": None,
+        }
+    return {
+        "is_enabled": bool(row.is_enabled),
+        "is_paused": bool(row.is_paused),
+        "scan_interval_seconds": int(row.scan_interval_seconds or 120),
+        "requested_scan_at": row.requested_scan_at,
+        "lease_owner": row.lease_owner,
+        "lease_expires_at": row.lease_expires_at,
+    }
+
+
+async def set_news_paused(session: AsyncSession, paused: bool) -> None:
+    row = await ensure_news_control(session)
+    row.is_paused = paused
+    row.updated_at = utcnow()
+    await _commit_with_retry(session)
+
+
+async def set_news_enabled(session: AsyncSession, enabled: bool) -> None:
+    """Operator master switch. Distinct from is_paused (transient): when
+    is_enabled is False the news worker loop idles across restarts and global
+    resume-all until explicitly re-enabled (see news_worker gate at line ~229)."""
+    row = await ensure_news_control(session)
+    row.is_enabled = bool(enabled)
+    row.updated_at = utcnow()
+    await _commit_with_retry(session)
+
+
+async def set_news_interval(session: AsyncSession, interval_seconds: int) -> None:
+    row = await ensure_news_control(session)
+    row.scan_interval_seconds = max(30, min(3600, int(interval_seconds)))
+    row.updated_at = utcnow()
+    await _commit_with_retry(session)
+
+
+async def request_one_news_scan(session: AsyncSession) -> None:
+    row = await ensure_news_control(session)
+    row.requested_scan_at = utcnow()
+    row.updated_at = utcnow()
+    await _commit_with_retry(session)
+
+
+async def clear_news_scan_request(session: AsyncSession) -> None:
+    row = await ensure_news_control(session)
+    row.requested_scan_at = None
+    row.updated_at = utcnow()
+    await _commit_with_retry(session)
+
+
+async def try_acquire_news_lease(
+    session: AsyncSession,
+    owner: str,
+    ttl_seconds: int,
+) -> bool:
+    """Try to acquire/renew the worker lease. Returns True if owned."""
+    await ensure_news_control(session)
+    now = utcnow()
+    lease_until = now + timedelta(seconds=max(30, ttl_seconds))
+
+    stmt = (
+        update(NewsWorkflowControl)
+        .where(NewsWorkflowControl.id == NEWS_CONTROL_ID)
+        .where(
+            (NewsWorkflowControl.lease_owner.is_(None))
+            | (NewsWorkflowControl.lease_owner == owner)
+            | (NewsWorkflowControl.lease_expires_at.is_(None))
+            | (NewsWorkflowControl.lease_expires_at < now)
+        )
+        .values(
+            lease_owner=owner,
+            lease_expires_at=lease_until,
+            updated_at=now,
+        )
+    )
+    result = await session.execute(stmt)
+    await _commit_with_retry(session)
+    return (result.rowcount or 0) > 0
+
+
+async def release_news_lease(session: AsyncSession, owner: str) -> None:
+    await session.execute(
+        update(NewsWorkflowControl)
+        .where(NewsWorkflowControl.id == NEWS_CONTROL_ID)
+        .where(NewsWorkflowControl.lease_owner == owner)
+        .values(
+            lease_owner=None,
+            lease_expires_at=None,
+            updated_at=utcnow(),
+        )
+    )
+    await _commit_with_retry(session)
+
+
+async def count_pending_news_intents(session: AsyncSession) -> int:
+    rows = await list_news_intents(session, status_filter="pending", limit=5000)
+    return len(rows)
+
+
+async def list_news_findings(
+    session: AsyncSession,
+    *,
+    limit: int = 200,
+    actionable_only: bool = False,
+    max_age_minutes: Optional[int] = None,
+) -> list[NewsWorkflowFinding]:
+    query = select(NewsWorkflowFinding).order_by(NewsWorkflowFinding.created_at.desc())
+    if actionable_only:
+        query = query.where(NewsWorkflowFinding.actionable.is_(True))
+    if max_age_minutes is not None and int(max_age_minutes) > 0:
+        cutoff = utcnow() - timedelta(minutes=int(max_age_minutes))
+        query = query.where(NewsWorkflowFinding.created_at >= cutoff)
+    query = query.limit(max(1, int(limit)))
+    result = await session.execute(query)
+    return list(result.scalars().all())
+
+
+async def list_news_intents(
+    session: AsyncSession,
+    status_filter: Optional[str] = None,
+    limit: int = 100,
+) -> list[NewsTradeIntent]:
+    query = select(NewsTradeIntent).order_by(NewsTradeIntent.created_at.desc())
+    if status_filter:
+        query = query.where(NewsTradeIntent.status == status_filter)
+    query = query.limit(limit)
+    result = await session.execute(query)
+    rows = list(result.scalars().all())
+
+    actionable = [r for r in rows if r.status in {"pending", "submitted"} and r.market_id]
+    if actionable:
+        tradability = await get_market_tradability_map([str(r.market_id) for r in actionable])
+        now = utcnow()
+        changed = 0
+        for row in actionable:
+            if tradability.get(str(row.market_id).strip().lower(), True):
+                continue
+            row.status = "expired"
+            row.consumed_at = now
+            changed += 1
+        if changed:
+            await _commit_with_retry(session)
+            if status_filter in {"pending", "submitted"}:
+                rows = [r for r in rows if r.status == status_filter]
+
+    return rows
+
+
+async def mark_news_intent(
+    session: AsyncSession,
+    intent_id: str,
+    status: str,
+) -> bool:
+    result = await session.execute(select(NewsTradeIntent).where(NewsTradeIntent.id == intent_id))
+    row = result.scalar_one_or_none()
+    if row is None:
+        return False
+    row.status = status
+    row.consumed_at = utcnow()
+    if row.finding_id and status != "pending":
+        finding = await session.execute(select(NewsWorkflowFinding).where(NewsWorkflowFinding.id == row.finding_id))
+        finding_row = finding.scalar_one_or_none()
+        if finding_row is not None:
+            finding_row.consumed_by_orchestrator = True
+    await _commit_with_retry(session)
+    return True
+
+
+async def expire_stale_news_intents(
+    session: AsyncSession,
+    max_age_minutes: int,
+) -> int:
+    now = utcnow()
+    cutoff = now - timedelta(minutes=max_age_minutes)
+    result = await session.execute(
+        update(NewsTradeIntent)
+        .where(NewsTradeIntent.status == "pending")
+        .where(NewsTradeIntent.created_at < cutoff)
+        .values(
+            status="expired",
+            consumed_at=now,
+        )
+    )
+    await _commit_with_retry(session)
+    return int(result.rowcount or 0)
+
+
+async def _get_or_create_app_settings(session: AsyncSession) -> AppSettings:
+    result = await session.execute(select(AppSettings).where(AppSettings.id == "default"))
+    db = result.scalar_one_or_none()
+    mutated = False
+    if db is None:
+        db = AppSettings(id="default")
+        session.add(db)
+        mutated = True
+    else:
+        # Lift legacy strict retrieval defaults that frequently produced zero
+        # findings in live workflows.
+        if getattr(db, "news_workflow_top_k", None) in (None, 8):
+            db.news_workflow_top_k = 20
+            mutated = True
+        if getattr(db, "news_workflow_rerank_top_n", None) in (None, 5):
+            db.news_workflow_rerank_top_n = 8
+            mutated = True
+        if getattr(db, "news_workflow_similarity_threshold", None) in (
+            None,
+            0.35,
+            0.42,
+        ):
+            db.news_workflow_similarity_threshold = 0.20
+            mutated = True
+        if getattr(db, "news_workflow_min_semantic_signal", None) in (None, 0.22):
+            db.news_workflow_min_semantic_signal = 0.05
+            mutated = True
+        if getattr(db, "news_workflow_max_edge_evals_per_article", None) in (
+            None,
+            3,
+        ):
+            db.news_workflow_max_edge_evals_per_article = 6
+            mutated = True
+        # Lift overly strict edge/confidence defaults that caused zero
+        # actionable findings in most cycles.
+        if getattr(db, "news_workflow_min_edge_percent", None) in (None, 8.0):
+            db.news_workflow_min_edge_percent = 5.0
+            mutated = True
+        if getattr(db, "news_workflow_min_confidence", None) in (None, 0.6):
+            db.news_workflow_min_confidence = 0.45
+            mutated = True
+    if mutated:
+        await _commit_with_retry(session)
+        await session.refresh(db)
+    return db
+
+
+async def get_news_settings(session: AsyncSession) -> dict[str, Any]:
+    db = await _get_or_create_app_settings(session)
+
+    return {
+        "enabled": bool(getattr(db, "news_workflow_enabled", True)),
+        "auto_run": bool(getattr(db, "news_workflow_auto_run", True)),
+        "scan_interval_seconds": int(getattr(db, "news_workflow_scan_interval_seconds", 120) or 120),
+        "top_k": int(getattr(db, "news_workflow_top_k", 20) or 20),
+        "rerank_top_n": int(getattr(db, "news_workflow_rerank_top_n", 8) or 8),
+        "similarity_threshold": float(getattr(db, "news_workflow_similarity_threshold", 0.20) or 0.20),
+        "keyword_weight": float(getattr(db, "news_workflow_keyword_weight", 0.25) or 0.25),
+        "semantic_weight": float(getattr(db, "news_workflow_semantic_weight", 0.45) or 0.45),
+        "event_weight": float(getattr(db, "news_workflow_event_weight", 0.30) or 0.30),
+        "require_verifier": bool(getattr(db, "news_workflow_require_verifier", True)),
+        "market_min_liquidity": float(getattr(db, "news_workflow_market_min_liquidity", 500.0) or 500.0),
+        "market_max_days_to_resolution": int(getattr(db, "news_workflow_market_max_days_to_resolution", 365) or 365),
+        "min_keyword_signal": float(getattr(db, "news_workflow_min_keyword_signal", 0.04) or 0.04),
+        "min_semantic_signal": float(getattr(db, "news_workflow_min_semantic_signal", 0.05) or 0.05),
+        # min_edge_percent: 5% edge covers fees + slippage and is meaningful
+        # in prediction markets.  Previous 8% default filtered too aggressively.
+        "min_edge_percent": float(getattr(db, "news_workflow_min_edge_percent", 5.0) or 5.0),
+        # min_confidence: 0.45 allows moderate-confidence news signals through.
+        # News edges carry inherent uncertainty; 0.6 was too strict.
+        "min_confidence": float(getattr(db, "news_workflow_min_confidence", 0.45) or 0.45),
+        "require_second_source": bool(getattr(db, "news_workflow_require_second_source", False)),
+        "orchestrator_enabled": bool(getattr(db, "news_workflow_orchestrator_enabled", True)),
+        "orchestrator_min_edge": float(getattr(db, "news_workflow_orchestrator_min_edge", 10.0) or 10.0),
+        "orchestrator_max_age_minutes": int(getattr(db, "news_workflow_orchestrator_max_age_minutes", 120) or 120),
+        "model": getattr(db, "news_workflow_model", None),
+        "article_max_age_hours": min(int(app_settings.NEWS_ARTICLE_TTL_HOURS), 48),
+        "cycle_spend_cap_usd": float(getattr(db, "news_workflow_cycle_spend_cap_usd", 0.25) or 0.25),
+        "hourly_spend_cap_usd": float(getattr(db, "news_workflow_hourly_spend_cap_usd", 2.0) or 2.0),
+        "cycle_llm_call_cap": int(getattr(db, "news_workflow_cycle_llm_call_cap", 30) or 30),
+        "cache_ttl_minutes": int(getattr(db, "news_workflow_cache_ttl_minutes", 30) or 30),
+        "max_edge_evals_per_article": int(getattr(db, "news_workflow_max_edge_evals_per_article", 6) or 6),
+    }
+
+
+async def update_news_settings(
+    session: AsyncSession,
+    updates: dict[str, Any],
+) -> dict[str, Any]:
+    db = await _get_or_create_app_settings(session)
+    mapping = {
+        "enabled": "news_workflow_enabled",
+        "auto_run": "news_workflow_auto_run",
+        "scan_interval_seconds": "news_workflow_scan_interval_seconds",
+        "top_k": "news_workflow_top_k",
+        "rerank_top_n": "news_workflow_rerank_top_n",
+        "similarity_threshold": "news_workflow_similarity_threshold",
+        "keyword_weight": "news_workflow_keyword_weight",
+        "semantic_weight": "news_workflow_semantic_weight",
+        "event_weight": "news_workflow_event_weight",
+        "require_verifier": "news_workflow_require_verifier",
+        "market_min_liquidity": "news_workflow_market_min_liquidity",
+        "market_max_days_to_resolution": "news_workflow_market_max_days_to_resolution",
+        "min_keyword_signal": "news_workflow_min_keyword_signal",
+        "min_semantic_signal": "news_workflow_min_semantic_signal",
+        "min_edge_percent": "news_workflow_min_edge_percent",
+        "min_confidence": "news_workflow_min_confidence",
+        "require_second_source": "news_workflow_require_second_source",
+        "orchestrator_enabled": "news_workflow_orchestrator_enabled",
+        "orchestrator_min_edge": "news_workflow_orchestrator_min_edge",
+        "orchestrator_max_age_minutes": "news_workflow_orchestrator_max_age_minutes",
+        "model": "news_workflow_model",
+        "cycle_spend_cap_usd": "news_workflow_cycle_spend_cap_usd",
+        "hourly_spend_cap_usd": "news_workflow_hourly_spend_cap_usd",
+        "cycle_llm_call_cap": "news_workflow_cycle_llm_call_cap",
+        "cache_ttl_minutes": "news_workflow_cache_ttl_minutes",
+        "max_edge_evals_per_article": "news_workflow_max_edge_evals_per_article",
+    }
+    for key, value in updates.items():
+        col = mapping.get(key)
+        if not col:
+            continue
+        setattr(db, col, value)
+
+    db.updated_at = utcnow()
+    await _commit_with_retry(session)
+    return await get_news_settings(session)

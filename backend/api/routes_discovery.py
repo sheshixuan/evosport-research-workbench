@@ -1,0 +1,3599 @@
+from collections import defaultdict
+from datetime import datetime, timedelta
+import json
+from utils.utcnow import utcnow
+import uuid
+from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel, Field
+from sqlalchemy import case, delete, func, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from typing import Any, Optional
+from sqlalchemy.ext.asyncio import AsyncSession
+from functools import partial
+from sqlalchemy.orm import load_only
+from utils.converters import normalize_market_id, safe_float
+
+from models.database import (
+    AsyncSessionLocal,
+    DiscoveredWallet,
+    TrackedWallet,
+    TraderGroup,
+    TraderGroupMember,
+    WalletActivityRollup,
+    WalletCluster,
+    get_db_session,
+)
+from services import discovery_shared_state
+from services import shared_state as scanner_shared_state
+from services.live_price_snapshot import (
+    append_live_binary_price_point,
+    get_live_mid_prices,
+    normalize_binary_price_history,
+)
+from services.pause_state import global_pause_state
+from services.wallet_discovery import wallet_discovery
+from services.wallet_intelligence import wallet_intelligence
+from services.smart_wallet_pool import (
+    smart_wallet_pool,
+    POOL_FLAG_MANUAL_EXCLUDE,
+    POOL_FLAG_MANUAL_INCLUDE,
+    POOL_FLAG_BLACKLISTED,
+    POOL_RECOMPUTE_MODE_QUALITY_ONLY,
+    POOL_RECOMPUTE_MODE_BALANCED,
+)
+from services.wallet_tracker import wallet_tracker
+from services.worker_state import read_worker_snapshot
+from services.polymarket import polymarket_client
+from services.market_cache import CachedMarket
+from services.trader_data_access import (
+    annotate_trader_signal_source_context,
+)
+from services.strategy_sdk import StrategySDK
+from utils.logger import get_logger
+from utils.validation import validate_eth_address
+
+_safe_float = partial(safe_float, reject_nan_inf=True)
+logger = get_logger(__name__)
+
+# Maps time_period query values to rolling window keys stored in the DB
+TIME_PERIOD_TO_WINDOW_KEY = {
+    "24h": "1d",
+    "7d": "7d",
+    "30d": "30d",
+    "90d": "90d",
+}
+
+discovery_router = APIRouter()
+
+
+GROUP_SOURCE_TYPES = {
+    "manual",
+    "suggested_cluster",
+    "suggested_tag",
+    "suggested_pool",
+}
+
+
+def _resolve_query_default(value: Any) -> Any:
+    if value.__class__.__module__.startswith("fastapi."):
+        return getattr(value, "default", value)
+    return value
+
+
+def _resolve_query_bool(value: Any) -> bool:
+    return bool(_resolve_query_default(value))
+
+
+async def _resolve_wallet_address(wallet_identifier: str) -> str:
+    try:
+        resolved = await polymarket_client.resolve_wallet_identifier(wallet_identifier)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return str(resolved.get("address") or "").lower()
+
+
+def _resolve_wallet_summary_window_key(time_period: str) -> Optional[str]:
+    normalized = str(time_period or "ALL").upper()
+    mapping = {
+        "DAY": "1d",
+        "WEEK": "7d",
+        "MONTH": "30d",
+        "ALL": None,
+    }
+    if normalized not in mapping:
+        raise HTTPException(status_code=400, detail="Invalid time_period. Use DAY/WEEK/MONTH/ALL")
+    return mapping[normalized]
+
+
+def _build_wallet_win_rate_payload(
+    *,
+    address: str,
+    profile: dict[str, Any],
+    window_key: Optional[str],
+) -> dict[str, Any]:
+    if window_key:
+        win_rate = (profile.get("rolling_win_rate", {}) or {}).get(window_key, 0.0)
+        trade_count = (profile.get("rolling_trade_count", {}) or {}).get(window_key, 0)
+    else:
+        win_rate = profile.get("win_rate", 0.0)
+        trade_count = profile.get("total_trades", 0)
+
+    wins = profile.get("wins", 0)
+    losses = profile.get("losses", 0)
+    if window_key and trade_count > 0 and wins + losses > 0:
+        wins = int(round((win_rate or 0.0) * trade_count))
+        losses = max(int(trade_count) - wins, 0)
+
+    return {
+        "address": address,
+        "win_rate": (win_rate or 0.0) * 100.0,
+        "wins": wins,
+        "losses": losses,
+        "total_markets": profile.get("unique_markets", 0),
+        "trade_count": trade_count,
+    }
+
+
+def _build_wallet_pnl_payload(
+    *,
+    address: str,
+    profile: dict[str, Any],
+    window_key: Optional[str],
+) -> dict[str, Any]:
+    if window_key:
+        pnl = (profile.get("rolling_pnl", {}) or {}).get(window_key, 0.0)
+        trade_count = (profile.get("rolling_trade_count", {}) or {}).get(window_key, 0)
+    else:
+        pnl = profile.get("total_pnl", 0.0)
+        trade_count = profile.get("total_trades", 0)
+
+    total_invested = float(profile.get("total_invested", 0.0) or 0.0)
+    roi_percent = (pnl / total_invested * 100.0) if total_invested > 0 else 0.0
+    return {
+        "address": address,
+        "total_trades": trade_count,
+        "open_positions": profile.get("open_positions", 0),
+        "total_invested": total_invested,
+        "total_returned": profile.get("total_returned", 0.0),
+        "position_value": 0.0,
+        "realized_pnl": profile.get("realized_pnl", 0.0),
+        "unrealized_pnl": profile.get("unrealized_pnl", 0.0),
+        "total_pnl": pnl,
+        "roi_percent": roi_percent,
+    }
+
+
+async def _load_tracked_trader_opportunities(
+    *,
+    limit: int,
+    include_filtered: bool,
+) -> list[dict[str, Any]]:
+    return await StrategySDK.get_trader_strategy_signals(
+        limit=limit,
+        include_filtered=include_filtered,
+    )
+
+
+async def _build_discovery_status(session: AsyncSession) -> dict:
+    stats = await wallet_discovery.get_discovery_stats()
+    worker_status = await discovery_shared_state.get_discovery_status_from_db(session)
+
+    stats["is_running"] = bool(worker_status.get("running", stats.get("is_running", False)))
+    stats["last_run_at"] = worker_status.get("last_run_at") or stats.get("last_run_at")
+    stats["wallets_discovered_last_run"] = int(
+        worker_status.get(
+            "wallets_discovered_last_run",
+            stats.get("wallets_discovered_last_run", 0),
+        )
+    )
+    stats["wallets_analyzed_last_run"] = int(
+        worker_status.get(
+            "wallets_analyzed_last_run",
+            stats.get("wallets_analyzed_last_run", 0),
+        )
+    )
+    stats["current_activity"] = worker_status.get("current_activity")
+    stats["interval_minutes"] = int(worker_status.get("run_interval_minutes", 60))
+    stats["paused"] = bool(worker_status.get("paused", False))
+    stats["priority_backlog_mode"] = bool(worker_status.get("priority_backlog_mode", True))
+    stats["requested_run_at"] = worker_status.get("requested_run_at")
+    return stats
+
+
+class CreateTraderGroupRequest(BaseModel):
+    name: str = Field(min_length=2, max_length=80)
+    description: Optional[str] = Field(default=None, max_length=500)
+    wallet_addresses: list[str] = Field(default_factory=list)
+    source_type: str = Field(default="manual")
+    suggestion_key: Optional[str] = Field(default=None, max_length=200)
+    criteria: dict = Field(default_factory=dict)
+    auto_track_members: bool = True
+    source_label: str = Field(default="manual", max_length=40)
+
+
+class UpdateTraderGroupMembersRequest(BaseModel):
+    wallet_addresses: list[str] = Field(default_factory=list)
+    add_to_tracking: bool = True
+    source_label: str = Field(default="manual", max_length=40)
+
+
+class PoolFlagRequest(BaseModel):
+    reason: Optional[str] = Field(default=None, max_length=240)
+
+
+class TrackWalletRequest(BaseModel):
+    label: Optional[str] = Field(default=None, max_length=120)
+
+
+def _normalize_wallet_addresses(addresses: list[str]) -> list[str]:
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for raw in addresses:
+        if not raw:
+            continue
+        addr = validate_eth_address(str(raw).strip()).lower()
+        if addr in seen:
+            continue
+        normalized.append(addr)
+        seen.add(addr)
+    return normalized
+
+
+def _suggestion_id(kind: str, key: str) -> str:
+    safe_key = "".join(ch if ch.isalnum() else "_" for ch in key.lower())
+    return f"{kind}:{safe_key}"
+
+
+def _coerce_source_flags(raw: object) -> dict:
+    if isinstance(raw, dict):
+        return dict(raw)
+    return {}
+
+
+def _pool_flags(source_flags: dict) -> dict[str, bool]:
+    return {
+        "manual_include": bool(source_flags.get(POOL_FLAG_MANUAL_INCLUDE)),
+        "manual_exclude": bool(source_flags.get(POOL_FLAG_MANUAL_EXCLUDE)),
+        "blacklisted": bool(source_flags.get(POOL_FLAG_BLACKLISTED)),
+    }
+
+
+def _market_categories_from_flags(source_flags: dict) -> list[str]:
+    categories = [
+        key.replace("leaderboard_category_", "")
+        for key, enabled in source_flags.items()
+        if key.startswith("leaderboard_category_") and bool(enabled)
+    ]
+    return sorted(set(categories))
+
+
+PRIMARY_MARKET_CATEGORIES = {
+    "politics",
+    "sports",
+    "crypto",
+    "culture",
+    "economics",
+    "tech",
+    "finance",
+    "weather",
+}
+
+
+def _normalize_primary_market_category(raw: object) -> Optional[str]:
+    text = str(raw or "").strip().lower()
+    if not text or text in {"overall", "all"}:
+        return None
+    if text in PRIMARY_MARKET_CATEGORIES:
+        return text
+    if "crypto" in text or "bitcoin" in text or "ethereum" in text or "solana" in text:
+        return "crypto"
+    if "politic" in text or "election" in text:
+        return "politics"
+    if "sport" in text:
+        return "sports"
+    if "weather" in text or "hurricane" in text or "temperature" in text:
+        return "weather"
+    if "econ" in text or "inflation" in text or "gdp" in text:
+        return "economics"
+    if "financ" in text or "stocks" in text or "equity" in text:
+        return "finance"
+    if "tech" in text or "ai" in text or "science" in text:
+        return "tech"
+    if "culture" in text or "entertainment" in text:
+        return "culture"
+    return None
+
+
+def _token_ids_from_market_cache(extra_data: dict[str, Any]) -> list[str]:
+    raw = extra_data.get("token_ids")
+    if not isinstance(raw, list):
+        return []
+    token_ids: list[str] = []
+    seen: set[str] = set()
+    for token in raw:
+        normalized = normalize_market_id(token)
+        if not normalized or normalized in seen:
+            continue
+        token_ids.append(normalized)
+        seen.add(normalized)
+    return token_ids
+
+
+def _looks_like_condition_id(value: object) -> bool:
+    normalized = normalize_market_id(value)
+    if len(normalized) != 66 or not normalized.startswith("0x"):
+        return False
+    return all(ch in "0123456789abcdef" for ch in normalized[2:])
+
+
+def _primary_category_from_market_cache_row(
+    *,
+    category: object,
+    extra_data: dict[str, Any],
+) -> Optional[str]:
+    normalized = _normalize_primary_market_category(category)
+    if normalized:
+        return normalized
+
+    raw_tags = extra_data.get("tags")
+    tags: list[object] = []
+    if isinstance(raw_tags, list):
+        tags = raw_tags
+    elif isinstance(raw_tags, str) and raw_tags.strip():
+        tags = [raw_tags]
+    for tag in tags:
+        normalized = _normalize_primary_market_category(tag)
+        if normalized:
+            return normalized
+    return None
+
+
+async def _load_primary_market_category_profiles(
+    *,
+    session: AsyncSession,
+    wallet_addresses: list[str],
+) -> dict[str, dict[str, Any]]:
+    normalized_wallets = sorted({normalize_market_id(address) for address in wallet_addresses if address})
+    if not normalized_wallets:
+        return {}
+
+    activity_rows = (
+        await session.execute(
+            select(
+                func.lower(WalletActivityRollup.wallet_address).label("wallet_address"),
+                func.lower(WalletActivityRollup.market_id).label("market_id"),
+                func.count(WalletActivityRollup.id).label("trade_count"),
+                func.sum(func.coalesce(WalletActivityRollup.notional, 0.0)).label("total_notional"),
+            )
+            .where(func.lower(WalletActivityRollup.wallet_address).in_(normalized_wallets))
+            .group_by(
+                func.lower(WalletActivityRollup.wallet_address),
+                func.lower(WalletActivityRollup.market_id),
+            )
+        )
+    ).all()
+    if not activity_rows:
+        return {}
+
+    market_ids = sorted({normalize_market_id(row.market_id) for row in activity_rows if row.market_id})
+    if not market_ids:
+        return {}
+
+    market_category_by_id: dict[str, str] = {}
+    unresolved_market_ids = set(market_ids)
+
+    direct_rows = (
+        await session.execute(
+            select(
+                CachedMarket.condition_id,
+                CachedMarket.category,
+                CachedMarket.extra_data,
+            ).where(func.lower(CachedMarket.condition_id).in_(market_ids))
+        )
+    ).all()
+    for row in direct_rows:
+        extra_data = row.extra_data if isinstance(row.extra_data, dict) else {}
+        category = _primary_category_from_market_cache_row(
+            category=row.category,
+            extra_data=extra_data,
+        )
+        if not category:
+            continue
+
+        condition_id = normalize_market_id(row.condition_id)
+        if condition_id in unresolved_market_ids:
+            market_category_by_id[condition_id] = category
+            unresolved_market_ids.discard(condition_id)
+
+        for token_id in _token_ids_from_market_cache(extra_data):
+            if token_id in unresolved_market_ids:
+                market_category_by_id[token_id] = category
+                unresolved_market_ids.discard(token_id)
+
+    unresolved_token_ids = {market_id for market_id in unresolved_market_ids if not _looks_like_condition_id(market_id)}
+    if unresolved_token_ids:
+        supplemental_rows = (
+            await session.execute(
+                select(
+                    CachedMarket.condition_id,
+                    CachedMarket.category,
+                    CachedMarket.extra_data,
+                ).where(CachedMarket.extra_data.is_not(None))
+            )
+        ).all()
+        for row in supplemental_rows:
+            if not unresolved_token_ids:
+                break
+            extra_data = row.extra_data if isinstance(row.extra_data, dict) else {}
+            category = _primary_category_from_market_cache_row(
+                category=row.category,
+                extra_data=extra_data,
+            )
+            if not category:
+                continue
+
+            condition_id = normalize_market_id(row.condition_id)
+            if condition_id in unresolved_token_ids:
+                market_category_by_id[condition_id] = category
+                unresolved_token_ids.discard(condition_id)
+                unresolved_market_ids.discard(condition_id)
+
+            for token_id in _token_ids_from_market_cache(extra_data):
+                if token_id in unresolved_token_ids:
+                    market_category_by_id[token_id] = category
+                    unresolved_token_ids.discard(token_id)
+                    unresolved_market_ids.discard(token_id)
+
+    wallet_category_stats: dict[str, dict[str, dict[str, float]]] = {}
+    for row in activity_rows:
+        wallet_address = normalize_market_id(row.wallet_address)
+        market_id = normalize_market_id(row.market_id)
+        category = market_category_by_id.get(market_id)
+        if not category:
+            continue
+
+        stats_by_category = wallet_category_stats.setdefault(wallet_address, {})
+        bucket = stats_by_category.setdefault(category, {"trade_count": 0.0, "notional": 0.0})
+        bucket["trade_count"] += float(row.trade_count or 0.0)
+        bucket["notional"] += float(row.total_notional or 0.0)
+
+    profiles: dict[str, dict[str, Any]] = {}
+    for wallet_address, stats_by_category in wallet_category_stats.items():
+        ranked = sorted(
+            stats_by_category.items(),
+            key=lambda entry: (
+                -float(entry[1].get("notional", 0.0)),
+                -float(entry[1].get("trade_count", 0.0)),
+                entry[0],
+            ),
+        )
+        if not ranked:
+            continue
+
+        category, top_stats = ranked[0]
+        total_notional = sum(float(values.get("notional", 0.0)) for values in stats_by_category.values())
+        total_trades = sum(float(values.get("trade_count", 0.0)) for values in stats_by_category.values())
+        if total_notional > 0:
+            share = float(top_stats.get("notional", 0.0)) / total_notional
+            basis = "notional"
+        elif total_trades > 0:
+            share = float(top_stats.get("trade_count", 0.0)) / total_trades
+            basis = "trade_count"
+        else:
+            continue
+
+        profiles[wallet_address] = {
+            "category": category,
+            "share": round(max(0.0, min(1.0, share)), 4),
+            "basis": basis,
+        }
+
+    return profiles
+
+
+def _normalize_win_rate_ratio(value: object) -> float:
+    """Normalize win-rate values to ratio scale [0, 1].
+
+    Discovery historically stores ratios (0.0-1.0), but legacy payloads may
+    contain percent values (0.0-100.0). Keep API sorting/filtering resilient.
+    """
+    try:
+        wr = float(value or 0.0)
+    except Exception:
+        return 0.0
+    if wr > 1.0:
+        wr = wr / 100.0
+    return max(0.0, min(wr, 1.0))
+
+
+def _is_placeholder_market_question(question: object) -> bool:
+    text = str(question or "").strip().lower()
+    return text.startswith("market 0x")
+
+
+def _humanize_market_slug(slug: object) -> str:
+    raw = str(slug or "").strip().replace("_", "-")
+    if not raw:
+        return ""
+    parts = [p for p in raw.split("-") if p]
+    if not parts:
+        return ""
+    return " ".join(p[:1].upper() + p[1:] for p in parts)
+
+
+def _extract_yes_no_from_history(history: list[dict]) -> tuple[Optional[float], Optional[float]]:
+    if not history:
+        return None, None
+    last = history[-1] if isinstance(history[-1], dict) else {}
+    yes = last.get("yes")
+    no = last.get("no")
+    try:
+        yes_v = float(yes) if yes is not None else None
+    except Exception:
+        yes_v = None
+    try:
+        no_v = float(no) if no is not None else None
+    except Exception:
+        no_v = None
+    return yes_v, no_v
+
+
+def _extract_outcome_labels(raw: object) -> list[str]:
+    candidates: list[object] = []
+    if isinstance(raw, list):
+        candidates = raw
+    elif isinstance(raw, tuple):
+        candidates = list(raw)
+    elif isinstance(raw, str):
+        text = raw.strip()
+        if text.startswith("[") and text.endswith("]"):
+            try:
+                parsed = json.loads(text)
+            except Exception:
+                parsed = None
+            if isinstance(parsed, list):
+                candidates = parsed
+
+    labels: list[str] = []
+    for item in candidates:
+        text = str(item or "").strip()
+        if text:
+            labels.append(text)
+    return labels
+
+
+def _extract_outcome_prices(raw: object) -> tuple[Optional[float], Optional[float]]:
+    candidates: list[object] = []
+    if isinstance(raw, list):
+        candidates = raw
+    elif isinstance(raw, tuple):
+        candidates = list(raw)
+    elif isinstance(raw, str):
+        text = raw.strip()
+        if text.startswith("[") and text.endswith("]"):
+            try:
+                parsed = json.loads(text)
+            except Exception:
+                parsed = None
+            if isinstance(parsed, list):
+                candidates = parsed
+
+    parsed_values: list[float] = []
+    for item in candidates:
+        value = _safe_float(item)
+        if value is not None:
+            parsed_values.append(value)
+    if len(parsed_values) >= 2:
+        return parsed_values[0], parsed_values[1]
+    if len(parsed_values) == 1:
+        return parsed_values[0], None
+    return None, None
+
+
+def _labels_look_like_yes_no(labels: list[str]) -> bool:
+    if len(labels) < 2:
+        return False
+    yes_text = str(labels[0] or "").strip().lower()
+    no_text = str(labels[1] or "").strip().lower()
+    yes_aliases = {"yes"}
+    no_aliases = {"no"}
+    return yes_text in yes_aliases and no_text in no_aliases
+
+
+async def _load_scanner_market_history(
+    session: AsyncSession,
+    *,
+    market_ids: set[str] | list[str] | tuple[str, ...],
+) -> dict[str, list[dict]]:
+    """Read scanner snapshot market history map used by main opportunities sparklines."""
+    out: dict[str, list[dict]] = {}
+    if not market_ids:
+        return out
+    for market_id, points in (
+        await scanner_shared_state.read_scanner_market_history(session, market_ids=market_ids)
+    ).items():
+        key = normalize_market_id(market_id)
+        if not key or not isinstance(points, list):
+            continue
+        out[key] = [p for p in points if isinstance(p, dict)]
+    return out
+
+
+def _attach_market_history_to_signal_rows(
+    rows: list[dict],
+    market_history: dict[str, list[dict]],
+) -> None:
+    """Attach sparkline payload and latest YES/NO prices to trader signal rows."""
+    if not rows:
+        return
+
+    for row in rows:
+        market_id = normalize_market_id(row.get("market_id"))
+        if not market_id:
+            continue
+
+        history = market_history.get(market_id, [])
+        if len(history) >= 2:
+            # Keep payload compact and consistent with AI context-pack limits.
+            compact = history[-20:]
+            row["price_history"] = compact
+            yes_price, no_price = _extract_yes_no_from_history(compact)
+            if yes_price is not None:
+                row["yes_price"] = yes_price
+            if no_price is not None:
+                row["no_price"] = no_price
+
+        if _is_placeholder_market_question(row.get("market_question")):
+            slug_fallback = _humanize_market_slug(row.get("market_slug"))
+            if slug_fallback:
+                row["market_question"] = slug_fallback
+
+
+def _normalize_signal_wallet_address(value: object) -> Optional[str]:
+    text = str(value or "").strip().lower()
+    if not text or not text.startswith("0x"):
+        return None
+    return text
+
+
+def _extract_signal_wallet_addresses(signal: dict[str, Any]) -> list[str]:
+    addresses: set[str] = set()
+
+    def _add_candidate(raw: object) -> None:
+        normalized = _normalize_signal_wallet_address(raw)
+        if normalized:
+            addresses.add(normalized)
+
+    raw_wallets = signal.get("wallets")
+    if isinstance(raw_wallets, list):
+        for item in raw_wallets:
+            if isinstance(item, dict):
+                _add_candidate(item.get("address"))
+            else:
+                _add_candidate(item)
+
+    top_wallet = signal.get("top_wallet")
+    if isinstance(top_wallet, dict):
+        _add_candidate(top_wallet.get("address"))
+
+    top_wallets = signal.get("top_wallets")
+    if isinstance(top_wallets, list):
+        for item in top_wallets:
+            if isinstance(item, dict):
+                _add_candidate(item.get("address"))
+
+    wallet_addresses = signal.get("wallet_addresses")
+    if isinstance(wallet_addresses, list):
+        for item in wallet_addresses:
+            _add_candidate(item)
+
+    return sorted(addresses)
+
+
+def _signal_has_direction(signal: dict[str, Any]) -> bool:
+    outcome = str(signal.get("outcome") or "").strip().upper()
+    if outcome in {"YES", "NO"}:
+        return True
+
+    direction = str(signal.get("direction") or "").strip().lower()
+    if direction in {"buy_yes", "buy_no", "buy", "sell"}:
+        return True
+
+    signal_type = str(signal.get("signal_type") or "").strip().lower()
+    return any(token in signal_type for token in ("buy", "sell", "accumulation"))
+
+
+def _signal_has_price_reference(signal: dict[str, Any]) -> tuple[bool, bool]:
+    prices: list[float] = []
+    for key in ("yes_price", "no_price", "entry_price", "avg_entry_price"):
+        parsed = _safe_float(signal.get(key))
+        if parsed is not None:
+            prices.append(parsed)
+
+    if not prices:
+        return False, False
+    return True, all(0.0 <= value <= 1.0 for value in prices)
+
+
+def _build_signal_validation_payload(
+    signal: dict[str, Any],
+    wallet_addresses: list[str],
+    has_qualified_source: bool,
+) -> dict[str, Any]:
+    has_market_id = bool(normalize_market_id(signal.get("market_id")))
+    has_wallets = bool(wallet_addresses)
+    has_direction = _signal_has_direction(signal)
+    has_price_reference, price_in_bounds = _signal_has_price_reference(signal)
+    upstream_tradable = bool(signal.get("is_tradeable", True))
+
+    reasons: list[str] = []
+    if not has_market_id:
+        reasons.append("missing_market_id")
+    if not has_wallets:
+        reasons.append("missing_wallets")
+    if not has_direction:
+        reasons.append("missing_direction")
+    if not has_price_reference:
+        reasons.append("missing_price_reference")
+    elif not price_in_bounds:
+        reasons.append("price_out_of_bounds")
+    if not has_qualified_source:
+        reasons.append("unqualified_wallet_source")
+    if not upstream_tradable:
+        reasons.append("market_not_tradable")
+
+    is_valid = has_market_id and has_wallets and has_direction and has_price_reference and price_in_bounds
+    is_actionable = is_valid and has_qualified_source
+    is_tradeable = upstream_tradable and is_actionable
+
+    return {
+        "is_valid": is_valid,
+        "is_actionable": is_actionable,
+        "is_tradeable": is_tradeable,
+        "checks": {
+            "has_market_id": has_market_id,
+            "has_wallets": has_wallets,
+            "has_direction": has_direction,
+            "has_price_reference": has_price_reference,
+            "price_in_bounds": price_in_bounds,
+            "has_qualified_source": has_qualified_source,
+            "upstream_tradable": upstream_tradable,
+        },
+        "reasons": reasons,
+    }
+
+
+def _extract_outcome_labels_from_market_info(
+    market_info: Optional[dict[str, Any]],
+    *,
+    fallback_slug: str = "",
+    fallback_question: str = "",
+) -> list[str]:
+    if not isinstance(market_info, dict):
+        market_info = {}
+
+    labels = _extract_outcome_labels(market_info.get("outcomes"))
+    if not labels:
+        tokens = market_info.get("tokens")
+        if isinstance(tokens, list):
+            from_tokens: list[str] = []
+            for token in tokens:
+                if not isinstance(token, dict):
+                    continue
+                label = str(token.get("outcome") or token.get("name") or "").strip()
+                if label:
+                    from_tokens.append(label)
+            labels = from_tokens
+
+    if not labels:
+        slug = str(market_info.get("slug") or fallback_slug or "").strip().lower()
+        if slug:
+            parts = [part for part in slug.split("-") if part]
+            if len(parts) >= 3 and 2 <= len(parts[1]) <= 4 and 2 <= len(parts[2]) <= 4:
+                if parts[1].isalpha() and parts[2].isalpha():
+                    labels = [parts[1].upper(), parts[2].upper()]
+
+    if not labels:
+        question = str(
+            market_info.get("groupItemTitle") or market_info.get("question") or fallback_question or ""
+        ).strip()
+        if " vs " in question.lower():
+            lowered = question.lower()
+            splitter = " vs. " if " vs. " in lowered else " vs "
+            chunks = [chunk.strip() for chunk in question.split(splitter) if chunk.strip()]
+            if len(chunks) >= 2:
+                labels = [chunks[0], chunks[1]]
+
+    if not labels:
+        return ["Yes", "No"]
+    if len(labels) == 1:
+        return [labels[0], "No"]
+    return labels
+
+
+def _extract_outcome_prices_from_market_info(
+    market_info: Optional[dict[str, Any]],
+) -> tuple[Optional[float], Optional[float]]:
+    if not isinstance(market_info, dict):
+        return None, None
+
+    yes_price = _safe_float(
+        market_info.get("yes_price") if market_info.get("yes_price") is not None else market_info.get("yesPrice")
+    )
+    no_price = _safe_float(
+        market_info.get("no_price") if market_info.get("no_price") is not None else market_info.get("noPrice")
+    )
+    if yes_price is not None or no_price is not None:
+        return yes_price, no_price
+
+    prices = market_info.get("outcome_prices")
+    if prices is None:
+        prices = market_info.get("outcomePrices")
+    return _extract_outcome_prices(prices)
+
+
+async def _attach_signal_market_metadata(rows: list[dict]) -> list[dict]:
+    if not rows:
+        return rows
+
+    market_info_cache: dict[str, Optional[dict[str, Any]]] = {}
+
+    async def _load_market_info(market_id: str) -> Optional[dict[str, Any]]:
+        normalized = normalize_market_id(market_id)
+        if not normalized:
+            return None
+        if normalized in market_info_cache:
+            return market_info_cache[normalized]
+        info: Optional[dict[str, Any]] = None
+        try:
+            if normalized.startswith("0x"):
+                info = await polymarket_client.get_market_by_condition_id(normalized)
+            else:
+                info = await polymarket_client.get_market_by_token_id(normalized)
+        except Exception:
+            info = None
+        market_info_cache[normalized] = info
+        return info
+
+    for row in rows:
+        market_id = normalize_market_id(row.get("market_id"))
+        if not market_id:
+            row["outcome_labels"] = ["Yes", "No"]
+            row["yes_label"] = "Yes"
+            row["no_label"] = "No"
+            continue
+
+        info = await _load_market_info(market_id)
+        labels = _extract_outcome_labels_from_market_info(
+            info,
+            fallback_slug=str(row.get("market_slug") or ""),
+            fallback_question=str(row.get("market_question") or ""),
+        )
+        info_yes, info_no = _extract_outcome_prices_from_market_info(info)
+        token_ids = (
+            [str(token_id).strip().lower() for token_id in (info.get("token_ids") or []) if str(token_id or "").strip()]
+            if isinstance(info, dict)
+            else []
+        )
+
+        existing_yes = _safe_float(row.get("yes_price"))
+        existing_no = _safe_float(row.get("no_price"))
+        current_yes = existing_yes if existing_yes is not None else info_yes
+        current_no = existing_no if existing_no is not None else info_no
+
+        if current_yes is not None:
+            row["yes_price"] = current_yes
+            row["current_yes_price"] = current_yes
+        elif row.get("current_yes_price") is None:
+            row["current_yes_price"] = None
+
+        if current_no is not None:
+            row["no_price"] = current_no
+            row["current_no_price"] = current_no
+        elif row.get("current_no_price") is None:
+            row["current_no_price"] = None
+
+        row["outcome_labels"] = labels
+        row["yes_label"] = labels[0]
+        row["no_label"] = labels[1] if len(labels) >= 2 else "No"
+        row["market_token_ids"] = token_ids
+
+        # For multi-outcome markets, extract per-outcome prices from tokens
+        if len(labels) > 2 and isinstance(info, dict):
+            tokens = info.get("tokens")
+            if isinstance(tokens, list):
+                token_prices: list[float] = []
+                for token in tokens:
+                    if isinstance(token, dict):
+                        price = _safe_float(token.get("price"))
+                        if price is not None:
+                            token_prices.append(price)
+                if len(token_prices) >= len(labels):
+                    row["outcome_prices"] = token_prices
+
+    return rows
+
+
+def _history_candidates_for_row(row: dict[str, Any]) -> list[str]:
+    candidates: list[str] = []
+    primary = normalize_market_id(row.get("market_id"))
+    if primary:
+        candidates.extend([primary, primary.upper()])
+    token_ids = row.get("market_token_ids")
+    if isinstance(token_ids, list):
+        for token_id in token_ids:
+            token_norm = normalize_market_id(token_id)
+            if token_norm:
+                candidates.extend([token_norm, token_norm.upper()])
+    return list(dict.fromkeys(candidates))
+
+
+def _attach_history_from_aliases(
+    rows: list[dict[str, Any]],
+    market_history: dict[str, list[dict]],
+) -> None:
+    if not rows or not market_history:
+        return
+
+    for row in rows:
+        existing = row.get("price_history")
+        if isinstance(existing, list) and len(existing) >= 2:
+            continue
+
+        for candidate in _history_candidates_for_row(row):
+            history = market_history.get(candidate) or market_history.get(candidate.lower())
+            if isinstance(history, list) and len(history) >= 2:
+                compact = history[-20:]
+                row["price_history"] = compact
+                yes_price, no_price = _extract_yes_no_from_history(compact)
+                if yes_price is not None:
+                    row["yes_price"] = yes_price
+                    row["current_yes_price"] = yes_price
+                if no_price is not None:
+                    row["no_price"] = no_price
+                    row["current_no_price"] = no_price
+                break
+
+
+def _infer_yes_no_from_trade(
+    *,
+    outcome_hint: str,
+    direction_hint: str,
+    side: str,
+    price: float,
+) -> tuple[float, float]:
+    side_u = side.upper()
+    outcome_u = outcome_hint.upper()
+    if not outcome_u:
+        if direction_hint == "buy_yes":
+            outcome_u = "YES"
+        elif direction_hint == "buy_no":
+            outcome_u = "NO"
+
+    if outcome_u == "YES":
+        if side_u == "SELL":
+            return 1.0 - price, price
+        return price, 1.0 - price
+
+    if outcome_u == "NO":
+        if side_u == "SELL":
+            return price, 1.0 - price
+        return 1.0 - price, price
+
+    if side_u == "SELL":
+        return 1.0 - price, price
+    return price, 1.0 - price
+
+
+async def _attach_activity_history_fallback(
+    session: AsyncSession,
+    rows: list[dict[str, Any]],
+) -> None:
+    if not rows:
+        return
+
+    aliases_by_row: dict[int, list[str]] = {}
+    requested_ids: set[str] = set()
+    for idx, row in enumerate(rows):
+        existing = row.get("price_history")
+        if isinstance(existing, list) and len(existing) >= 2:
+            continue
+        aliases = _history_candidates_for_row(row)
+        if not aliases:
+            continue
+        aliases_by_row[idx] = aliases
+        requested_ids.update(alias.lower() for alias in aliases)
+
+    if not requested_ids:
+        return
+
+    cutoff = utcnow() - timedelta(days=45)
+    result = await session.execute(
+        select(
+            WalletActivityRollup.market_id,
+            WalletActivityRollup.traded_at,
+            WalletActivityRollup.side,
+            WalletActivityRollup.price,
+        )
+        .where(
+            func.lower(WalletActivityRollup.market_id).in_(list(requested_ids)),
+            WalletActivityRollup.traded_at >= cutoff,
+        )
+        .order_by(WalletActivityRollup.traded_at.asc())
+    )
+    raw_rows = result.all()
+    if not raw_rows:
+        return
+
+    events_by_market: dict[str, list[tuple[datetime, str, float]]] = defaultdict(list)
+    for market_id, traded_at, side, price in raw_rows:
+        market_norm = normalize_market_id(market_id)
+        if not market_norm or traded_at is None:
+            continue
+        price_f = _safe_float(price)
+        if price_f is None or price_f < 0.0 or price_f > 1.01:
+            continue
+        events_by_market[market_norm].append((traded_at, str(side or ""), float(price_f)))
+
+    for idx, aliases in aliases_by_row.items():
+        row = rows[idx]
+        labels_raw = row.get("outcome_labels")
+        labels = (
+            [str(item).strip() for item in labels_raw if str(item or "").strip()]
+            if isinstance(labels_raw, list)
+            else []
+        )
+        has_named_outcomes = bool(labels) and not _labels_look_like_yes_no(labels)
+        has_authoritative_prices = (
+            _safe_float(row.get("yes_price")) is not None and _safe_float(row.get("no_price")) is not None
+        )
+        # Wallet activity fallback only carries side+price and cannot safely map
+        # named two-outcome markets (e.g. "Kecmanovic" vs "Shelton").
+        if has_named_outcomes and has_authoritative_prices:
+            continue
+
+        outcome_hint = str(row.get("outcome") or "")
+        direction_hint = str(row.get("direction") or "").strip().lower()
+        points: list[dict[str, float]] = []
+        for alias in aliases:
+            market_events = events_by_market.get(alias.lower()) or []
+            if market_events:
+                for traded_at, side, price in market_events[-120:]:
+                    yes_price, no_price = _infer_yes_no_from_trade(
+                        outcome_hint=outcome_hint,
+                        direction_hint=direction_hint,
+                        side=side,
+                        price=price,
+                    )
+                    points.append(
+                        {
+                            "t": float(traded_at.timestamp() * 1000.0),
+                            "yes": round(yes_price, 6),
+                            "no": round(no_price, 6),
+                        }
+                    )
+                break
+
+        if len(points) < 2:
+            continue
+
+        points.sort(key=lambda item: item["t"])
+        compact = points[-20:]
+        row["price_history"] = compact
+        yes_last, no_last = _extract_yes_no_from_history(compact)
+        if yes_last is not None and _safe_float(row.get("yes_price")) is None:
+            row["yes_price"] = yes_last
+        if yes_last is not None and _safe_float(row.get("current_yes_price")) is None:
+            row["current_yes_price"] = yes_last
+        if no_last is not None and _safe_float(row.get("no_price")) is None:
+            row["no_price"] = no_last
+        if no_last is not None and _safe_float(row.get("current_no_price")) is None:
+            row["current_no_price"] = no_last
+
+
+def _normalize_signal_price_histories(rows: list[dict[str, Any]]) -> None:
+    for row in rows:
+        normalized = normalize_binary_price_history(row.get("price_history"))
+        if not normalized:
+            continue
+
+        row["price_history"] = normalized
+        yes_last, no_last = _extract_yes_no_from_history(normalized)
+        if yes_last is not None and _safe_float(row.get("yes_price")) is None:
+            row["yes_price"] = yes_last
+        if yes_last is not None and _safe_float(row.get("current_yes_price")) is None:
+            row["current_yes_price"] = yes_last
+        if no_last is not None and _safe_float(row.get("no_price")) is None:
+            row["no_price"] = no_last
+        if no_last is not None and _safe_float(row.get("current_no_price")) is None:
+            row["current_no_price"] = no_last
+
+
+def _extract_binary_market_tokens(row: dict[str, Any]) -> tuple[Optional[str], Optional[str]]:
+    token_ids = row.get("market_token_ids")
+    if not isinstance(token_ids, list):
+        return None, None
+
+    cleaned = [str(token_id).strip().lower() for token_id in token_ids if str(token_id or "").strip()]
+    if len(cleaned) < 2:
+        return None, None
+    return cleaned[0], cleaned[1]
+
+
+async def _attach_live_mid_prices_to_signal_rows(rows: list[dict[str, Any]]) -> None:
+    if not rows:
+        return
+    _normalize_signal_price_histories(rows)
+
+    token_pairs: list[tuple[dict[str, Any], str, str]] = []
+    unique_tokens: list[str] = []
+    seen_tokens: set[str] = set()
+
+    for row in rows:
+        yes_token, no_token = _extract_binary_market_tokens(row)
+        if not yes_token or not no_token:
+            continue
+        token_pairs.append((row, yes_token, no_token))
+        for token_id in (yes_token, no_token):
+            if token_id in seen_tokens:
+                continue
+            seen_tokens.add(token_id)
+            unique_tokens.append(token_id)
+
+    if not token_pairs:
+        return
+
+    live_prices = await get_live_mid_prices(unique_tokens)
+    if not live_prices:
+        return
+
+    for row, yes_token, no_token in token_pairs:
+        yes_price = live_prices.get(yes_token)
+        no_price = live_prices.get(no_token)
+        if yes_price is None and no_price is not None and 0.0 <= no_price <= 1.0:
+            yes_price = float(1.0 - no_price)
+        if no_price is None and yes_price is not None and 0.0 <= yes_price <= 1.0:
+            no_price = float(1.0 - yes_price)
+        if yes_price is None or no_price is None:
+            continue
+
+        row["yes_price"] = yes_price
+        row["no_price"] = no_price
+        row["current_yes_price"] = yes_price
+        row["current_no_price"] = no_price
+        row["outcome_prices"] = [yes_price, no_price]
+        row["price_history"] = append_live_binary_price_point(
+            row.get("price_history"),
+            yes_price=yes_price,
+            no_price=no_price,
+        )
+
+
+async def _annotate_trader_signal_rows(
+    _session: AsyncSession,
+    rows: list[dict],
+) -> list[dict]:
+    if not rows:
+        return rows
+
+    await annotate_trader_signal_source_context(rows)
+
+    for row in rows:
+        wallet_addresses = _extract_signal_wallet_addresses(row)
+        source_flags = row.get("source_flags") if isinstance(row.get("source_flags"), dict) else {}
+        source_breakdown = row.get("source_breakdown") if isinstance(row.get("source_breakdown"), dict) else {}
+        has_qualified_source = bool(source_flags.get("qualified"))
+        row["source_flags"] = source_flags
+        row["source_breakdown"] = source_breakdown
+        validation = _build_signal_validation_payload(
+            signal=row,
+            wallet_addresses=wallet_addresses,
+            has_qualified_source=has_qualified_source,
+        )
+        strategy_validation = row.get("validation")
+        has_strategy_validation = isinstance(strategy_validation, dict) and (
+            "is_tradeable" in row or "validation_reasons" in row
+        )
+        if has_strategy_validation:
+            checks = dict(strategy_validation.get("checks") or {})
+            checks.setdefault("has_market_id", bool(normalize_market_id(row.get("market_id"))))
+            checks.setdefault("has_wallets", bool(wallet_addresses))
+            checks.setdefault("has_direction", _signal_has_direction(row))
+            has_price_reference, price_in_bounds = _signal_has_price_reference(row)
+            checks.setdefault("has_price_reference", has_price_reference)
+            checks.setdefault("price_in_bounds", price_in_bounds)
+            checks["has_qualified_source"] = has_qualified_source
+            checks.setdefault(
+                "upstream_tradable",
+                bool(row.get("firehose_market_tradable", row.get("is_tradeable", True))),
+            )
+
+            row["validation"] = {
+                "is_valid": bool(row.get("is_valid", strategy_validation.get("is_valid", True))),
+                "is_actionable": bool(row.get("is_actionable", strategy_validation.get("is_actionable", True))),
+                "is_tradeable": bool(row.get("is_tradeable", strategy_validation.get("is_tradeable", True))),
+                "checks": checks,
+                "reasons": list(row.get("validation_reasons") or strategy_validation.get("reasons") or []),
+            }
+            row["is_valid"] = bool(row["validation"]["is_valid"])
+            row["is_actionable"] = bool(row["validation"]["is_actionable"])
+            row["is_tradeable"] = bool(row["validation"]["is_tradeable"])
+            row["validation_reasons"] = list(row["validation"]["reasons"])
+        else:
+            row["validation"] = validation
+            row["is_valid"] = bool(validation.get("is_valid"))
+            row["is_actionable"] = bool(validation.get("is_actionable"))
+            row["is_tradeable"] = bool(validation.get("is_tradeable"))
+            row["validation_reasons"] = list(validation.get("reasons") or [])
+
+    return rows
+
+
+async def _track_wallet_addresses(
+    addresses: list[str],
+    label: str,
+    fetch_initial: bool = False,
+) -> int:
+    tracked = 0
+    for address in addresses:
+        try:
+            await wallet_tracker.add_wallet(
+                address=address,
+                label=label,
+                fetch_initial=fetch_initial,
+            )
+            tracked += 1
+        except Exception:
+            continue
+    return tracked
+
+
+async def _ensure_discovered_wallet_entries(
+    addresses: list[str],
+    source_label: str = "group_member",
+) -> int:
+    """Ensure each address has a DiscoveredWallet row so it can participate
+    in pool scoring and confluence detection.  Creates stub entries for any
+    addresses not already present and marks them with appropriate source
+    flags.  Returns the number of newly created entries."""
+    if not addresses:
+        return 0
+
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(
+            pg_insert(DiscoveredWallet)
+            .values(
+                [
+                    {
+                        "address": address.strip().lower(),
+                        "discovered_at": utcnow(),
+                        "discovery_source": source_label,
+                        "source_flags": {
+                            "tracked_wallet": True,
+                            "group_member": True,
+                        },
+                    }
+                    for address in addresses
+                    if str(address or "").strip()
+                ]
+            )
+            .on_conflict_do_nothing(index_elements=[DiscoveredWallet.address])
+        )
+        await session.commit()
+        return int(result.rowcount or 0)
+
+
+def _apply_pool_flag_updates(
+    source_flags: dict,
+    *,
+    manual_include: Optional[bool] = None,
+    manual_exclude: Optional[bool] = None,
+    blacklisted: Optional[bool] = None,
+    tracked_wallet: Optional[bool] = None,
+) -> dict:
+    out = dict(source_flags)
+    if manual_include is not None:
+        out[POOL_FLAG_MANUAL_INCLUDE] = bool(manual_include)
+    if manual_exclude is not None:
+        out[POOL_FLAG_MANUAL_EXCLUDE] = bool(manual_exclude)
+    if blacklisted is not None:
+        out[POOL_FLAG_BLACKLISTED] = bool(blacklisted)
+    if tracked_wallet is not None:
+        out["tracked_wallet"] = bool(tracked_wallet)
+    return out
+
+
+async def _fetch_group_payload(
+    session: AsyncSession,
+    include_members: bool = False,
+    member_limit: int = 25,
+) -> list[dict]:
+    group_result = await session.execute(
+        select(TraderGroup)
+        .where(TraderGroup.is_active == True)  # noqa: E712
+        .order_by(TraderGroup.created_at.asc())
+    )
+    groups = list(group_result.scalars().all())
+    if not groups:
+        return []
+
+    group_ids = [g.id for g in groups]
+    member_result = await session.execute(
+        select(TraderGroupMember)
+        .where(TraderGroupMember.group_id.in_(group_ids))
+        .order_by(TraderGroupMember.added_at.asc())
+    )
+    members = list(member_result.scalars().all())
+
+    members_by_group: dict[str, list[TraderGroupMember]] = defaultdict(list)
+    all_addresses: set[str] = set()
+    for member in members:
+        members_by_group[member.group_id].append(member)
+        all_addresses.add(member.wallet_address.lower())
+
+    profile_map: dict[str, DiscoveredWallet] = {}
+    if all_addresses:
+        profile_rows = await session.execute(
+            select(DiscoveredWallet).where(DiscoveredWallet.address.in_(list(all_addresses)))
+        )
+        for wallet in profile_rows.scalars().all():
+            profile_map[wallet.address.lower()] = wallet
+
+    payload: list[dict] = []
+    for group in groups:
+        group_members = members_by_group.get(group.id, [])
+        item = {
+            "id": group.id,
+            "name": group.name,
+            "description": group.description,
+            "source_type": group.source_type,
+            "suggestion_key": group.suggestion_key,
+            "criteria": group.criteria or {},
+            "auto_track_members": bool(group.auto_track_members),
+            "member_count": len(group_members),
+            "created_at": group.created_at.isoformat() if group.created_at else None,
+            "updated_at": group.updated_at.isoformat() if group.updated_at else None,
+        }
+        if include_members:
+            member_payload = []
+            for member in group_members[:member_limit]:
+                profile = profile_map.get(member.wallet_address.lower())
+                member_payload.append(
+                    {
+                        "id": member.id,
+                        "wallet_address": member.wallet_address,
+                        "source": member.source,
+                        "confidence": member.confidence,
+                        "notes": member.notes,
+                        "added_at": member.added_at.isoformat() if member.added_at else None,
+                        "username": profile.username if profile else None,
+                        "composite_score": (profile.composite_score if profile else None),
+                        "quality_score": profile.quality_score if profile else None,
+                        "activity_score": profile.activity_score if profile else None,
+                        "pool_tier": profile.pool_tier if profile else None,
+                    }
+                )
+            item["members"] = member_payload
+        payload.append(item)
+
+    return payload
+
+
+# ==================== LEADERBOARD ====================
+
+
+@discovery_router.get("/leaderboard")
+async def get_leaderboard(
+    limit: int = Query(default=50, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    min_trades: int = Query(default=0, ge=0),
+    min_resolved_positions: int = Query(default=0, ge=0),
+    min_pnl: Optional[float] = Query(default=None),
+    insider_only: bool = Query(default=False),
+    min_insider_score: Optional[float] = Query(default=None, ge=0.0, le=1.0),
+    sort_by: str = Query(
+        default="rank_score",
+        description="rank_score, total_pnl, win_rate, sharpe_ratio, profit_factor, insider_score",
+    ),
+    sort_dir: str = Query(default="desc", description="asc or desc"),
+    tags: Optional[str] = Query(default=None, description="Comma-separated tag filter"),
+    recommendation: Optional[str] = Query(default=None, description="copy_candidate, monitor, avoid"),
+    time_period: Optional[str] = Query(
+        default=None,
+        description="Time period filter: 24h, 7d, 30d, 90d, or all (default all)",
+    ),
+    active_within_hours: Optional[int] = Query(
+        default=None,
+        ge=1,
+        le=720,
+        description="Only include wallets with activity within last N hours",
+    ),
+    min_activity_score: Optional[float] = Query(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        description="Minimum activity score filter",
+    ),
+    pool_only: bool = Query(
+        default=False,
+        description="Only include wallets currently in the smart top pool",
+    ),
+    tier: Optional[str] = Query(
+        default=None,
+        description="Pool tier filter: core, rising, standby",
+    ),
+    search: Optional[str] = Query(
+        default=None,
+        description="Search wallet address, username, tags, or strategy terms",
+    ),
+    unique_entities_only: bool = Query(
+        default=False,
+        description="Deduplicate clustered wallets so each entity appears once",
+    ),
+    market_category: Optional[str] = Query(
+        default=None,
+        description="Market focus filter: politics, sports, crypto, culture, economics, tech, finance, weather",
+    ),
+):
+    """
+    Get the wallet leaderboard with comprehensive filters and sorting.
+
+    Returns ranked wallets with trading stats, tags, and recommendations.
+    Supports pagination, multi-field sorting, and tag-based filtering.
+    """
+    try:
+        # Validate sort_by
+        valid_sort_fields = [
+            "rank_score",
+            "composite_score",
+            "quality_score",
+            "activity_score",
+            "stability_score",
+            "last_trade_at",
+            "total_pnl",
+            "total_returned",
+            "win_rate",
+            "sharpe_ratio",
+            "profit_factor",
+            "total_trades",
+            "avg_roi",
+            "sortino_ratio",
+            "trades_per_day",
+            "insider_score",
+        ]
+        if sort_by not in valid_sort_fields:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid sort_by. Must be one of: {valid_sort_fields}",
+            )
+
+        # Validate sort_dir
+        if sort_dir not in ("asc", "desc"):
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid sort_dir. Must be 'asc' or 'desc'",
+            )
+
+        # Validate recommendation
+        valid_recommendations = ["copy_candidate", "monitor", "avoid"]
+        if recommendation and recommendation not in valid_recommendations:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid recommendation. Must be one of: {valid_recommendations}",
+            )
+
+        # Validate market category (optional)
+        valid_market_categories = [
+            "politics",
+            "sports",
+            "crypto",
+            "culture",
+            "economics",
+            "tech",
+            "finance",
+            "weather",
+            "overall",
+            "all",
+        ]
+        if market_category and market_category.lower() not in valid_market_categories:
+            raise HTTPException(
+                status_code=400,
+                detail=(f"Invalid market_category. Must be one of: {valid_market_categories}"),
+            )
+
+        # Map time_period to rolling window key
+        window_key = None
+        if time_period and time_period != "all":
+            window_key = TIME_PERIOD_TO_WINDOW_KEY.get(time_period)
+            if window_key is None:
+                valid_periods = list(TIME_PERIOD_TO_WINDOW_KEY.keys()) + ["all"]
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid time_period. Must be one of: {valid_periods}",
+                )
+
+        # Parse comma-separated tags
+        tag_list = tags.split(",") if tags else None
+
+        result = await wallet_discovery.get_leaderboard(
+            limit=limit,
+            offset=offset,
+            min_trades=min_trades,
+            min_resolved_positions=min_resolved_positions,
+            min_pnl=min_pnl,
+            insider_only=insider_only,
+            min_insider_score=min_insider_score,
+            sort_by=sort_by,
+            sort_dir=sort_dir,
+            tags=tag_list,
+            recommendation=recommendation,
+            window_key=window_key,
+            active_within_hours=active_within_hours,
+            min_activity_score=min_activity_score,
+            pool_only=pool_only,
+            tier=tier,
+            search_text=search,
+            unique_entities_only=unique_entities_only,
+            market_category=market_category,
+        )
+
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@discovery_router.get("/leaderboard/stats")
+async def get_discovery_stats(session: AsyncSession = Depends(get_db_session)):
+    """
+    Get discovery engine statistics.
+
+    Returns total wallets analyzed, last run timestamp, coverage metrics,
+    and engine health information.
+    """
+    try:
+        return await _build_discovery_status(session)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==================== WALLET PROFILES ====================
+
+
+@discovery_router.get("/wallet/{wallet_address}/profile")
+async def get_wallet_profile(wallet_address: str):
+    """
+    Get comprehensive wallet profile with all metrics, tags, cluster info, and rolling windows.
+
+    Returns detailed analysis including trading statistics, detected strategies,
+    tag classifications, entity cluster membership, and performance over
+    multiple time windows.
+    """
+    try:
+        address = validate_eth_address(wallet_address)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    try:
+        profile = await wallet_discovery.get_wallet_profile(address)
+        if not profile:
+            raise HTTPException(status_code=404, detail="Wallet profile not found")
+        return profile
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@discovery_router.get("/wallet/{wallet_identifier}/win-rate")
+async def get_wallet_win_rate(
+    wallet_identifier: str,
+    time_period: str = Query("ALL", description="Time period: DAY, WEEK, MONTH, or ALL"),
+):
+    try:
+        resolved_address = await _resolve_wallet_address(wallet_identifier)
+        window_key = _resolve_wallet_summary_window_key(time_period)
+        profile = await wallet_discovery.get_wallet_profile(resolved_address)
+        if profile:
+            return _build_wallet_win_rate_payload(
+                address=resolved_address,
+                profile=profile,
+                window_key=window_key,
+            )
+
+        fast_result = await polymarket_client.calculate_win_rate_fast(resolved_address, min_positions=1)
+        if fast_result:
+            return {
+                "address": resolved_address,
+                "win_rate": fast_result["win_rate"],
+                "wins": fast_result["wins"],
+                "losses": fast_result["losses"],
+                "total_markets": fast_result["closed_positions"],
+                "trade_count": fast_result["closed_positions"],
+            }
+        return {
+            "address": resolved_address,
+            "win_rate": 0.0,
+            "wins": 0,
+            "losses": 0,
+            "total_markets": 0,
+            "trade_count": 0,
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@discovery_router.get("/wallet/{wallet_identifier}/pnl")
+async def get_wallet_pnl(
+    wallet_identifier: str,
+    time_period: str = Query("ALL", description="Time period: DAY, WEEK, MONTH, or ALL"),
+):
+    try:
+        resolved_address = await _resolve_wallet_address(wallet_identifier)
+        window_key = _resolve_wallet_summary_window_key(time_period)
+        profile = await wallet_discovery.get_wallet_profile(resolved_address)
+        if profile:
+            return _build_wallet_pnl_payload(
+                address=resolved_address,
+                profile=profile,
+                window_key=window_key,
+            )
+
+        return await polymarket_client.get_wallet_pnl(resolved_address, time_period=time_period)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@discovery_router.post("/wallet/{wallet_identifier}/track")
+async def track_wallet(
+    wallet_identifier: str,
+    payload: Optional[TrackWalletRequest] = None,
+):
+    try:
+        resolved_address = await _resolve_wallet_address(wallet_identifier)
+        analysis_upserted = False
+        profile = await wallet_discovery.get_wallet_profile(resolved_address)
+        if profile is None:
+            analysis = await wallet_discovery.analyze_wallet(resolved_address)
+            if analysis is not None:
+                await wallet_discovery._upsert_wallet(analysis)
+                await wallet_discovery.refresh_leaderboard()
+                analysis_upserted = True
+                profile = await wallet_discovery.get_wallet_profile(resolved_address)
+
+        if analysis_upserted:
+            try:
+                await smart_wallet_pool.recompute_pool()
+            except Exception as exc:
+                logger.warning(
+                    "Smart pool recompute after wallet track failed",
+                    address=resolved_address,
+                    exc_info=exc,
+                )
+
+        analysis_payload = (
+            _build_wallet_pnl_payload(
+                address=resolved_address,
+                profile=profile,
+                window_key=None,
+            )
+            if profile
+            else await polymarket_client.get_wallet_pnl(resolved_address)
+        )
+        wallet_label = (
+            payload.label
+            if payload and payload.label
+            else f"Discovered ({analysis_payload.get('roi_percent', 0):.1f}% ROI)"
+        )
+        await wallet_tracker.add_wallet(resolved_address, wallet_label)
+
+        return {
+            "status": "success",
+            "wallet": resolved_address,
+            "label": wallet_label,
+            "analysis": analysis_payload,
+            "tracking": True,
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+# ==================== DISCOVERY CONTROL ====================
+
+
+@discovery_router.post("/run")
+async def trigger_discovery(
+    session: AsyncSession = Depends(get_db_session),
+):
+    """
+    Queue a one-time discovery run for the discovery worker.
+    """
+    if global_pause_state.is_paused:
+        raise HTTPException(
+            status_code=409,
+            detail="Global pause is active. Resume all workers before queueing runs.",
+        )
+    try:
+        await discovery_shared_state.request_one_discovery_run(session)
+        return {
+            "status": "queued",
+            "message": "Discovery run requested; worker will execute on next cycle.",
+            **await discovery_shared_state.get_discovery_status_from_db(session),
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@discovery_router.post("/start")
+async def start_discovery_worker(session: AsyncSession = Depends(get_db_session)):
+    """Resume automatic discovery worker cycles."""
+    if global_pause_state.is_paused:
+        raise HTTPException(
+            status_code=409,
+            detail="Global pause is active. Use /workers/resume-all first.",
+        )
+    await discovery_shared_state.set_discovery_paused(session, False)
+    return {
+        "status": "started",
+        **await discovery_shared_state.get_discovery_status_from_db(session),
+    }
+
+
+@discovery_router.post("/pause")
+async def pause_discovery_worker(session: AsyncSession = Depends(get_db_session)):
+    """Pause automatic discovery worker cycles."""
+    await discovery_shared_state.set_discovery_paused(session, True)
+    return {
+        "status": "paused",
+        **await discovery_shared_state.get_discovery_status_from_db(session),
+    }
+
+
+@discovery_router.post("/interval")
+async def set_discovery_interval(
+    interval_minutes: int = Query(..., ge=5, le=1440),
+    session: AsyncSession = Depends(get_db_session),
+):
+    """Set discovery worker cadence in minutes."""
+    await discovery_shared_state.set_discovery_interval(session, interval_minutes)
+    return {
+        "status": "updated",
+        **await discovery_shared_state.get_discovery_status_from_db(session),
+    }
+
+
+@discovery_router.post("/priority-backlog-mode")
+async def set_discovery_priority_backlog_mode(
+    enabled: bool = Query(..., description="Enable backlog-priority cadence and queue"),
+    session: AsyncSession = Depends(get_db_session),
+):
+    """Enable or disable discovery priority backlog mode."""
+    await discovery_shared_state.set_discovery_priority_backlog_mode(session, enabled)
+    return {
+        "status": "updated",
+        **await discovery_shared_state.get_discovery_status_from_db(session),
+    }
+
+
+@discovery_router.post("/refresh-leaderboard")
+async def trigger_refresh():
+    """
+    Force a leaderboard rank recalculation.
+
+    Recomputes rank scores for all tracked wallets using the latest
+    metrics without running a full discovery scan.
+    """
+    try:
+        result = await wallet_discovery.refresh_leaderboard()
+        return {
+            "status": "success",
+            "message": "Leaderboard refreshed",
+            "result": result,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==================== CONFLUENCE SIGNALS ====================
+
+
+@discovery_router.get("/confluence")
+async def get_confluence_signals(
+    min_strength: float = Query(default=0.0, ge=0.0, le=1.0),
+    min_tier: str = Query(default="WATCH", description="WATCH, HIGH, EXTREME"),
+    limit: int = Query(default=50, ge=1, le=200),
+):
+    """
+    Get active confluence signals.
+
+    Identifies markets where multiple top-ranked wallets are converging
+    on the same position. Higher strength indicates stronger agreement
+    among skilled traders.
+    """
+    try:
+        signals = await StrategySDK.get_trader_confluence_signals(
+            min_strength=min_strength,
+            min_tier=min_tier,
+            limit=limit,
+        )
+        return {"signals": signals}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@discovery_router.post("/confluence/scan")
+async def trigger_confluence_scan():
+    """
+    Trigger a manual confluence scan.
+
+    Analyzes current positions of top wallets to detect convergence
+    patterns across active markets.
+    """
+    try:
+        result = await wallet_intelligence.confluence.scan_for_confluence()
+        return {
+            "status": "success",
+            "message": "Confluence scan completed",
+            "result": result,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@discovery_router.get("/pool/stats")
+async def get_smart_pool_stats(session: AsyncSession = Depends(get_db_session)):
+    """Get near-real-time smart wallet pool health metrics."""
+    try:
+        canonical = await smart_wallet_pool.get_pool_stats()
+        worker = await read_worker_snapshot(session, "tracked_traders")
+        stats = worker.get("stats") or {}
+        if isinstance(stats, dict):
+            pool_stats = stats.get("pool_stats")
+            if isinstance(pool_stats, dict):
+                # Worker owns tracked-traders runtime state; API canonical values
+                # are only authoritative for direct DB-count fields.
+                merged = {**pool_stats}
+                for key in (
+                    "pool_size",
+                    "active_1h",
+                    "active_24h",
+                    "active_1h_pct",
+                    "active_24h_pct",
+                    "freshest_trade_at",
+                    "stale_floor_trade_at",
+                ):
+                    if key in canonical and canonical.get(key) is not None:
+                        merged[key] = canonical.get(key)
+                for key, value in canonical.items():
+                    if key not in merged:
+                        merged[key] = value
+                for key in (
+                    "last_pool_recompute_at",
+                    "last_full_sweep_at",
+                    "last_incremental_refresh_at",
+                    "last_activity_reconciliation_at",
+                    "last_error",
+                    "candidates_last_sweep",
+                    "events_last_reconcile",
+                ):
+                    if merged.get(key) in (None, "") and pool_stats.get(key) not in (None, ""):
+                        merged[key] = pool_stats.get(key)
+                return merged
+        return canonical
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@discovery_router.post("/pool/actions/recompute")
+async def recompute_smart_pool(
+    mode: str = Query(
+        default=POOL_RECOMPUTE_MODE_QUALITY_ONLY,
+        description="quality_only or balanced",
+    ),
+):
+    """Force smart pool recomputation with optional mode override."""
+    normalized = str(mode or "").strip().lower()
+    valid_modes = {POOL_RECOMPUTE_MODE_QUALITY_ONLY, POOL_RECOMPUTE_MODE_BALANCED}
+    if normalized not in valid_modes:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid mode. Must be one of: {sorted(valid_modes)}",
+        )
+    try:
+        await smart_wallet_pool.recompute_pool(mode=normalized)
+        return {
+            "status": "success",
+            "mode": smart_wallet_pool.get_recompute_mode(),
+            "pool_stats": await smart_wallet_pool.get_pool_stats(),
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@discovery_router.get("/pool/members")
+async def get_pool_members(
+    limit: int = Query(default=300, ge=1, le=1000),
+    offset: int = Query(default=0, ge=0),
+    pool_only: bool = Query(default=True),
+    tracked_only: bool = Query(default=False),
+    include_blacklisted: bool = Query(default=True),
+    tier: Optional[str] = Query(default=None, description="core or rising"),
+    search: Optional[str] = Query(default=None),
+    min_win_rate: float = Query(
+        default=0.0,
+        ge=0.0,
+        le=100.0,
+        description="Minimum win rate threshold (percent 0-100 or ratio 0-1).",
+    ),
+    sort_by: str = Query(
+        default="composite_score",
+        description=(
+            "selection_score, composite_score, quality_score, activity_score, "
+            "trades_24h, trades_1h, total_trades, total_pnl, win_rate, "
+            "last_trade_at, rank_score"
+        ),
+    ),
+    sort_dir: str = Query(default="desc", description="asc or desc"),
+    session: AsyncSession = Depends(get_db_session),
+):
+    """List smart-pool members with actionable flags for management workflows."""
+    try:
+        pool_only = _resolve_query_bool(pool_only)
+        tracked_only = _resolve_query_bool(tracked_only)
+        include_blacklisted = _resolve_query_bool(include_blacklisted)
+
+        valid_sort_fields = {
+            "selection_score": lambda row: float(row.get("selection_score") or row.get("composite_score") or 0.0),
+            "composite_score": lambda row: float(row.get("composite_score") or 0.0),
+            "quality_score": lambda row: float(row.get("quality_score") or 0.0),
+            "activity_score": lambda row: float(row.get("activity_score") or 0.0),
+            "trades_24h": lambda row: int(row.get("trades_24h") or 0),
+            "trades_1h": lambda row: int(row.get("trades_1h") or 0),
+            "total_trades": lambda row: int(row.get("total_trades") or 0),
+            "total_pnl": lambda row: float(row.get("total_pnl") or 0.0),
+            "win_rate": lambda row: float(row.get("win_rate") or 0.0),
+            "last_trade_at": lambda row: row.get("last_trade_at") or "",
+            "rank_score": lambda row: float(row.get("rank_score") or 0.0),
+        }
+        if sort_by not in valid_sort_fields:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid sort_by. Must be one of: {list(valid_sort_fields)}",
+            )
+        if sort_dir not in {"asc", "desc"}:
+            raise HTTPException(status_code=400, detail="sort_dir must be asc or desc")
+
+        min_win_rate_ratio = _normalize_win_rate_ratio(_resolve_query_default(min_win_rate))
+        tracked_rows = []
+        tracked_addresses: set[str] = set()
+        tracked_labels: dict[str, str] = {}
+        if tracked_only:
+            tracked_result = await session.execute(select(TrackedWallet.address, TrackedWallet.label))
+            tracked_rows = list(tracked_result.all())
+            tracked_addresses = {str(row[0]).lower() for row in tracked_rows}
+            tracked_labels = {
+                str(row[0]).lower(): str(row[1]).strip()
+                for row in tracked_rows
+                if row[1] is not None and str(row[1]).strip()
+            }
+            if not tracked_addresses:
+                return {
+                    "total": 0,
+                    "offset": offset,
+                    "limit": limit,
+                    "members": [],
+                    "stats": {
+                        "pool_members": 0,
+                        "blacklisted": 0,
+                        "manual_included": 0,
+                        "manual_excluded": 0,
+                        "tracked_in_pool": 0,
+                        "tracked_total": 0,
+                    },
+                }
+
+        normalized_win_rate_expr = case(
+            (
+                func.coalesce(DiscoveredWallet.win_rate, 0.0) > 1.0,
+                func.coalesce(DiscoveredWallet.win_rate, 0.0) / 100.0,
+            ),
+            else_=func.coalesce(DiscoveredWallet.win_rate, 0.0),
+        )
+        wallet_query = select(DiscoveredWallet).options(
+            load_only(
+                DiscoveredWallet.address,
+                DiscoveredWallet.username,
+                DiscoveredWallet.last_analyzed_at,
+                DiscoveredWallet.win_rate,
+                DiscoveredWallet.wins,
+                DiscoveredWallet.losses,
+                DiscoveredWallet.total_pnl,
+                DiscoveredWallet.total_trades,
+                DiscoveredWallet.rank_score,
+                DiscoveredWallet.quality_score,
+                DiscoveredWallet.activity_score,
+                DiscoveredWallet.stability_score,
+                DiscoveredWallet.composite_score,
+                DiscoveredWallet.last_trade_at,
+                DiscoveredWallet.trades_1h,
+                DiscoveredWallet.trades_24h,
+                DiscoveredWallet.in_top_pool,
+                DiscoveredWallet.pool_tier,
+                DiscoveredWallet.pool_membership_reason,
+                DiscoveredWallet.source_flags,
+                DiscoveredWallet.tags,
+                DiscoveredWallet.strategies_detected,
+                DiscoveredWallet.cluster_id,
+            )
+        )
+        if pool_only:
+            wallet_query = wallet_query.where(DiscoveredWallet.in_top_pool == True)  # noqa: E712
+        if tracked_only:
+            wallet_query = wallet_query.where(DiscoveredWallet.address.in_(sorted(tracked_addresses)))
+        if tier:
+            wallet_query = wallet_query.where(func.lower(func.coalesce(DiscoveredWallet.pool_tier, "")) == str(tier).lower())
+        if min_win_rate_ratio > 0.0:
+            wallet_query = wallet_query.where(normalized_win_rate_expr >= min_win_rate_ratio)
+        if not include_blacklisted:
+            wallet_query = wallet_query.where(
+                func.coalesce(DiscoveredWallet.source_flags[POOL_FLAG_BLACKLISTED].as_boolean(), False) == False  # noqa: E712
+            )
+
+        wallets_result = await session.execute(wallet_query)
+        wallets = list(wallets_result.scalars().all())
+        if not tracked_only:
+            tracked_result = await session.execute(select(TrackedWallet.address, TrackedWallet.label))
+            tracked_rows = list(tracked_result.all())
+        tracked_addresses = {str(row[0]).lower() for row in tracked_rows}
+        tracked_labels = {
+            str(row[0]).lower(): str(row[1]).strip()
+            for row in tracked_rows
+            if row[1] is not None and str(row[1]).strip()
+        }
+
+        cluster_ids = sorted(
+            {str(w.cluster_id).strip() for w in wallets if w.cluster_id is not None and str(w.cluster_id).strip()}
+        )
+        cluster_labels: dict[str, str] = {}
+        if cluster_ids:
+            cluster_rows = await session.execute(
+                select(WalletCluster.id, WalletCluster.label).where(WalletCluster.id.in_(cluster_ids))
+            )
+            cluster_labels = {
+                str(row[0]).strip().lower(): str(row[1]).strip()
+                for row in cluster_rows.all()
+                if row[1] is not None and str(row[1]).strip()
+            }
+
+        def _looks_placeholder_label(value: Optional[str]) -> bool:
+            text = str(value or "").strip()
+            if not text:
+                return True
+            lower = text.lower()
+            if lower.startswith("0x") and ("..." in text or len(text) <= 16):
+                return True
+            return False
+
+        query = (search or "").strip().lower()
+        rows: list[dict] = []
+        blacklisted_count = 0
+        manual_included_count = 0
+        manual_excluded_count = 0
+        pool_member_count = 0
+        tracked_in_pool_count = 0
+
+        for wallet in wallets:
+            source_flags = _coerce_source_flags(wallet.source_flags)
+            flags = _pool_flags(source_flags)
+            categories = _market_categories_from_flags(source_flags)
+            addr_l = wallet.address.lower()
+            is_tracked = addr_l in tracked_addresses
+            tracked_label = tracked_labels.get(addr_l)
+            cluster_label = cluster_labels.get(str(wallet.cluster_id or "").strip().lower())
+
+            username = str(wallet.username or "").strip() or None
+            display_name = username
+            name_source = "username" if display_name else "unresolved"
+            if not display_name and tracked_label and not _looks_placeholder_label(tracked_label):
+                display_name = tracked_label
+                name_source = "tracked_label"
+            if not display_name and cluster_label:
+                display_name = cluster_label
+                name_source = "cluster_label"
+
+            selection_meta = source_flags.get("pool_selection_meta")
+            if not isinstance(selection_meta, dict):
+                selection_meta = {}
+            raw_reasons = selection_meta.get("reasons")
+            selection_reasons = [r for r in raw_reasons if isinstance(r, dict)] if isinstance(raw_reasons, list) else []
+            selection_breakdown = selection_meta.get("score_breakdown")
+            if not isinstance(selection_breakdown, dict):
+                selection_breakdown = {}
+            try:
+                selection_score = float(
+                    selection_meta.get("selection_score")
+                    if selection_meta.get("selection_score") is not None
+                    else (wallet.composite_score or 0.0)
+                )
+            except Exception:
+                selection_score = float(wallet.composite_score or 0.0)
+            try:
+                selection_rank = (
+                    int(selection_meta.get("selection_rank"))
+                    if selection_meta.get("selection_rank") is not None
+                    else None
+                )
+            except Exception:
+                selection_rank = None
+            try:
+                selection_percentile = (
+                    float(selection_meta.get("selection_percentile"))
+                    if selection_meta.get("selection_percentile") is not None
+                    else None
+                )
+            except Exception:
+                selection_percentile = None
+            raw_eligibility_status = str(selection_meta.get("eligibility_status") or "").strip().lower()
+            if raw_eligibility_status in {"eligible", "blocked"}:
+                eligibility_status = raw_eligibility_status
+            else:
+                eligibility_status = "eligible" if wallet.in_top_pool else "blocked"
+            raw_blockers = selection_meta.get("eligibility_blockers")
+            if isinstance(raw_blockers, list):
+                eligibility_blockers = [item for item in raw_blockers if isinstance(item, (dict, str))]
+            else:
+                eligibility_blockers = []
+            # Defensive reconciliation: membership is canonical for pool view.
+            # Stale metadata should not surface blocked state/reasons for active pool members.
+            if wallet.in_top_pool:
+                eligibility_status = "eligible"
+                eligibility_blockers = []
+                if selection_reasons:
+                    selection_reasons = [
+                        reason
+                        for reason in selection_reasons
+                        if str((reason or {}).get("code") or "").strip().lower()
+                        not in {
+                            "not_analyzed",
+                            "recommendation_blocked",
+                            "insufficient_trades",
+                            "anomaly_too_high",
+                            "non_positive_pnl",
+                            "tier_thresholds_not_met",
+                            "below_selection_cutoff",
+                        }
+                    ]
+            try:
+                analysis_freshness_hours = (
+                    float(selection_meta.get("analysis_freshness_hours"))
+                    if selection_meta.get("analysis_freshness_hours") is not None
+                    else None
+                )
+            except Exception:
+                analysis_freshness_hours = None
+            if analysis_freshness_hours is None and wallet.last_analyzed_at is not None:
+                analysis_freshness_hours = round(
+                    max(
+                        (utcnow() - wallet.last_analyzed_at).total_seconds(),
+                        0.0,
+                    )
+                    / 3600.0,
+                    2,
+                )
+            quality_gate_version = (
+                str(selection_meta.get("quality_gate_version")).strip()
+                if selection_meta.get("quality_gate_version") is not None
+                else None
+            )
+
+            if flags["blacklisted"]:
+                blacklisted_count += 1
+            if flags["manual_include"]:
+                manual_included_count += 1
+            if flags["manual_exclude"]:
+                manual_excluded_count += 1
+
+            if tracked_only and not is_tracked:
+                continue
+            if pool_only and not wallet.in_top_pool:
+                continue
+            if not include_blacklisted and flags["blacklisted"]:
+                continue
+            if tier and (wallet.pool_tier or "").lower() != str(tier).lower():
+                continue
+            normalized_win_rate = _normalize_win_rate_ratio(wallet.win_rate)
+            if normalized_win_rate < min_win_rate_ratio:
+                continue
+            resolved_positions = max(int(wallet.wins or 0) + int(wallet.losses or 0), 0)
+
+            tag_text = " ".join(wallet.tags or [])
+            strategy_text = " ".join(wallet.strategies_detected or [])
+            category_text = " ".join(categories)
+            if query:
+                haystack = " ".join(
+                    [
+                        wallet.address.lower(),
+                        str(wallet.username or "").lower(),
+                        str(display_name or "").lower(),
+                        str(tracked_label or "").lower(),
+                        str(wallet.pool_tier or "").lower(),
+                        tag_text.lower(),
+                        strategy_text.lower(),
+                        category_text.lower(),
+                    ]
+                )
+                if query not in haystack:
+                    continue
+
+            row = {
+                "address": wallet.address,
+                "username": wallet.username,
+                "display_name": display_name,
+                "name_source": name_source,
+                "tracked_label": tracked_label,
+                "cluster_label": cluster_label,
+                "in_top_pool": bool(wallet.in_top_pool),
+                "pool_tier": wallet.pool_tier,
+                "pool_membership_reason": wallet.pool_membership_reason,
+                "rank_score": wallet.rank_score or 0.0,
+                "composite_score": wallet.composite_score or 0.0,
+                "quality_score": wallet.quality_score or 0.0,
+                "activity_score": wallet.activity_score or 0.0,
+                "stability_score": wallet.stability_score or 0.0,
+                "selection_score": selection_score,
+                "selection_rank": selection_rank,
+                "selection_percentile": selection_percentile,
+                "selection_reasons": selection_reasons,
+                "selection_breakdown": selection_breakdown,
+                "selection_updated_at": selection_meta.get("updated_at"),
+                "eligibility_status": eligibility_status,
+                "eligibility_blockers": eligibility_blockers,
+                "analysis_freshness_hours": analysis_freshness_hours,
+                "quality_gate_version": quality_gate_version,
+                "trades_1h": wallet.trades_1h or 0,
+                "trades_24h": wallet.trades_24h or 0,
+                "last_trade_at": wallet.last_trade_at.isoformat() if wallet.last_trade_at else None,
+                "wins": wallet.wins or 0,
+                "losses": wallet.losses or 0,
+                "resolved_positions": resolved_positions,
+                "total_trades": wallet.total_trades or 0,
+                "total_pnl": wallet.total_pnl or 0.0,
+                "win_rate": normalized_win_rate,
+                "win_rate_score": wallet_discovery._confidence_adjusted_win_rate(
+                    wins=wallet.wins,
+                    losses=wallet.losses,
+                ),
+                "win_rate_confidence": wallet_discovery._win_rate_confidence(resolved_positions),
+                "tags": wallet.tags or [],
+                "strategies_detected": wallet.strategies_detected or [],
+                "market_categories": categories,
+                "primary_market_category": None,
+                "primary_market_category_share": None,
+                "primary_market_category_basis": None,
+                "tracked_wallet": is_tracked,
+                "pool_flags": flags,
+            }
+            rows.append(row)
+            if row["in_top_pool"]:
+                pool_member_count += 1
+                if is_tracked:
+                    tracked_in_pool_count += 1
+
+        if sort_by == "win_rate":
+            rows.sort(
+                key=lambda row: (
+                    float(row.get("win_rate") or 0.0),
+                    int(row.get("resolved_positions") or 0),
+                    float(row.get("total_pnl") or 0.0),
+                ),
+                reverse=(sort_dir != "asc"),
+            )
+        else:
+            rows.sort(
+                key=valid_sort_fields[sort_by],
+                reverse=(sort_dir != "asc"),
+            )
+
+        total = len(rows)
+        page = rows[offset : offset + limit]
+        primary_profiles = await _load_primary_market_category_profiles(
+            session=session,
+            wallet_addresses=[str(row.get("address") or "") for row in page],
+        )
+        for row in page:
+            address_key = normalize_market_id(row.get("address"))
+            profile = primary_profiles.get(address_key)
+            if profile:
+                row["primary_market_category"] = profile.get("category")
+                row["primary_market_category_share"] = profile.get("share")
+                row["primary_market_category_basis"] = profile.get("basis")
+                continue
+
+            fallback_category = None
+            for category in row.get("market_categories") or []:
+                normalized = _normalize_primary_market_category(category)
+                if normalized:
+                    fallback_category = normalized
+                    break
+            row["primary_market_category"] = fallback_category
+            row["primary_market_category_share"] = None
+            row["primary_market_category_basis"] = "flags" if fallback_category else None
+
+        return {
+            "total": total,
+            "offset": offset,
+            "limit": limit,
+            "members": page,
+            "stats": {
+                "pool_members": pool_member_count,
+                "blacklisted": blacklisted_count,
+                "manual_included": manual_included_count,
+                "manual_excluded": manual_excluded_count,
+                "tracked_in_pool": tracked_in_pool_count,
+                "tracked_total": len(tracked_addresses),
+            },
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@discovery_router.post("/pool/members/{wallet_address}/manual-include")
+async def pool_manual_include(
+    wallet_address: str,
+    payload: Optional[PoolFlagRequest] = None,
+    session: AsyncSession = Depends(get_db_session),
+):
+    """Force-include a wallet in the pool unless blacklisted."""
+    try:
+        address = validate_eth_address(wallet_address).lower()
+        wallet = await session.get(DiscoveredWallet, address)
+        if wallet is None:
+            await session.execute(
+                pg_insert(DiscoveredWallet)
+                .values(
+                    address=address,
+                    discovered_at=utcnow(),
+                    discovery_source="manual_pool",
+                )
+                .on_conflict_do_nothing(index_elements=[DiscoveredWallet.address])
+            )
+            wallet = await session.get(DiscoveredWallet, address)
+        if wallet is None:
+            raise HTTPException(status_code=500, detail="Failed to materialize discovered wallet row")
+
+        source_flags = _coerce_source_flags(wallet.source_flags)
+        source_flags = _apply_pool_flag_updates(
+            source_flags,
+            manual_include=True,
+            manual_exclude=False,
+            blacklisted=False,
+        )
+        if payload and payload.reason:
+            source_flags["pool_manual_reason"] = payload.reason
+        wallet.source_flags = source_flags
+        await session.commit()
+
+        await smart_wallet_pool.recompute_pool()
+        return {"status": "success", "address": address, "pool_flags": _pool_flags(source_flags)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@discovery_router.delete("/pool/members/{wallet_address}/manual-include")
+async def clear_pool_manual_include(
+    wallet_address: str,
+    session: AsyncSession = Depends(get_db_session),
+):
+    """Clear manual include override for a wallet."""
+    try:
+        address = validate_eth_address(wallet_address).lower()
+        wallet = await session.get(DiscoveredWallet, address)
+        if wallet is None:
+            raise HTTPException(status_code=404, detail="Wallet not found")
+        source_flags = _coerce_source_flags(wallet.source_flags)
+        source_flags = _apply_pool_flag_updates(source_flags, manual_include=False)
+        wallet.source_flags = source_flags
+        await session.commit()
+
+        await smart_wallet_pool.recompute_pool()
+        return {"status": "success", "address": address, "pool_flags": _pool_flags(source_flags)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@discovery_router.post("/pool/members/{wallet_address}/manual-exclude")
+async def pool_manual_exclude(
+    wallet_address: str,
+    payload: Optional[PoolFlagRequest] = None,
+    session: AsyncSession = Depends(get_db_session),
+):
+    """Force-exclude a wallet from the pool."""
+    try:
+        address = validate_eth_address(wallet_address).lower()
+        wallet = await session.get(DiscoveredWallet, address)
+        if wallet is None:
+            raise HTTPException(status_code=404, detail="Wallet not found")
+
+        source_flags = _coerce_source_flags(wallet.source_flags)
+        source_flags = _apply_pool_flag_updates(
+            source_flags,
+            manual_include=False,
+            manual_exclude=True,
+        )
+        if payload and payload.reason:
+            source_flags["pool_manual_reason"] = payload.reason
+        wallet.source_flags = source_flags
+        await session.commit()
+
+        await smart_wallet_pool.recompute_pool()
+        return {"status": "success", "address": address, "pool_flags": _pool_flags(source_flags)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@discovery_router.delete("/pool/members/{wallet_address}/manual-exclude")
+async def clear_pool_manual_exclude(
+    wallet_address: str,
+    session: AsyncSession = Depends(get_db_session),
+):
+    """Clear manual exclude override for a wallet."""
+    try:
+        address = validate_eth_address(wallet_address).lower()
+        wallet = await session.get(DiscoveredWallet, address)
+        if wallet is None:
+            raise HTTPException(status_code=404, detail="Wallet not found")
+        source_flags = _coerce_source_flags(wallet.source_flags)
+        source_flags = _apply_pool_flag_updates(source_flags, manual_exclude=False)
+        wallet.source_flags = source_flags
+        await session.commit()
+
+        await smart_wallet_pool.recompute_pool()
+        return {"status": "success", "address": address, "pool_flags": _pool_flags(source_flags)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@discovery_router.post("/pool/members/{wallet_address}/blacklist")
+async def blacklist_pool_wallet(
+    wallet_address: str,
+    payload: Optional[PoolFlagRequest] = None,
+    session: AsyncSession = Depends(get_db_session),
+):
+    """Blacklist wallet from pool selection."""
+    try:
+        address = validate_eth_address(wallet_address).lower()
+        wallet = await session.get(DiscoveredWallet, address)
+        if wallet is None:
+            raise HTTPException(status_code=404, detail="Wallet not found")
+        source_flags = _coerce_source_flags(wallet.source_flags)
+        source_flags = _apply_pool_flag_updates(
+            source_flags,
+            blacklisted=True,
+            manual_include=False,
+            manual_exclude=True,
+        )
+        if payload and payload.reason:
+            source_flags["pool_blacklist_reason"] = payload.reason
+        wallet.source_flags = source_flags
+        await session.commit()
+
+        await smart_wallet_pool.recompute_pool()
+        return {"status": "success", "address": address, "pool_flags": _pool_flags(source_flags)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@discovery_router.delete("/pool/members/{wallet_address}/blacklist")
+async def unblacklist_pool_wallet(
+    wallet_address: str,
+    session: AsyncSession = Depends(get_db_session),
+):
+    """Remove wallet from pool blacklist."""
+    try:
+        address = validate_eth_address(wallet_address).lower()
+        wallet = await session.get(DiscoveredWallet, address)
+        if wallet is None:
+            raise HTTPException(status_code=404, detail="Wallet not found")
+        source_flags = _coerce_source_flags(wallet.source_flags)
+        source_flags = _apply_pool_flag_updates(source_flags, blacklisted=False)
+        wallet.source_flags = source_flags
+        await session.commit()
+
+        await smart_wallet_pool.recompute_pool()
+        return {"status": "success", "address": address, "pool_flags": _pool_flags(source_flags)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@discovery_router.delete("/pool/members/{wallet_address}")
+async def delete_pool_wallet(
+    wallet_address: str,
+    session: AsyncSession = Depends(get_db_session),
+):
+    """Delete wallet from discovery/tracking datasets and remove from pool."""
+    try:
+        address = validate_eth_address(wallet_address).lower()
+
+        removed_discovered = (
+            await session.execute(delete(DiscoveredWallet).where(DiscoveredWallet.address == address))
+        ).rowcount or 0
+        removed_rollups = (
+            await session.execute(delete(WalletActivityRollup).where(WalletActivityRollup.wallet_address == address))
+        ).rowcount or 0
+        removed_tracked = (
+            await session.execute(delete(TrackedWallet).where(TrackedWallet.address == address))
+        ).rowcount or 0
+        removed_group_memberships = (
+            await session.execute(delete(TraderGroupMember).where(TraderGroupMember.wallet_address == address))
+        ).rowcount or 0
+        await session.commit()
+
+        await smart_wallet_pool.recompute_pool()
+        return {
+            "status": "success",
+            "address": address,
+            "removed": {
+                "discovered_wallets": int(removed_discovered),
+                "wallet_activity_rollups": int(removed_rollups),
+                "tracked_wallets": int(removed_tracked),
+                "group_memberships": int(removed_group_memberships),
+            },
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@discovery_router.post("/pool/actions/promote-tracked")
+async def promote_tracked_wallets_to_pool(
+    limit: int = Query(default=300, ge=1, le=2000),
+    session: AsyncSession = Depends(get_db_session),
+):
+    """Promote tracked-wallet list into manual-included pool candidates."""
+    try:
+        tracked_rows = (
+            (await session.execute(select(TrackedWallet).order_by(TrackedWallet.added_at.asc()).limit(limit)))
+            .scalars()
+            .all()
+        )
+        tracked_addresses = [row.address.lower() for row in tracked_rows if row.address]
+        if not tracked_addresses:
+            return {"status": "success", "promoted": 0, "created": 0, "updated": 0}
+
+        insert_result = await session.execute(
+            pg_insert(DiscoveredWallet)
+            .values(
+                [
+                    {
+                        "address": address,
+                        "discovered_at": utcnow(),
+                        "discovery_source": "manual_pool",
+                    }
+                    for address in tracked_addresses
+                ]
+            )
+            .on_conflict_do_nothing(index_elements=[DiscoveredWallet.address])
+        )
+        existing_rows = (
+            (await session.execute(select(DiscoveredWallet).where(DiscoveredWallet.address.in_(tracked_addresses))))
+            .scalars()
+            .all()
+        )
+        existing = {row.address.lower(): row for row in existing_rows}
+
+        created = int(insert_result.rowcount or 0)
+        updated = max(0, len(tracked_addresses) - created)
+        for address in tracked_addresses:
+            wallet = existing.get(address)
+            if wallet is None:
+                continue
+
+            source_flags = _coerce_source_flags(wallet.source_flags)
+            source_flags = _apply_pool_flag_updates(
+                source_flags,
+                manual_include=True,
+                manual_exclude=False,
+                blacklisted=False,
+                tracked_wallet=True,
+            )
+            wallet.source_flags = source_flags
+
+        await session.commit()
+        await smart_wallet_pool.recompute_pool()
+
+        return {
+            "status": "success",
+            "promoted": len(tracked_addresses),
+            "created": created,
+            "updated": updated,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@discovery_router.get("/traders")
+async def get_traders_overview(
+    tracked_limit: int = Query(default=200, ge=1, le=500),
+    confluence_limit: int = Query(default=50, ge=1, le=200),
+    hours: int = Query(
+        default=24,
+        ge=1,
+        le=168,
+        description="Tracked trade activity window in hours",
+    ),
+    session: AsyncSession = Depends(get_db_session),
+):
+    """Broader traders view: tracked traders + discovery confluence + groups."""
+    try:
+        cutoff = utcnow() - timedelta(hours=hours)
+        tracked_wallet_rows = (
+            (
+                await session.execute(
+                    select(TrackedWallet.address, TrackedWallet.label).order_by(TrackedWallet.added_at.asc())
+                )
+            )
+            .all()
+        )
+        tracked_addresses = [str(address or "").strip().lower() for address, _ in tracked_wallet_rows if address]
+
+        discovered_by_address: dict[str, DiscoveredWallet] = {}
+        activity_by_address: dict[str, dict[str, Any]] = {}
+        if tracked_addresses:
+            discovered_rows = (
+                (
+                    await session.execute(
+                        select(DiscoveredWallet).where(func.lower(DiscoveredWallet.address).in_(tracked_addresses))
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            discovered_by_address = {
+                str(row.address or "").strip().lower(): row for row in discovered_rows if str(row.address or "").strip()
+            }
+            activity_rows = (
+                await session.execute(
+                    select(
+                        func.lower(WalletActivityRollup.wallet_address).label("wallet_address"),
+                        func.count(WalletActivityRollup.id).label("recent_trade_count"),
+                        func.max(WalletActivityRollup.traded_at).label("latest_trade_at"),
+                    )
+                    .where(
+                        func.lower(WalletActivityRollup.wallet_address).in_(tracked_addresses),
+                        WalletActivityRollup.traded_at >= cutoff,
+                    )
+                    .group_by(func.lower(WalletActivityRollup.wallet_address))
+                )
+            ).all()
+            activity_by_address = {
+                str(row.wallet_address or "").strip().lower(): {
+                    "recent_trade_count": int(row.recent_trade_count or 0),
+                    "latest_trade_at": row.latest_trade_at.isoformat() if row.latest_trade_at else None,
+                }
+                for row in activity_rows
+                if str(row.wallet_address or "").strip()
+            }
+
+        tracked_rows: list[dict] = []
+        total_recent_trades = 0
+        for address, label in tracked_wallet_rows:
+            normalized_address = str(address or "").strip().lower()
+            if not normalized_address:
+                continue
+            discovered_profile = discovered_by_address.get(normalized_address)
+            activity = activity_by_address.get(
+                normalized_address,
+                {"recent_trade_count": 0, "latest_trade_at": None},
+            )
+            recent_trades = int(activity.get("recent_trade_count") or 0)
+            total_recent_trades += recent_trades
+            tracked_rows.append(
+                {
+                    "address": normalized_address,
+                    "label": str(label or "").strip() or None,
+                    "username": discovered_profile.username if discovered_profile else None,
+                    "recent_trade_count": recent_trades,
+                    "latest_trade_at": activity.get("latest_trade_at"),
+                    "open_positions": int(discovered_profile.open_positions or 0) if discovered_profile else 0,
+                }
+            )
+
+        tracked_rows.sort(
+            key=lambda row: (
+                row["recent_trade_count"],
+                row.get("latest_trade_at") or "",
+            ),
+            reverse=True,
+        )
+
+        confluence_signals = await _load_tracked_trader_opportunities(
+            limit=confluence_limit,
+            include_filtered=False,
+        )
+        signal_market_ids = {
+            normalize_market_id(row.get("market_id"))
+            for row in confluence_signals
+            if normalize_market_id(row.get("market_id"))
+        }
+        market_history = await _load_scanner_market_history(session, market_ids=signal_market_ids)
+        _attach_market_history_to_signal_rows(confluence_signals, market_history)
+        await _attach_signal_market_metadata(confluence_signals)
+        _attach_history_from_aliases(confluence_signals, market_history)
+        await _attach_activity_history_fallback(session, confluence_signals)
+        await _attach_live_mid_prices_to_signal_rows(confluence_signals)
+        await _annotate_trader_signal_rows(session, confluence_signals)
+
+        groups = await _fetch_group_payload(session=session, include_members=False)
+
+        return {
+            "tracked": {
+                "wallets": tracked_rows[:tracked_limit],
+                "total_wallets": len(tracked_rows),
+                "hours_window": hours,
+                "recent_trade_count": total_recent_trades,
+            },
+            "groups": {
+                "items": groups,
+                "total_groups": len(groups),
+                "total_members": sum(g.get("member_count", 0) for g in groups),
+            },
+            "confluence": {
+                "signals": confluence_signals,
+                "total_signals": len(confluence_signals),
+            },
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@discovery_router.get("/traders/network")
+async def get_traders_network_graph(
+    min_pair_score: float = Query(default=0.55, ge=0.0, le=1.0),
+    limit_wallets: int = Query(default=180, ge=20, le=500),
+    include_groups: bool = Query(default=True),
+    include_clusters: bool = Query(default=True),
+    session: AsyncSession = Depends(get_db_session),
+):
+    """Return a trader entity network graph for interactive graph visualization."""
+    try:
+        min_pair_score = float(_resolve_query_default(min_pair_score))
+        limit_wallets = int(_resolve_query_default(limit_wallets))
+        include_groups = _resolve_query_bool(include_groups)
+        include_clusters = _resolve_query_bool(include_clusters)
+
+        base_graph = await wallet_intelligence.cohort_analyzer.get_network_graph()
+        base_nodes = [dict(node) for node in (base_graph.get("nodes") or []) if isinstance(node, dict)]
+        if not base_nodes:
+            await wallet_intelligence.cohort_analyzer.analyze_cohorts()
+            base_graph = await wallet_intelligence.cohort_analyzer.get_network_graph()
+            base_nodes = [dict(node) for node in (base_graph.get("nodes") or []) if isinstance(node, dict)]
+
+        base_edges = [dict(edge) for edge in (base_graph.get("edges") or []) if isinstance(edge, dict)]
+        base_cohorts = [dict(cohort) for cohort in (base_graph.get("cohorts") or []) if isinstance(cohort, dict)]
+
+        wallet_nodes = [node for node in base_nodes if str(node.get("kind") or "") == "wallet"]
+        if not wallet_nodes:
+            return {
+                "generated_at": base_graph.get("generated_at"),
+                "lookback_days": int(base_graph.get("lookback_days") or 0),
+                "min_pair_score": min_pair_score,
+                "limit_wallets": limit_wallets,
+                "summary": {
+                    "wallet_nodes": 0,
+                    "cluster_nodes": 0,
+                    "group_nodes": 0,
+                    "co_trade_edges": 0,
+                    "cluster_membership_edges": 0,
+                    "group_membership_edges": 0,
+                    "components": 0,
+                    "density": 0.0,
+                },
+                "nodes": [],
+                "edges": [],
+                "cohorts": [],
+                "actions": {
+                    "wallet": ["analyze", "track", "untrack", "add_to_group", "create_group_from_neighbors"],
+                    "group": ["track_members", "delete_group"],
+                },
+            }
+
+        wallet_nodes_sorted = sorted(
+            wallet_nodes,
+            key=lambda node: (
+                int(node.get("degree") or 0),
+                float(node.get("composite_score") or 0.0),
+                float(node.get("rank_score") or 0.0),
+            ),
+            reverse=True,
+        )
+        selected_wallet_nodes = [dict(node) for node in wallet_nodes_sorted[:limit_wallets]]
+        selected_wallet_ids = {str(node.get("id") or "") for node in selected_wallet_nodes}
+        selected_wallet_ids.discard("")
+
+        co_trade_edges = [
+            edge
+            for edge in base_edges
+            if str(edge.get("kind") or "") == "co_trade"
+            and float(edge.get("combined_score") or edge.get("weight") or 0.0) >= min_pair_score
+            and str(edge.get("source") or "") in selected_wallet_ids
+            and str(edge.get("target") or "") in selected_wallet_ids
+        ]
+
+        cluster_edges = []
+        cluster_node_ids: set[str] = set()
+        if include_clusters:
+            cluster_edges = [
+                edge
+                for edge in base_edges
+                if str(edge.get("kind") or "") == "cluster_membership"
+                and str(edge.get("target") or "") in selected_wallet_ids
+            ]
+            cluster_node_ids = {
+                str(edge.get("source") or "") for edge in cluster_edges if str(edge.get("source") or "")
+            }
+
+        node_by_id = {str(node.get("id") or ""): node for node in base_nodes if str(node.get("id") or "")}
+        cluster_nodes = [dict(node_by_id[node_id]) for node_id in cluster_node_ids if node_id in node_by_id]
+        cluster_nodes.sort(
+            key=lambda node: int(node.get("member_count") or 0),
+            reverse=True,
+        )
+
+        group_nodes: list[dict] = []
+        group_edges: list[dict] = []
+        if include_groups:
+            groups = await _fetch_group_payload(
+                session=session,
+                include_members=True,
+                member_limit=500,
+            )
+            for group in groups:
+                group_id = str(group.get("id") or "").strip()
+                if not group_id:
+                    continue
+                members = [
+                    str(member.get("wallet_address") or "").strip().lower()
+                    for member in (group.get("members") or [])
+                    if isinstance(member, dict)
+                ]
+                members = [address for address in members if address]
+                linked_wallet_ids = [
+                    f"wallet:{address}" for address in members if f"wallet:{address}" in selected_wallet_ids
+                ]
+                if not linked_wallet_ids:
+                    continue
+
+                node_id = f"group:{group_id}"
+                group_nodes.append(
+                    {
+                        "id": node_id,
+                        "kind": "group",
+                        "group_id": group_id,
+                        "label": str(group.get("name") or f"Group {group_id[:8]}"),
+                        "description": group.get("description"),
+                        "source_type": group.get("source_type"),
+                        "member_count": int(group.get("member_count") or 0),
+                        "linked_wallet_count": len(linked_wallet_ids),
+                        "auto_track_members": bool(group.get("auto_track_members")),
+                        "member_wallet_addresses": members,
+                    }
+                )
+                for wallet_node_id in linked_wallet_ids:
+                    group_edges.append(
+                        {
+                            "id": f"edge:group:{group_id}:{wallet_node_id}",
+                            "kind": "group_membership",
+                            "source": node_id,
+                            "target": wallet_node_id,
+                            "weight": 1.0,
+                        }
+                    )
+
+        edges = co_trade_edges + cluster_edges + group_edges
+        nodes = selected_wallet_nodes + cluster_nodes + group_nodes
+
+        co_trade_degree: dict[str, int] = defaultdict(int)
+        group_links: dict[str, int] = defaultdict(int)
+        cluster_links: dict[str, int] = defaultdict(int)
+        for edge in edges:
+            edge_kind = str(edge.get("kind") or "")
+            source = str(edge.get("source") or "")
+            target = str(edge.get("target") or "")
+            if edge_kind == "co_trade":
+                if source in selected_wallet_ids:
+                    co_trade_degree[source] += 1
+                if target in selected_wallet_ids:
+                    co_trade_degree[target] += 1
+            elif edge_kind == "group_membership":
+                if target in selected_wallet_ids:
+                    group_links[target] += 1
+            elif edge_kind == "cluster_membership":
+                if target in selected_wallet_ids:
+                    cluster_links[target] += 1
+
+        for node in nodes:
+            if str(node.get("kind") or "") != "wallet":
+                continue
+            node_id = str(node.get("id") or "")
+            node["co_trade_degree"] = int(co_trade_degree.get(node_id, 0))
+            node["group_links"] = int(group_links.get(node_id, 0))
+            node["cluster_links"] = int(cluster_links.get(node_id, 0))
+            node["degree"] = int(
+                co_trade_degree.get(node_id, 0) + group_links.get(node_id, 0) + cluster_links.get(node_id, 0)
+            )
+
+        visible_wallet_addresses = {
+            str(node.get("address") or "").strip().lower()
+            for node in nodes
+            if str(node.get("kind") or "") == "wallet" and str(node.get("address") or "").strip()
+        }
+        visible_cohorts: list[dict] = []
+        for cohort in base_cohorts:
+            members = [
+                str(address).strip().lower()
+                for address in (cohort.get("wallet_addresses") or [])
+                if str(address).strip().lower() in visible_wallet_addresses
+            ]
+            if len(members) < 2:
+                continue
+            item = dict(cohort)
+            item["visible_wallet_addresses"] = members
+            item["visible_wallet_count"] = len(members)
+            visible_cohorts.append(item)
+        visible_cohorts.sort(
+            key=lambda cohort: float(cohort.get("avg_combined_score") or 0.0),
+            reverse=True,
+        )
+
+        node_ids = {str(node.get("id") or "") for node in nodes if str(node.get("id") or "")}
+        adjacency: dict[str, set[str]] = defaultdict(set)
+        for edge in edges:
+            source = str(edge.get("source") or "")
+            target = str(edge.get("target") or "")
+            if source in node_ids and target in node_ids:
+                adjacency[source].add(target)
+                adjacency[target].add(source)
+
+        visited: set[str] = set()
+        components = 0
+        for node_id in node_ids:
+            if node_id in visited:
+                continue
+            components += 1
+            queue = [node_id]
+            while queue:
+                current = queue.pop(0)
+                if current in visited:
+                    continue
+                visited.add(current)
+                for neighbor in adjacency[current]:
+                    if neighbor not in visited:
+                        queue.append(neighbor)
+
+        wallet_count = len([node for node in nodes if str(node.get("kind") or "") == "wallet"])
+        co_trade_edge_count = len(co_trade_edges)
+        density = 0.0
+        if wallet_count > 1:
+            density = (2.0 * co_trade_edge_count) / (wallet_count * (wallet_count - 1))
+
+        return {
+            "generated_at": base_graph.get("generated_at"),
+            "lookback_days": int(base_graph.get("lookback_days") or 0),
+            "min_pair_score": min_pair_score,
+            "limit_wallets": limit_wallets,
+            "summary": {
+                "wallet_nodes": wallet_count,
+                "cluster_nodes": len([node for node in nodes if str(node.get("kind") or "") == "cluster"]),
+                "group_nodes": len([node for node in nodes if str(node.get("kind") or "") == "group"]),
+                "co_trade_edges": co_trade_edge_count,
+                "cluster_membership_edges": len(cluster_edges),
+                "group_membership_edges": len(group_edges),
+                "components": components,
+                "density": round(density, 4),
+            },
+            "nodes": nodes,
+            "edges": edges,
+            "cohorts": visible_cohorts,
+            "actions": {
+                "wallet": ["analyze", "track", "untrack", "add_to_group", "create_group_from_neighbors"],
+                "group": ["track_members", "delete_group"],
+            },
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==================== TRADER GROUPS ====================
+
+
+@discovery_router.get("/groups")
+async def get_trader_groups(
+    include_members: bool = Query(default=False),
+    member_limit: int = Query(default=25, ge=1, le=200),
+    session: AsyncSession = Depends(get_db_session),
+):
+    """List tracked trader groups."""
+    try:
+        groups = await _fetch_group_payload(
+            session=session,
+            include_members=include_members,
+            member_limit=member_limit,
+        )
+        return {"groups": groups, "total": len(groups)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@discovery_router.post("/groups")
+async def create_trader_group(
+    payload: CreateTraderGroupRequest,
+    session: AsyncSession = Depends(get_db_session),
+):
+    """Create a trader group and optionally add all members to tracking."""
+    try:
+        name = payload.name.strip()
+        if not name:
+            raise HTTPException(status_code=400, detail="Group name is required")
+
+        source_type = payload.source_type.strip().lower()
+        if source_type not in GROUP_SOURCE_TYPES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid source_type. Must be one of: {sorted(GROUP_SOURCE_TYPES)}",
+            )
+
+        existing = await session.execute(select(TraderGroup).where(func.lower(TraderGroup.name) == name.lower()))
+        if existing.scalars().first():
+            raise HTTPException(
+                status_code=409,
+                detail=f"Trader group '{name}' already exists",
+            )
+
+        try:
+            addresses = _normalize_wallet_addresses(payload.wallet_addresses)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+        group = TraderGroup(
+            id=str(uuid.uuid4()),
+            name=name,
+            description=(payload.description or None),
+            source_type=source_type,
+            suggestion_key=payload.suggestion_key,
+            criteria=payload.criteria or {},
+            auto_track_members=bool(payload.auto_track_members),
+            is_active=True,
+        )
+        session.add(group)
+        for address in addresses:
+            session.add(
+                TraderGroupMember(
+                    id=str(uuid.uuid4()),
+                    group_id=group.id,
+                    wallet_address=address,
+                    source=payload.source_label,
+                )
+            )
+        await session.commit()
+
+        tracked_count = 0
+        if payload.auto_track_members and addresses:
+            tracked_count = await _track_wallet_addresses(
+                addresses=addresses,
+                label=f"Group: {name}",
+                fetch_initial=False,
+            )
+
+        # Ensure group members exist in DiscoveredWallet so they can
+        # participate in pool scoring and confluence detection.
+        if addresses:
+            await _ensure_discovered_wallet_entries(
+                addresses=addresses,
+                source_label=f"group:{name}",
+            )
+
+        groups = await _fetch_group_payload(
+            session=session,
+            include_members=True,
+            member_limit=200,
+        )
+        created = next((g for g in groups if g.get("id") == group.id), None)
+
+        return {
+            "status": "success",
+            "group": created,
+            "tracked_members": tracked_count,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@discovery_router.post("/groups/{group_id}/members")
+async def add_group_members(
+    group_id: str,
+    payload: UpdateTraderGroupMembersRequest,
+    session: AsyncSession = Depends(get_db_session),
+):
+    """Add wallets to an existing trader group."""
+    try:
+        group = await session.get(TraderGroup, group_id)
+        if not group or not group.is_active:
+            raise HTTPException(status_code=404, detail="Trader group not found")
+
+        try:
+            addresses = _normalize_wallet_addresses(payload.wallet_addresses)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+        if not addresses:
+            return {"status": "success", "added_members": 0, "tracked_members": 0}
+
+        existing_members = await session.execute(
+            select(TraderGroupMember.wallet_address).where(TraderGroupMember.group_id == group_id)
+        )
+        existing_addresses = {
+            str(address).lower() for address in existing_members.scalars().all() if isinstance(address, str)
+        }
+
+        to_add = [addr for addr in addresses if addr not in existing_addresses]
+        for address in to_add:
+            session.add(
+                TraderGroupMember(
+                    id=str(uuid.uuid4()),
+                    group_id=group_id,
+                    wallet_address=address,
+                    source=payload.source_label,
+                )
+            )
+        await session.commit()
+
+        tracked_count = 0
+        if payload.add_to_tracking and to_add:
+            tracked_count = await _track_wallet_addresses(
+                addresses=to_add,
+                label=f"Group: {group.name}",
+                fetch_initial=False,
+            )
+
+        # Ensure new group members exist in DiscoveredWallet so they can
+        # participate in pool scoring and confluence detection.
+        if to_add:
+            await _ensure_discovered_wallet_entries(
+                addresses=to_add,
+                source_label=f"group:{group.name}",
+            )
+
+        groups = await _fetch_group_payload(
+            session=session,
+            include_members=True,
+            member_limit=200,
+        )
+        updated = next((g for g in groups if g.get("id") == group_id), None)
+
+        return {
+            "status": "success",
+            "added_members": len(to_add),
+            "tracked_members": tracked_count,
+            "group": updated,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@discovery_router.delete("/groups/{group_id}/members/{wallet_address}")
+async def remove_group_member(
+    group_id: str,
+    wallet_address: str,
+    session: AsyncSession = Depends(get_db_session),
+):
+    """Remove a wallet from a trader group."""
+    try:
+        try:
+            address = validate_eth_address(wallet_address).lower()
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+        member_result = await session.execute(
+            select(TraderGroupMember).where(
+                TraderGroupMember.group_id == group_id,
+                TraderGroupMember.wallet_address == address,
+            )
+        )
+        member = member_result.scalars().first()
+        if not member:
+            raise HTTPException(status_code=404, detail="Group member not found")
+
+        await session.delete(member)
+        await session.commit()
+        return {
+            "status": "success",
+            "group_id": group_id,
+            "wallet_address": address,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@discovery_router.delete("/groups/{group_id}")
+async def delete_trader_group(
+    group_id: str,
+    session: AsyncSession = Depends(get_db_session),
+):
+    """Delete a trader group and all its memberships."""
+    try:
+        group = await session.get(TraderGroup, group_id)
+        if not group:
+            raise HTTPException(status_code=404, detail="Trader group not found")
+
+        members_result = await session.execute(select(TraderGroupMember).where(TraderGroupMember.group_id == group_id))
+        for member in members_result.scalars().all():
+            await session.delete(member)
+        await session.delete(group)
+        await session.commit()
+        return {"status": "success", "group_id": group_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@discovery_router.post("/groups/{group_id}/track")
+async def track_group_members(
+    group_id: str,
+    session: AsyncSession = Depends(get_db_session),
+):
+    """Ensure all wallets in a trader group are tracked by the wallet monitor."""
+    try:
+        group = await session.get(TraderGroup, group_id)
+        if not group or not group.is_active:
+            raise HTTPException(status_code=404, detail="Trader group not found")
+
+        member_result = await session.execute(
+            select(TraderGroupMember.wallet_address).where(TraderGroupMember.group_id == group_id)
+        )
+        addresses = [addr for addr in member_result.scalars().all() if isinstance(addr, str)]
+
+        tracked_count = await _track_wallet_addresses(
+            addresses=addresses,
+            label=f"Group: {group.name}",
+            fetch_initial=False,
+        )
+        return {
+            "status": "success",
+            "group_id": group_id,
+            "tracked_members": tracked_count,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@discovery_router.get("/groups/suggestions")
+async def get_group_suggestions(
+    min_group_size: int = Query(default=3, ge=2, le=100),
+    max_suggestions: int = Query(default=12, ge=1, le=100),
+    min_composite_score: float = Query(default=0.55, ge=0.0, le=1.0),
+    session: AsyncSession = Depends(get_db_session),
+):
+    """Suggest high-quality trader groups from discovery clusters/tags/pool tiers."""
+    try:
+        suggestions: list[dict] = []
+
+        existing_result = await session.execute(select(TraderGroup.name))
+        existing_names = {
+            str(name).strip().lower() for name in existing_result.scalars().all() if isinstance(name, str)
+        }
+
+        # 1) Cluster-driven suggestions (entity-linked wallets)
+        cluster_result = await session.execute(
+            select(WalletCluster)
+            .where(WalletCluster.total_wallets >= min_group_size)
+            .order_by(WalletCluster.combined_pnl.desc())
+            .limit(max_suggestions * 2)
+        )
+        for cluster in cluster_result.scalars().all():
+            wallet_rows = await session.execute(
+                select(DiscoveredWallet)
+                .where(
+                    DiscoveredWallet.cluster_id == cluster.id,
+                    DiscoveredWallet.composite_score >= min_composite_score,
+                )
+                .order_by(DiscoveredWallet.composite_score.desc())
+                .limit(200)
+            )
+            wallets = list(wallet_rows.scalars().all())
+            if len(wallets) < min_group_size:
+                continue
+
+            addresses = [w.address.lower() for w in wallets]
+            name = (cluster.label or f"Cluster {cluster.id[:8]}").strip()
+            avg_comp = sum((w.composite_score or 0.0) for w in wallets) / len(wallets)
+            suggestions.append(
+                {
+                    "id": _suggestion_id("cluster", cluster.id),
+                    "kind": "cluster",
+                    "name": name,
+                    "description": (
+                        f"Entity-linked wallets discovered via clustering "
+                        f"(confidence {round((cluster.confidence or 0.0) * 100)}%)."
+                    ),
+                    "wallet_count": len(addresses),
+                    "wallet_addresses": addresses,
+                    "avg_composite_score": round(avg_comp, 4),
+                    "sample_wallets": [
+                        {
+                            "address": w.address,
+                            "username": w.username,
+                            "composite_score": w.composite_score or 0.0,
+                            "pool_tier": w.pool_tier,
+                        }
+                        for w in wallets[:8]
+                    ],
+                    "criteria": {
+                        "cluster_id": cluster.id,
+                        "confidence": cluster.confidence or 0.0,
+                    },
+                    "already_exists": name.lower() in existing_names,
+                }
+            )
+
+        # 2) Pool tier suggestions (core/rising/standby quality cohorts)
+        for tier in ("core", "rising", "standby"):
+            tier_rows = await session.execute(
+                select(DiscoveredWallet)
+                .where(
+                    DiscoveredWallet.in_top_pool == True,  # noqa: E712
+                    func.lower(DiscoveredWallet.pool_tier) == tier,
+                    DiscoveredWallet.composite_score >= min_composite_score,
+                )
+                .order_by(
+                    DiscoveredWallet.composite_score.desc(),
+                    DiscoveredWallet.last_trade_at.desc(),
+                )
+                .limit(200)
+            )
+            wallets = list(tier_rows.scalars().all())
+            if len(wallets) < min_group_size:
+                continue
+
+            name = f"{tier.title()} Pool Traders"
+            addresses = [w.address.lower() for w in wallets]
+            avg_comp = sum((w.composite_score or 0.0) for w in wallets) / len(wallets)
+            suggestions.append(
+                {
+                    "id": _suggestion_id("pool", tier),
+                    "kind": "pool_tier",
+                    "name": name,
+                    "description": (f"Auto-group from discovery smart pool tier '{tier}'."),
+                    "wallet_count": len(addresses),
+                    "wallet_addresses": addresses,
+                    "avg_composite_score": round(avg_comp, 4),
+                    "sample_wallets": [
+                        {
+                            "address": w.address,
+                            "username": w.username,
+                            "composite_score": w.composite_score or 0.0,
+                            "pool_tier": w.pool_tier,
+                        }
+                        for w in wallets[:8]
+                    ],
+                    "criteria": {"pool_tier": tier},
+                    "already_exists": name.lower() in existing_names,
+                }
+            )
+
+        # 3) Tag-driven suggestions from high-quality discovered wallets
+        tag_candidate_rows = await session.execute(
+            select(DiscoveredWallet)
+            .where(DiscoveredWallet.composite_score >= min_composite_score)
+            .order_by(DiscoveredWallet.composite_score.desc())
+            .limit(1500)
+        )
+        wallets = list(tag_candidate_rows.scalars().all())
+        wallets_by_tag: dict[str, list[DiscoveredWallet]] = defaultdict(list)
+        for wallet in wallets:
+            for tag in wallet.tags or []:
+                if isinstance(tag, str) and tag.strip():
+                    wallets_by_tag[tag.strip().lower()].append(wallet)
+
+        for tag, tagged_wallets in wallets_by_tag.items():
+            unique_wallets = {w.address.lower(): w for w in tagged_wallets}
+            rows = sorted(
+                unique_wallets.values(),
+                key=lambda w: w.composite_score or 0.0,
+                reverse=True,
+            )
+            if len(rows) < min_group_size:
+                continue
+
+            display_tag = tag.replace("_", " ").title()
+            name = f"{display_tag} Traders"
+            addresses = [w.address.lower() for w in rows[:200]]
+            avg_comp = sum((w.composite_score or 0.0) for w in rows[:200]) / len(addresses)
+            suggestions.append(
+                {
+                    "id": _suggestion_id("tag", tag),
+                    "kind": "tag",
+                    "name": name,
+                    "description": (f"High-quality discovered traders sharing tag '{tag}'."),
+                    "wallet_count": len(addresses),
+                    "wallet_addresses": addresses,
+                    "avg_composite_score": round(avg_comp, 4),
+                    "sample_wallets": [
+                        {
+                            "address": w.address,
+                            "username": w.username,
+                            "composite_score": w.composite_score or 0.0,
+                            "pool_tier": w.pool_tier,
+                        }
+                        for w in rows[:8]
+                    ],
+                    "criteria": {"tag": tag},
+                    "already_exists": name.lower() in existing_names,
+                }
+            )
+
+        suggestions.sort(
+            key=lambda s: (s["wallet_count"], s.get("avg_composite_score") or 0.0),
+            reverse=True,
+        )
+
+        # De-duplicate by suggestion id and trim.
+        deduped: dict[str, dict] = {}
+        for suggestion in suggestions:
+            sid = suggestion["id"]
+            if sid in deduped:
+                continue
+            deduped[sid] = suggestion
+            if len(deduped) >= max_suggestions:
+                break
+
+        return {"suggestions": list(deduped.values()), "total": len(deduped)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==================== ENTITY CLUSTERS ====================
+
+
+@discovery_router.get("/clusters")
+async def get_clusters(
+    min_wallets: int = Query(default=2, ge=2, le=100),
+):
+    """
+    Get wallet clusters (groups of wallets belonging to the same entity).
+
+    Uses on-chain analysis to identify wallets that are likely controlled
+    by the same person or organization based on funding patterns,
+    coordinated trading, and timing analysis.
+    """
+    try:
+        clusters = await wallet_intelligence.clusterer.get_clusters(
+            min_wallets=min_wallets,
+        )
+        return {"clusters": clusters}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@discovery_router.get("/clusters/{cluster_id}")
+async def get_cluster_detail(cluster_id: str):
+    """
+    Get detailed info about a specific cluster and its member wallets.
+
+    Returns all wallets in the cluster, evidence linking them, shared
+    trading patterns, and aggregate performance metrics.
+    """
+    try:
+        detail = await wallet_intelligence.clusterer.get_cluster_detail(
+            cluster_id=cluster_id,
+        )
+        if not detail:
+            raise HTTPException(status_code=404, detail="Cluster not found")
+        return detail
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==================== TAGS ====================
+
+
+@discovery_router.get("/tags")
+async def get_all_tags():
+    """
+    Get all tag definitions with wallet counts.
+
+    Tags classify wallets by behavior (e.g., whale, sniper, market_maker,
+    arbitrageur). Each tag includes a description and the number of
+    wallets currently carrying that tag.
+    """
+    try:
+        tags = await StrategySDK.get_trader_tags()
+        return {"tags": tags}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@discovery_router.get("/tags/{tag_name}/wallets")
+async def get_wallets_by_tag(
+    tag_name: str,
+    limit: int = Query(default=100, ge=1, le=500),
+):
+    """
+    Get wallets with a specific tag.
+
+    Returns a list of wallets classified under the given tag,
+    sorted by rank score.
+    """
+    try:
+        wallets = await StrategySDK.get_traders_by_tag(tag_name=tag_name, limit=limit)
+        return {"wallets": wallets}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==================== CROSS-PLATFORM ====================
+
+
+@discovery_router.get("/cross-platform")
+async def get_cross_platform_entities(
+    limit: int = Query(default=50, ge=1, le=200),
+):
+    """
+    Get entities tracked across Polymarket and Kalshi.
+
+    Identifies traders operating on multiple prediction market platforms,
+    enabling detection of cross-platform arbitrage strategies and
+    providing a more complete view of trader behavior.
+    """
+    try:
+        entities = await wallet_intelligence.cross_platform.get_cross_platform_entities(
+            limit=limit,
+        )
+        return entities
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@discovery_router.get("/cross-platform/arb-activity")
+async def get_cross_platform_arb():
+    """
+    Get recent cross-platform arbitrage activity.
+
+    Returns instances where entities are exploiting price differences
+    between Polymarket and Kalshi on the same underlying events.
+    """
+    try:
+        activity = await wallet_intelligence.cross_platform.get_cross_platform_arb_activity()
+        return activity
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))

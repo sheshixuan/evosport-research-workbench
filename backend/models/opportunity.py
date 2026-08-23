@@ -1,0 +1,215 @@
+from __future__ import annotations
+
+import hashlib
+
+from pydantic import BaseModel, Field
+from typing import Optional
+from datetime import datetime, timezone
+from enum import Enum
+
+
+class MispricingType(str, Enum):
+    """Classification of mispricing source (from Kroer et al. Part 2, Section IV).
+
+    Market makers choose speed over accuracy, creating three systematic types:
+    - WITHIN_MARKET: Sum of probabilities != 1 for multi-condition markets
+      (662 NegRisk markets, 42% of all multi-condition, median deviation 0.08)
+    - CROSS_MARKET: Dependent markets priced independently, violating constraints
+      (1,576 dependent pairs identified, 13 confirmed exploitable)
+    - SETTLEMENT_LAG: Prices don't instantly lock after outcome determined
+      (windows last minutes to hours, e.g. Assad example)
+    """
+
+    WITHIN_MARKET = "within_market"
+    CROSS_MARKET = "cross_market"
+    SETTLEMENT_LAG = "settlement_lag"
+    NEWS_INFORMATION = "news_information"  # Informational edge from breaking news
+
+
+class ROIType(str, Enum):
+    """Distinguishes between guaranteed arbitrage spread and directional bet payout."""
+
+    GUARANTEED_SPREAD = "guaranteed_spread"  # Structural arb: locked-in profit
+    DIRECTIONAL_PAYOUT = "directional_payout"  # Statistical edge: payout-if-win ratio
+
+
+class AIAnalysis(BaseModel):
+    """Inline AI judgment data attached to an opportunity."""
+
+    overall_score: float = 0.0
+    profit_viability: float = 0.0
+    resolution_safety: float = 0.0
+    execution_feasibility: float = 0.0
+    market_efficiency: float = 0.0
+    recommendation: str = "pending"  # strong_execute, execute, review, skip, strong_skip, pending
+    reasoning: Optional[str] = None
+    risk_factors: list[str] = []
+    judged_at: Optional[datetime] = None
+    resolution_analyses: list[dict] = []
+
+
+class ExecutionLeg(BaseModel):
+    leg_id: str
+    market_id: str
+    market_question: Optional[str] = None
+    token_id: Optional[str] = None
+    side: str = "buy"
+    outcome: Optional[str] = None
+    limit_price: Optional[float] = None
+    price_policy: str = "maker_limit"
+    time_in_force: str = "GTC"
+    post_only: bool = False
+    notional_weight: float = Field(default=1.0, gt=0.0)
+    min_fill_ratio: float = Field(default=0.0, ge=0.0, le=1.0)
+    metadata: dict = Field(default_factory=dict)
+
+
+class ExecutionConstraints(BaseModel):
+    max_unhedged_notional_usd: float = Field(default=0.0, ge=0.0)
+    hedge_timeout_seconds: int = Field(default=20, ge=1)
+    session_timeout_seconds: int = Field(default=300, ge=1)
+    max_reprice_attempts: int = Field(default=3, ge=0, le=100)
+    pair_lock: bool = True
+    leg_fill_tolerance_ratio: float = Field(default=0.02, ge=0.0, le=1.0)
+
+
+class ExecutionPlan(BaseModel):
+    plan_id: str = Field(default_factory=lambda: "")
+    policy: str = "PARALLEL_MAKER"
+    time_in_force: str = "GTC"
+    legs: list[ExecutionLeg] = Field(default_factory=list)
+    constraints: ExecutionConstraints = Field(default_factory=ExecutionConstraints)
+    metadata: dict = Field(default_factory=dict)
+
+    def __init__(self, **data):
+        super().__init__(**data)
+        if self.plan_id:
+            return
+        leg_fingerprint = "|".join(
+            sorted(f"{leg.market_id}:{leg.token_id or ''}:{leg.side}:{leg.outcome or ''}" for leg in self.legs)
+        )
+        digest = hashlib.sha256(leg_fingerprint.encode("utf-8")).hexdigest()[:16]
+        self.plan_id = f"plan_{digest}"
+
+
+class Opportunity(BaseModel):
+    """Represents a detected arbitrage opportunity"""
+
+    id: str = Field(default_factory=lambda: "")
+    stable_id: str = Field(default_factory=lambda: "")  # Persists across scans (no timestamp)
+    strategy: str  # strategy slug identifier
+    title: str
+    description: str
+
+    # Profit metrics
+    total_cost: float
+    expected_payout: float = 1.0
+    gross_profit: float
+    fee: float
+    net_profit: float
+    roi_percent: float
+    is_guaranteed: bool = True  # True for structural arb, False for directional bets
+    roi_type: Optional[str] = None  # "guaranteed_spread" or "directional_payout"
+
+    # Conviction signal for the trader's score formula. Naturally bounded by
+    # price space: it represents the absolute price disagreement between the
+    # strategy's fair-value estimate and the market price, scaled to a 0-100
+    # range (so 9¢ disagreement → 9.0).
+    #
+    # For arbitrage strategies edge_percent should equal roi_percent (a 5%
+    # guaranteed bundle is a 5% conviction signal). For directional
+    # strategies — where roi_percent reflects capital efficiency on a
+    # low-priced contract (e.g. 900% if a $0.10 YES wins for $1.00) — the
+    # two diverge: a 9¢ price disagreement is a 9-point conviction signal,
+    # NOT a 900-point one. Conflating these used to feed structurally
+    # inflated conviction into the trader's compute_score.
+    #
+    # When unset (None), downstream code falls back to roi_percent for
+    # back-compat with arb strategies that haven't been migrated.
+    edge_percent: Optional[float] = None
+
+    # Risk assessment
+    risk_score: float = Field(ge=0.0, le=1.0, default=0.5)
+    risk_factors: list[str] = []
+    confidence: float = 0.5
+
+    # Market details
+    markets: list[dict] = []  # List of markets involved
+    market_roster: Optional[dict] = None
+    polymarket_url: Optional[str] = None
+    kalshi_url: Optional[str] = None
+    event_id: Optional[str] = None
+    event_slug: Optional[str] = None
+    event_title: Optional[str] = None
+    category: Optional[str] = None
+
+    # Liquidity
+    min_liquidity: float = 0.0
+    max_position_size: float = 0.0  # How much can be executed
+
+    # Timing
+    detected_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    first_detected_at: Optional[datetime] = None  # Immutable first-seen timestamp for stable_id lifecycle
+    last_detected_at: Optional[datetime] = None  # Most recent scan that re-detected this opportunity
+    last_priced_at: Optional[datetime] = None  # Most recent market price refresh applied to this opportunity
+    last_updated_at: Optional[datetime] = None  # Most recent lifecycle payload update
+    last_seen_at: Optional[datetime] = None  # Last scan that detected this opportunity
+    resolution_date: Optional[datetime] = None
+
+    # Mispricing classification (from article Part IV)
+    mispricing_type: Optional[MispricingType] = None
+
+    # Profit guarantee from Frank-Wolfe (Proposition 4.1)
+    guaranteed_profit: Optional[float] = None  # D(μ̂||θ) - g(μ̂)
+    capture_ratio: Optional[float] = None  # guaranteed / max profit
+
+    # Execution details
+    positions_to_take: list[dict] = []  # What to buy
+    execution_plan: Optional[ExecutionPlan] = None
+
+    # Inline AI analysis (populated by scanner, persisted across scans)
+    ai_analysis: Optional[AIAnalysis] = None
+
+    # Strategy-specific context passed from detect() to evaluate() and should_exit()
+    strategy_context: dict = {}
+    revision: Optional[int] = None
+
+    # Per-trader signal scoping (plan 0041). When set, this opportunity (and
+    # the resulting ``trade_signals`` row) is visible only to the trader with
+    # this id; all other traders bound to the same source skip it. Strategies
+    # do NOT set this directly — the opportunity dispatcher in
+    # ``market_runtime`` tags it during per-trader fan-out when the trader's
+    # ``source_configs_json[].strategy_params`` is non-empty. ``None`` keeps
+    # the legacy multi-trader-visible routing.
+    intended_trader_id: Optional[str] = None
+
+    def __init__(self, **data):
+        super().__init__(**data)
+        all_market_ids = sorted(str(m.get("id", "")).strip() for m in self.markets if str(m.get("id", "")).strip())
+        market_fingerprint = "|".join(all_market_ids)
+        market_hash = hashlib.sha256(market_fingerprint.encode()).hexdigest()[:8] if market_fingerprint else "no_market"
+        market_snippets = "_".join(mid[:8] for mid in all_market_ids[:3]) if all_market_ids else "unknown"
+        stable_suffix = f"{market_snippets}_{market_hash}"
+        strategy_name = self.strategy
+        if not self.stable_id:
+            self.stable_id = f"{strategy_name}_{stable_suffix}"
+        if not self.id:
+            self.id = f"{strategy_name}_{stable_suffix}_{int(self.detected_at.timestamp())}"
+        if self.first_detected_at is None:
+            self.first_detected_at = self.detected_at
+        if self.last_detected_at is None:
+            self.last_detected_at = self.detected_at
+        if self.last_seen_at is None:
+            self.last_seen_at = self.last_detected_at
+        if self.last_updated_at is None:
+            self.last_updated_at = self.last_detected_at
+
+
+class OpportunityFilter(BaseModel):
+    """Filter criteria for opportunities"""
+
+    min_profit: float = 0.0
+    max_risk: float = 1.0
+    strategies: list[str] = []  # strategy slugs
+    min_liquidity: float = 0.0
+    category: Optional[str] = None

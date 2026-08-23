@@ -1,0 +1,513 @@
+"""Unit tests for smart wallet pool scoring/churn and confluence thresholds."""
+
+import sys
+import uuid
+from pathlib import Path
+from types import SimpleNamespace
+from datetime import timedelta
+from typing import Optional
+import pytest
+
+BACKEND_ROOT = Path(__file__).resolve().parents[1]
+if str(BACKEND_ROOT) not in sys.path:
+    sys.path.insert(0, str(BACKEND_ROOT))
+
+from utils.utcnow import utcnow
+import services.wallet_intelligence as wallet_intelligence_module  # noqa: E402
+from models.database import (  # noqa: E402
+    Base,
+    DiscoveredWallet,
+    TraderGroup,
+    TraderGroupMember,
+    TrackedWallet,
+    WalletActivityRollup,
+)
+from services.smart_wallet_pool import (  # noqa: E402
+    SmartWalletPoolService,
+    TARGET_POOL_SIZE,
+    MIN_POOL_SIZE,
+    MAX_HOURLY_REPLACEMENT_RATE,
+    MAX_POOL_SIZE,
+    SELECTION_SCORE_QUALITY_TARGET_FLOOR,
+    POOL_FLAG_BLACKLISTED,
+    POOL_FLAG_MANUAL_EXCLUDE,
+    POOL_FLAG_MANUAL_INCLUDE,
+)
+from services.wallet_intelligence import ConfluenceDetector  # noqa: E402
+from tests.postgres_test_db import build_postgres_session_factory  # noqa: E402
+
+
+def _wallet(
+    *,
+    rank_score: float,
+    win_rate: float,
+    sharpe_ratio: Optional[float],
+    profit_factor: Optional[float],
+    total_pnl: float,
+    max_drawdown: Optional[float] = None,
+    roi_std: float = 0.0,
+    anomaly_score: float = 0.0,
+    cluster_id: Optional[str] = None,
+    is_profitable: bool = False,
+    metrics_source_version: Optional[str] = "accuracy_v2_closed_positions",
+    last_analyzed_at=None,
+):
+    from utils.utcnow import utcnow as _utcnow
+
+    return SimpleNamespace(
+        rank_score=rank_score,
+        win_rate=win_rate,
+        sharpe_ratio=sharpe_ratio,
+        profit_factor=profit_factor,
+        total_pnl=total_pnl,
+        max_drawdown=max_drawdown,
+        roi_std=roi_std,
+        anomaly_score=anomaly_score,
+        cluster_id=cluster_id,
+        is_profitable=is_profitable,
+        metrics_source_version=metrics_source_version,
+        last_analyzed_at=last_analyzed_at if last_analyzed_at is not None else _utcnow(),
+    )
+
+
+class TestWalletActivityRollupIdentity:
+    def test_rollup_identity_dedupes_same_tx_across_sources(self):
+        svc = SmartWalletPoolService()
+        traded_at = utcnow()
+
+        first = {
+            "wallet_address": "0xabc",
+            "market_id": "market-1",
+            "side": "BUY",
+            "price": 0.44,
+            "size": 10.0,
+            "notional": 4.4,
+            "tx_hash": "0xdeadbeef",
+            "source": "wallet_trades_api",
+            "traded_at": traded_at,
+        }
+        second = {
+            **first,
+            "price": 0.441,
+            "size": 10.5,
+            "source": "activity_api",
+            "tx_hash": "0xDEADBEEF",
+        }
+
+        assert svc._build_wallet_activity_rollup_id(first) == svc._build_wallet_activity_rollup_id(second)
+
+    def test_rollup_identity_without_tx_hash_uses_time_and_size_signature(self):
+        svc = SmartWalletPoolService()
+        traded_at = utcnow().replace(microsecond=123000)
+
+        first = {
+            "wallet_address": "0xabc",
+            "market_id": "market-1",
+            "side": "BUY",
+            "price": 0.44,
+            "size": 10.0,
+            "notional": 4.4,
+            "tx_hash": None,
+            "source": "wallet_trades_api",
+            "traded_at": traded_at,
+        }
+        second = {**first, "size": 11.0}
+
+        assert svc._build_wallet_activity_rollup_id(first) != svc._build_wallet_activity_rollup_id(second)
+
+
+class TestSmartWalletPoolScoring:
+    def test_quality_score_monotonic_for_better_wallet(self):
+        svc = SmartWalletPoolService()
+        weak = _wallet(
+            rank_score=0.20,
+            win_rate=0.45,
+            sharpe_ratio=0.4,
+            profit_factor=1.1,
+            total_pnl=500.0,
+        )
+        strong = _wallet(
+            rank_score=0.90,
+            win_rate=0.72,
+            sharpe_ratio=2.4,
+            profit_factor=4.2,
+            total_pnl=25000.0,
+        )
+
+        assert svc._score_quality(strong) > svc._score_quality(weak)
+
+    def test_activity_score_decays_with_recency(self):
+        svc = SmartWalletPoolService()
+        now = utcnow()
+
+        fresh_score = svc._score_activity(
+            trades_1h=6,
+            trades_24h=40,
+            last_trade_at=now - timedelta(minutes=2),
+            now=now,
+        )
+        stale_score = svc._score_activity(
+            trades_1h=0,
+            trades_24h=1,
+            last_trade_at=now - timedelta(hours=96),
+            now=now,
+        )
+
+        assert 0.0 <= fresh_score <= 1.0
+        assert 0.0 <= stale_score <= 1.0
+        assert fresh_score > stale_score
+
+    def test_source_confidence_rewards_broader_signal_coverage(self):
+        svc = SmartWalletPoolService()
+        light = SimpleNamespace(source_flags={"leaderboard": True})
+        broad = SimpleNamespace(
+            source_flags={
+                "leaderboard": True,
+                "leaderboard_pnl": True,
+                "wallet_trades": True,
+                "market_trades": True,
+                "activity": True,
+            }
+        )
+        assert svc._score_source_confidence(broad) > svc._score_source_confidence(light)
+
+    def test_quality_gate_blockers_cover_unanalyzed_low_quality_wallets(self):
+        svc = SmartWalletPoolService()
+        wallet = SimpleNamespace(
+            last_analyzed_at=None,
+            recommendation="unanalyzed",
+            total_trades=12,
+            anomaly_score=0.74,
+            total_pnl=-150.0,
+        )
+        blockers = svc._eligibility_blockers(wallet)
+        codes = {b.get("code") for b in blockers}
+        assert "not_analyzed" in codes
+        assert "recommendation_blocked" in codes
+        assert "insufficient_trades" in codes
+        assert "anomaly_too_high" in codes
+        assert "non_positive_pnl" in codes
+
+    def test_activity_score_downweights_unverified_metrics_profiles(self):
+        svc = SmartWalletPoolService()
+        now = utcnow()
+        verified_wallet = SimpleNamespace(
+            metrics_source_version="accuracy_v2_closed_positions",
+            last_analyzed_at=now - timedelta(hours=2),
+        )
+        legacy_wallet = SimpleNamespace(
+            metrics_source_version=None,
+            last_analyzed_at=now - timedelta(hours=2),
+        )
+        verified = svc._score_activity(
+            trades_1h=4,
+            trades_24h=18,
+            last_trade_at=now - timedelta(minutes=10),
+            now=now,
+            wallet=verified_wallet,
+        )
+        legacy = svc._score_activity(
+            trades_1h=4,
+            trades_24h=18,
+            last_trade_at=now - timedelta(minutes=10),
+            now=now,
+            wallet=legacy_wallet,
+        )
+        assert verified > legacy
+
+    def test_selection_reasons_include_manual_churn_and_insider_alignment(self):
+        svc = SmartWalletPoolService()
+        now = utcnow()
+        wallet = SimpleNamespace(
+            source_flags={POOL_FLAG_MANUAL_INCLUDE: True},
+            quality_score=0.8,
+            trades_1h=0,
+            trades_24h=4,
+            last_trade_at=now - timedelta(hours=2),
+            cluster_id=None,
+        )
+        reasons = svc._derive_selection_reasons(
+            wallet=wallet,
+            address="wallet_a",
+            selection_score=0.86,
+            insider_score=0.8,
+            cutoff_72h=now - timedelta(hours=72),
+            desired_addresses=set(),
+            current_addresses={"wallet_a"},
+            cluster_count=0,
+            cluster_cap=10,
+        )
+        codes = {r.get("code") for r in reasons}
+        assert "manual_include" in codes
+        assert "churn_guard_retained" in codes
+        assert "insider_alignment" in codes
+
+    def test_selection_score_clamps_components(self):
+        svc = SmartWalletPoolService()
+        score = svc._score_selection(
+            composite=1.4,
+            rank_score=-0.4,
+            insider_score=0.2,
+            source_confidence=2.0,
+            diversity_score=-1.0,
+            momentum_score=0.5,
+        )
+        assert score == pytest.approx(0.711, abs=1e-12)
+
+
+class TestSmartWalletPoolChurnGuard:
+    def test_effective_target_shrinks_in_quality_only_mode(self):
+        svc = SmartWalletPoolService()
+        strong = {f"strong_{i}": SELECTION_SCORE_QUALITY_TARGET_FLOOR + 0.05 for i in range(125)}
+        weak = {f"weak_{i}": SELECTION_SCORE_QUALITY_TARGET_FLOOR - 0.05 for i in range(240)}
+        scores = {**strong, **weak}
+        eligible = set(scores.keys())
+
+        target = svc._effective_target_pool_size(
+            selection_scores=scores,
+            eligible_addresses=eligible,
+            manual_includes=[],
+            quality_only_mode=True,
+        )
+
+        assert target == len(strong)
+
+    def test_effective_target_keeps_balanced_minimum(self):
+        svc = SmartWalletPoolService()
+        strong = {f"strong_{i}": SELECTION_SCORE_QUALITY_TARGET_FLOOR + 0.05 for i in range(125)}
+        weak = {f"weak_{i}": SELECTION_SCORE_QUALITY_TARGET_FLOOR - 0.05 for i in range(240)}
+        scores = {**strong, **weak}
+        eligible = set(scores.keys())
+
+        target = svc._effective_target_pool_size(
+            selection_scores=scores,
+            eligible_addresses=eligible,
+            manual_includes=[],
+            quality_only_mode=False,
+        )
+
+        assert target == MIN_POOL_SIZE
+
+    def test_quality_only_mode_allows_pool_shrink_below_minimum(self):
+        svc = SmartWalletPoolService()
+        current = [f"cur_{i}" for i in range(200)]
+        desired = [f"elite_{i}" for i in range(30)]
+        scores = {address: 0.5 for address in current + desired}
+
+        final_pool, _ = svc._apply_churn_guard(
+            desired=desired,
+            current=current,
+            scores=scores,
+            quality_only_mode=True,
+        )
+
+        assert len(final_pool) == len(desired)
+        assert set(final_pool) == set(desired)
+
+    def test_quality_only_churn_counts_slot_turnover_without_double_count(self):
+        svc = SmartWalletPoolService()
+        current = [f"cur_{i}" for i in range(100)]
+        desired = [f"cur_{i}" for i in range(99)] + ["new_0"]
+        scores = {address: 0.5 for address in current + desired}
+
+        _, churn_rate = svc._apply_churn_guard(
+            desired=desired,
+            current=current,
+            scores=scores,
+            quality_only_mode=True,
+        )
+
+        # One replacement over a 100-wallet baseline should be 1%.
+        assert abs(churn_rate - 0.01) < 1e-9
+
+    def test_replacements_capped_when_score_delta_is_small(self):
+        svc = SmartWalletPoolService()
+        current = [f"cur_{i}" for i in range(TARGET_POOL_SIZE)]
+        desired = [f"new_{i}" for i in range(TARGET_POOL_SIZE)]
+
+        scores = {address: 0.50 for address in current}
+        scores.update({address: 0.53 for address in desired})
+
+        final_pool, churn_rate = svc._apply_churn_guard(
+            desired=desired,
+            current=current,
+            scores=scores,
+        )
+
+        replacements = len(set(final_pool) - set(current))
+        cap = int(TARGET_POOL_SIZE * MAX_HOURLY_REPLACEMENT_RATE)
+
+        assert replacements <= cap
+        assert churn_rate <= cap / TARGET_POOL_SIZE
+
+    def test_replacements_can_exceed_cap_when_score_delta_is_large(self):
+        svc = SmartWalletPoolService()
+        current = [f"cur_{i}" for i in range(TARGET_POOL_SIZE)]
+        desired = [f"new_{i}" for i in range(TARGET_POOL_SIZE)]
+
+        scores = {address: 0.20 for address in current}
+        scores.update({address: 0.95 for address in desired})
+
+        final_pool, _ = svc._apply_churn_guard(
+            desired=desired,
+            current=current,
+            scores=scores,
+        )
+
+        replacements = len(set(final_pool) - set(current))
+        cap = int(TARGET_POOL_SIZE * MAX_HOURLY_REPLACEMENT_RATE)
+        assert replacements > cap
+
+    def test_manual_include_enforcement_adds_missing_addresses(self):
+        svc = SmartWalletPoolService()
+        base_pool = [f"cur_{i}" for i in range(10)]
+        manual = ["wallet_manual_1", "wallet_manual_2"]
+        scores = {address: 0.5 for address in base_pool + manual}
+        eligible = set(base_pool + manual)
+
+        final = svc._enforce_manual_includes(
+            final_pool=base_pool,
+            manual_includes=manual,
+            scores=scores,
+            eligible_addresses=eligible,
+        )
+
+        assert "wallet_manual_1" in final
+        assert "wallet_manual_2" in final
+        assert len(final) <= MAX_POOL_SIZE
+
+    def test_pool_block_flags_take_precedence(self):
+        svc = SmartWalletPoolService()
+        wallet = SimpleNamespace(
+            source_flags={
+                POOL_FLAG_MANUAL_INCLUDE: True,
+                POOL_FLAG_MANUAL_EXCLUDE: True,
+                POOL_FLAG_BLACKLISTED: False,
+            }
+        )
+        assert svc._is_pool_manually_included(wallet) is True
+        assert svc._is_pool_manually_excluded(wallet) is True
+        assert svc._is_pool_blocked(wallet) is True
+
+    def test_cluster_diversity_limits_single_cluster_domination(self):
+        svc = SmartWalletPoolService()
+        crowded = [SimpleNamespace(address=f"cluster_{i}", cluster_id="entity_a") for i in range(80)]
+        independent = [SimpleNamespace(address=f"ind_{i}", cluster_id=None) for i in range(120)]
+        ranked = crowded + independent
+        target_size = 100
+        diversified = svc._rank_with_cluster_diversity(ranked, target_size=target_size)
+        cap = max(3, int(target_size * 0.08))
+        crowded_count = sum(1 for w in diversified if getattr(w, "cluster_id", None) == "entity_a")
+        assert crowded_count <= cap
+
+
+class TestConfluenceDetectorThresholds:
+    def test_tier_thresholds_follow_watch_high_extreme(self):
+        detector = ConfluenceDetector()
+        assert detector._tier_for_count(3) == "WATCH"
+        assert detector._tier_for_count(4) == "HIGH"
+        assert detector._tier_for_count(5) == "HIGH"
+        assert detector._tier_for_count(6) == "EXTREME"
+        assert detector._tier_for_count(12) == "EXTREME"
+
+    def test_conviction_score_clamped_and_directional(self):
+        detector = ConfluenceDetector()
+
+        best_case = detector._conviction_score(
+            adjusted_wallet_count=30,
+            weighted_wallet_score=1.0,
+            timing_tightness=1.0,
+            net_notional=1_000_000_000.0,
+            conflicting_notional=0.0,
+            market_liquidity=1_000_000_000.0,
+            market_volume_24h=1_000_000_000.0,
+            anomaly_avg=0.0,
+            unique_wallet_count=30,
+        )
+        worst_case = detector._conviction_score(
+            adjusted_wallet_count=0,
+            weighted_wallet_score=0.0,
+            timing_tightness=0.0,
+            net_notional=0.0,
+            conflicting_notional=10_000.0,
+            market_liquidity=0.0,
+            market_volume_24h=0.0,
+            anomaly_avg=1.0,
+            unique_wallet_count=10,
+        )
+
+        assert 0.0 <= best_case <= 100.0
+        assert 0.0 <= worst_case <= 100.0
+        assert best_case > worst_case
+
+
+@pytest.mark.asyncio
+async def test_confluence_qualifying_wallets_only_include_recent_activity_candidates(tmp_path, monkeypatch):
+    engine, session_factory = await build_postgres_session_factory(Base, "confluence_recent_qualifiers")
+    monkeypatch.setattr(wallet_intelligence_module, "AsyncSessionLocal", session_factory)
+
+    now = utcnow()
+    cutoff_60m = now - timedelta(minutes=60)
+
+    async with session_factory() as session:
+        session.add_all(
+            [
+                DiscoveredWallet(
+                    address="recent_ranked",
+                    rank_score=0.95,
+                    composite_score=0.81,
+                    anomaly_score=0.05,
+                ),
+                DiscoveredWallet(
+                    address="stale_ranked",
+                    rank_score=0.99,
+                    composite_score=0.88,
+                    anomaly_score=0.03,
+                ),
+                TrackedWallet(address="tracked_recent"),
+                TrackedWallet(address="tracked_stale"),
+                TraderGroup(id="group-1", name="Unit Test Group", is_active=True),
+                TraderGroupMember(
+                    id="group-member-1",
+                    group_id="group-1",
+                    wallet_address="group_recent",
+                ),
+                WalletActivityRollup(
+                    id=str(uuid.uuid4()),
+                    wallet_address="recent_ranked",
+                    market_id="market-1",
+                    side="BUY",
+                    traded_at=now - timedelta(minutes=5),
+                    source="unit_test",
+                ),
+                WalletActivityRollup(
+                    id=str(uuid.uuid4()),
+                    wallet_address="tracked_recent",
+                    market_id="market-2",
+                    side="BUY",
+                    traded_at=now - timedelta(minutes=7),
+                    source="unit_test",
+                ),
+                WalletActivityRollup(
+                    id=str(uuid.uuid4()),
+                    wallet_address="group_recent",
+                    market_id="market-3",
+                    side="SELL",
+                    traded_at=now - timedelta(minutes=9),
+                    source="unit_test",
+                ),
+            ]
+        )
+        await session.commit()
+
+    detector = ConfluenceDetector()
+    wallets = await detector._get_qualifying_wallets(cutoff_60m)
+    addresses = {str(row.get("address") or "") for row in wallets}
+
+    assert "recent_ranked" in addresses
+    assert "tracked_recent" in addresses
+    assert "group_recent" in addresses
+    assert "stale_ranked" not in addresses
+    assert "tracked_stale" not in addresses
+
+    await engine.dispose()

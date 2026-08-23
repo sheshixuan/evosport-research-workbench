@@ -1,0 +1,840 @@
+"""Process-wide in-memory signal cache hydrated from Redis.
+
+Architecture
+------------
+The fast trader runtime previously fetched unconsumed trade signals from
+Postgres on EVERY cycle (``list_unconsumed_trade_signals``).  Under
+contention the query took 1-7s, blowing the 3s fast-tier budget and
+serializing the entire hot path on the database.
+
+This module replaces that DB poll with a Redis-pushed in-memory cache:
+
+  scanner / news / strategy bridge
+        │
+        ▼
+  signal_bus.upsert_trade_signal
+        ├─ DB INSERT (audit, source of truth)
+        └─ Redis publish "signal_payloads" (full snapshot, ~1ms)
+                          │
+                          ▼
+                    SignalCache subscriber
+                       (this module)
+                          │
+                          ▼
+                  Process-wide LRU cache
+                          │
+                          ▼
+              fast_trader_runtime reads via
+              get_unconsumed_signals(...)
+              (no DB roundtrip)
+
+The cache is the FAST PATH; DB is the SLOW PATH safety net.  When the
+cache has the signals (which is the case under steady state), the fast
+trader skips the DB query entirely.  When the cache misses (cold start,
+Redis down, race with publisher), the caller falls back to the DB.
+
+Per-trader consumption tracking
+-------------------------------
+``list_unconsumed_trade_signals``'s NOT EXISTS subquery is replaced by
+an in-memory per-trader consumed-set.  Hydrated on cold-start from the
+DB ledger via ``trader_orchestrator_state.fetch_recent_consumed_signal_ids``
+(last 48 h, capped at 50 000 entries), updated on every
+``mark_consumed`` call.  The set is unbounded by design — Plan 0032
+retired the previous 1 000-entry deque ring after operators observed
+"trader_order already exists" skip storms whenever a busy trader's
+ring wrapped (every ~1.4 h on the affected hosts).  A lazy prune
+inside ``mark_consumed`` drops obviously-stale ids (no longer in
+``_signals``, terminal-state cutoff at 24 h) once the per-trader set
+crosses 50 000 entries, capping long-term memory growth without
+re-introducing the wrap bug.
+
+Soft-fail contract
+------------------
+* Redis down: subscriber sleeps and retries; cache stops growing but
+  existing entries remain valid for the freshness window.  Fast trader
+  detects empty/stale cache and falls back to DB.
+* Cache miss for a specific signal_id: caller falls back to DB.
+* Process restart: cache is empty until the subscriber reconnects and
+  the publisher emits new signals; bootstrap hydration fills it from
+  DB in the meantime.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import threading
+import time
+from collections import OrderedDict
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from typing import Any, Iterable, Optional
+
+from services import redis_client
+from utils.logger import get_logger
+from utils.utcnow import utcnow
+
+logger = get_logger("signal_cache")
+
+# Channel name used by both publisher and subscriber.  See
+# ``services/signal_bus.py::_publish_signal_payload`` for the publisher.
+SIGNAL_PAYLOADS_CHANNEL = "signal_payloads"
+
+# Bounded LRU cap.  At 10 K signals × ~500 bytes each, cache memory
+# stays under ~5 MB — fine for a worker process.  Per-trader consumed
+# sets are unbounded by design (Plan 0032: a 1 000-entry deque ring
+# wrapped in ~1.4 h on busy traders, re-emitting skip storms); a lazy
+# prune inside ``mark_consumed`` keeps the long-term memory floor flat.
+_MAX_SIGNAL_CACHE_ENTRIES = 10_000
+
+# Lazy-prune trigger: once a per-trader consumed-set crosses this
+# many entries we sweep stale signal_ids (no longer in ``_signals`` AND
+# whose mirroring snapshot — if it ever existed — was last updated
+# more than this many seconds ago).  Both numbers are intentionally
+# loose: the goal is to cap long-term memory growth, not to evict
+# eagerly.  At ~12 ``mark_consumed`` per minute (the worst-case
+# observed throughput on the affected production traders) the prune
+# threshold is hit roughly once every 2.5 days, and the sweep itself
+# is O(N) over the trader's set — sub-millisecond at the cap.
+_CONSUMED_SET_PRUNE_THRESHOLD = 50_000
+_CONSUMED_SET_PRUNE_TERMINAL_CUTOFF_SECONDS = 86_400.0  # 24 h
+
+
+@dataclass(slots=True)
+class SignalSnapshot:
+    """Duck-typed mirror of ``TradeSignal`` for fast-trader consumption.
+
+    All fields the fast trader reads via ``getattr(signal, ...)`` are
+    present.  Heavy JSON columns (``payload_json``,
+    ``strategy_context_json``, ``quality_rejection_reasons``) are NOT
+    included — the fast trader doesn't read them, and shipping them
+    over Redis on every signal is wasted bandwidth.
+    """
+
+    id: str
+    source: str
+    source_item_id: Optional[str]
+    signal_type: str
+    strategy_type: Optional[str]
+    market_id: str
+    market_question: Optional[str]
+    direction: Optional[str]
+    entry_price: Optional[float]
+    effective_price: Optional[float]
+    edge_percent: Optional[float]
+    confidence: Optional[float]
+    liquidity: Optional[float]
+    expires_at: Optional[datetime]
+    status: str
+    quality_passed: Optional[bool]
+    dedupe_key: str
+    runtime_sequence: Optional[int]
+    created_at: datetime
+    updated_at: Optional[datetime]
+    # Time the snapshot was placed in the cache (monotonic seconds).
+    # Used for freshness checks and LRU eviction.
+    _cached_at_mono: float = field(default_factory=time.monotonic)
+
+    @classmethod
+    def from_db_row(cls, row: Any) -> Optional["SignalSnapshot"]:
+        """Build a snapshot from a ``TradeSignal`` ORM row.
+
+        Used by the safety-net DB sweep to seed the cache when the
+        publisher dropped a publish (Redis briefly down, restart race).
+        Reads only the columns the fast trader needs — heavy JSON
+        columns are skipped so this is safe to call on a row loaded
+        with ``defer_heavy_columns=True``.
+        """
+        try:
+            signal_id = str(getattr(row, "id", "") or "").strip()
+            if not signal_id:
+                return None
+            source = str(getattr(row, "source", "") or "").strip()
+            if not source:
+                return None
+            return cls(
+                id=signal_id,
+                source=source,
+                source_item_id=_str_or_none(getattr(row, "source_item_id", None)),
+                signal_type=str(getattr(row, "signal_type", "") or "").strip(),
+                strategy_type=_str_or_none(getattr(row, "strategy_type", None)),
+                market_id=str(getattr(row, "market_id", "") or "").strip(),
+                market_question=_str_or_none(getattr(row, "market_question", None)),
+                direction=_str_or_none(getattr(row, "direction", None)),
+                entry_price=_float_or_none(getattr(row, "entry_price", None)),
+                effective_price=_float_or_none(getattr(row, "effective_price", None)),
+                edge_percent=_float_or_none(getattr(row, "edge_percent", None)),
+                confidence=_float_or_none(getattr(row, "confidence", None)),
+                liquidity=_float_or_none(getattr(row, "liquidity", None)),
+                expires_at=_dt_or_none(getattr(row, "expires_at", None)),
+                status=str(getattr(row, "status", "pending") or "pending").strip().lower(),
+                quality_passed=_bool_or_none(getattr(row, "quality_passed", None)),
+                dedupe_key=str(getattr(row, "dedupe_key", "") or "").strip(),
+                runtime_sequence=_int_or_none(getattr(row, "runtime_sequence", None)),
+                created_at=_dt_or_none(getattr(row, "created_at", None)) or utcnow(),
+                updated_at=_dt_or_none(getattr(row, "updated_at", None)),
+            )
+        except Exception as exc:
+            logger.debug("SignalSnapshot.from_db_row failed: %s", exc)
+            return None
+
+    @classmethod
+    def from_redis_payload(cls, payload: dict[str, Any]) -> Optional["SignalSnapshot"]:
+        """Build a snapshot from the JSON dict published over Redis.
+
+        Returns None if the payload is missing required fields — the
+        caller should drop and continue.  Datetime strings are parsed
+        back into ``datetime`` instances so consumers can compare them
+        against ``utcnow()`` directly.
+        """
+        try:
+            signal_id = str(payload.get("id") or "").strip()
+            if not signal_id:
+                return None
+            source = str(payload.get("source") or "").strip()
+            if not source:
+                return None
+            return cls(
+                id=signal_id,
+                source=source,
+                source_item_id=_str_or_none(payload.get("source_item_id")),
+                signal_type=str(payload.get("signal_type") or "").strip(),
+                strategy_type=_str_or_none(payload.get("strategy_type")),
+                market_id=str(payload.get("market_id") or "").strip(),
+                market_question=_str_or_none(payload.get("market_question")),
+                direction=_str_or_none(payload.get("direction")),
+                entry_price=_float_or_none(payload.get("entry_price")),
+                effective_price=_float_or_none(payload.get("effective_price")),
+                edge_percent=_float_or_none(payload.get("edge_percent")),
+                confidence=_float_or_none(payload.get("confidence")),
+                liquidity=_float_or_none(payload.get("liquidity")),
+                expires_at=_dt_or_none(payload.get("expires_at")),
+                status=str(payload.get("status") or "pending").strip().lower(),
+                quality_passed=_bool_or_none(payload.get("quality_passed")),
+                dedupe_key=str(payload.get("dedupe_key") or "").strip(),
+                runtime_sequence=_int_or_none(payload.get("runtime_sequence")),
+                created_at=_dt_or_none(payload.get("created_at")) or utcnow(),
+                updated_at=_dt_or_none(payload.get("updated_at")),
+            )
+        except Exception as exc:
+            logger.debug("SignalSnapshot.from_redis_payload failed: %s", exc)
+            return None
+
+
+def _str_or_none(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _float_or_none(value: Any) -> Optional[float]:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _int_or_none(value: Any) -> Optional[int]:
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _bool_or_none(value: Any) -> Optional[bool]:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"true", "1", "yes"}:
+            return True
+        if lowered in {"false", "0", "no"}:
+            return False
+    return None
+
+
+def _dt_or_none(value: Any) -> Optional[datetime]:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+    if isinstance(value, (int, float)):
+        try:
+            return datetime.fromtimestamp(float(value), tz=timezone.utc)
+        except (OverflowError, ValueError, OSError):
+            return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+
+
+# ---------------------------------------------------------------------------
+# The cache itself.
+# ---------------------------------------------------------------------------
+
+
+class SignalCache:
+    """LRU cache of signals + per-trader consumed-id rings.
+
+    All mutation goes through ``self._lock`` (a threading.RLock) so the
+    Redis subscriber task and the fast trader's read path can call it
+    concurrently.  Read-side operations are sub-microsecond dict
+    lookups.
+    """
+
+    def __init__(self, max_entries: int = _MAX_SIGNAL_CACHE_ENTRIES) -> None:
+        self._lock = threading.RLock()
+        # OrderedDict for O(1) LRU semantics.
+        self._signals: OrderedDict[str, SignalSnapshot] = OrderedDict()
+        self._max_entries = max_entries
+        # Per-trader consumed-set: unbounded set of signal_ids the
+        # trader has consumed.  Plan 0032 retired the prior
+        # ``deque(maxlen=1_000)`` ring (companion set) — wrapping was
+        # the dominant cause of "trader_order already exists" skip
+        # spam on busy traders.  A lazy prune inside ``mark_consumed``
+        # keeps long-term memory bounded.
+        self._consumed_set: dict[str, set[str]] = {}
+        # Diagnostic counters.
+        self._signals_added: int = 0
+        self._signals_evicted: int = 0
+        self._consumptions_recorded: int = 0
+        self._lookups_total: int = 0
+        self._lookups_hit: int = 0
+        self._upserts_skipped_consumed_overlap: int = 0
+        self._consumed_set_lazy_prunes_total: int = 0
+        # Timestamp of the last subscriber message — surfaced in
+        # ``status_snapshot()`` so operators can see if the cache is
+        # actively being fed.
+        self._last_received_mono: Optional[float] = None
+        # Whether the per-trader consumption sets have been hydrated
+        # from DB.  Bootstrap path sets this to True once done.
+        self._consumed_hydrated: set[str] = set()
+        # Whether the cache itself has been bootstrapped at least once
+        # from the DB.  Hot-path consumers should ONLY trust the cache
+        # (i.e. accept empty results as authoritative) when this is
+        # True.  Set by ``bootstrap_from_db`` after a successful seed.
+        self._ready: bool = False
+        # Monotonic timestamp of the last successful bootstrap.  Surfaced
+        # in status_snapshot for operator visibility.
+        self._last_bootstrap_mono: Optional[float] = None
+        self._bootstraps_total: int = 0
+
+    # ---------- Mutation (subscriber side) ----------
+
+    def upsert(self, snapshot: SignalSnapshot) -> None:
+        """Insert or refresh a signal in the cache.
+
+        Plan 0032 optimisation: when the snapshot's signal_id is
+        already present in EVERY known trader's consumed-set, skip
+        the upsert entirely.  Re-emitting the snapshot would only
+        bump ``runtime_sequence`` and waste filter cycles in
+        ``get_unconsumed_signals`` — every trader would skip it
+        immediately on the consumed-set lookup anyway.
+
+        The skip is strict: a brand-new trader whose consumed-set
+        does not exist yet is treated as "interested", so the
+        snapshot is upserted and stays available for hydration when
+        the new trader cold-starts.
+        """
+        with self._lock:
+            self._last_received_mono = time.monotonic()
+            interested_traders = self._consumed_set
+            if interested_traders and all(
+                snapshot.id in consumed
+                for consumed in interested_traders.values()
+            ):
+                self._upserts_skipped_consumed_overlap += 1
+                return
+            self._signals[snapshot.id] = snapshot
+            # Move-to-end so LRU eviction picks the oldest unused entry.
+            self._signals.move_to_end(snapshot.id)
+            self._signals_added += 1
+            # Bounded eviction.
+            while len(self._signals) > self._max_entries:
+                self._signals.popitem(last=False)
+                self._signals_evicted += 1
+
+    def mark_consumed(self, trader_id: str, signal_id: str) -> None:
+        """Record that a trader consumed a signal.
+
+        Hot-path callers SHOULD call this after a successful consumption
+        write to the DB so subsequent ``get_unconsumed_signals`` calls
+        skip the signal without hitting the DB.
+        """
+        if not trader_id or not signal_id:
+            return
+        with self._lock:
+            consumed = self._consumed_set.get(trader_id)
+            if consumed is None:
+                consumed = set()
+                self._consumed_set[trader_id] = consumed
+            if signal_id in consumed:
+                return
+            consumed.add(signal_id)
+            self._consumptions_recorded += 1
+            if len(consumed) >= _CONSUMED_SET_PRUNE_THRESHOLD:
+                self._lazy_prune_consumed_set(trader_id, consumed)
+
+    def _lazy_prune_consumed_set(
+        self, trader_id: str, consumed: set[str]
+    ) -> None:
+        """Drop signal_ids that are obviously stale.
+
+        Called from ``mark_consumed`` only after the set crosses
+        ``_CONSUMED_SET_PRUNE_THRESHOLD``.  An id is droppable when
+        the cache no longer holds a snapshot for it AND, if a
+        snapshot exists, its ``updated_at`` is older than
+        ``_CONSUMED_SET_PRUNE_TERMINAL_CUTOFF_SECONDS`` (24 h) —
+        terminal status flips and signals that have been LRU-evicted
+        cannot be re-emitted in a way the trader has not already
+        consumed, so dropping their ids does NOT re-introduce the
+        ring-wrap bug.
+
+        Caller must hold ``self._lock``.
+        """
+        cutoff = utcnow() - timedelta(
+            seconds=_CONSUMED_SET_PRUNE_TERMINAL_CUTOFF_SECONDS
+        )
+        signals = self._signals
+        droppable: list[str] = []
+        for sid in consumed:
+            snap = signals.get(sid)
+            if snap is None:
+                droppable.append(sid)
+                continue
+            updated = snap.updated_at or snap.created_at
+            if updated is not None and updated < cutoff:
+                droppable.append(sid)
+        for sid in droppable:
+            consumed.discard(sid)
+        self._consumed_set_lazy_prunes_total += 1
+
+    def hydrate_trader_consumed_ids(
+        self,
+        trader_id: str,
+        signal_ids: Iterable[str],
+    ) -> None:
+        """Bulk-load consumed signal_ids for a trader from a DB query.
+
+        Idempotent: re-hydrating a trader simply replaces the set.
+        """
+        if not trader_id:
+            return
+        with self._lock:
+            self._consumed_set[trader_id] = {
+                str(sid) for sid in signal_ids if sid
+            }
+            self._consumed_hydrated.add(trader_id)
+
+    def is_trader_hydrated(self, trader_id: str) -> bool:
+        with self._lock:
+            return trader_id in self._consumed_hydrated
+
+    def consumed_ids_for(self, trader_id: str) -> frozenset[str]:
+        """Return a snapshot of the trader's consumed signal_ids.
+
+        Read-only surface used by the fast trader's hot path to filter
+        ``intent_runtime.list_unconsumed_signals`` results before
+        dispatching them to per-market workers, and by any other caller
+        that needs to consult the consumed-set without holding the
+        cache lock for longer than the copy. ``frozenset`` so the
+        caller cannot mutate cache state through the return value.
+
+        Empty frozenset if the trader has not been hydrated; callers
+        treat that as "filter disabled" rather than "everything is
+        unconsumed", since the absence of a hydrated set is itself
+        evidence that consumption history hasn't been consulted yet.
+        """
+        normalized = str(trader_id or "").strip()
+        if not normalized:
+            return frozenset()
+        with self._lock:
+            consumed = self._consumed_set.get(normalized)
+            if not consumed:
+                return frozenset()
+            return frozenset(consumed)
+
+    def is_ready(self) -> bool:
+        """True once the cache has been bootstrapped from DB at least once.
+
+        Hot-path readers should treat empty cache results as authoritative
+        ONLY when this is True.  Until the first bootstrap completes the
+        cache may be missing currently-pending signals that pre-existed
+        the subscriber, so trusting an empty result would silently skip
+        legitimate work.
+        """
+        with self._lock:
+            return self._ready
+
+    def mark_ready(self) -> None:
+        with self._lock:
+            self._ready = True
+            self._last_bootstrap_mono = time.monotonic()
+            self._bootstraps_total += 1
+
+    # ---------- Read (fast-trader side) ----------
+
+    def get_unconsumed_signals(
+        self,
+        *,
+        trader_id: str,
+        sources: Optional[Iterable[str]] = None,
+        cursor_runtime_sequence: Optional[int] = None,
+        statuses: Optional[Iterable[str]] = None,
+        limit: int = 200,
+    ) -> list[SignalSnapshot]:
+        """Return signals matching the filter that this trader hasn't consumed.
+
+        Filters applied in order (cheapest first):
+          * status in ``statuses`` (default: ``{"pending"}``)
+          * source in ``sources`` (if provided)
+          * runtime_sequence > ``cursor_runtime_sequence`` (if provided)
+          * not in this trader's consumed-set
+          * expires_at not in the past (if set)
+
+        Sorted by ``(runtime_sequence asc, created_at asc)`` so the
+        fast trader processes signals in arrival order.
+        """
+        normalized_statuses = (
+            {str(s).strip().lower() for s in statuses}
+            if statuses is not None
+            else {"pending"}
+        )
+        normalized_sources = (
+            {str(s).strip().lower() for s in sources}
+            if sources is not None
+            else None
+        )
+        now = utcnow()
+        results: list[SignalSnapshot] = []
+        with self._lock:
+            self._lookups_total += 1
+            consumed = self._consumed_set.get(trader_id) or frozenset()
+            for snapshot in self._signals.values():
+                if snapshot.status not in normalized_statuses:
+                    continue
+                if normalized_sources is not None and snapshot.source.lower() not in normalized_sources:
+                    continue
+                if cursor_runtime_sequence is not None:
+                    seq = snapshot.runtime_sequence
+                    if seq is not None and seq <= cursor_runtime_sequence:
+                        continue
+                if snapshot.id in consumed:
+                    continue
+                if snapshot.expires_at is not None and snapshot.expires_at < now:
+                    continue
+                results.append(snapshot)
+            if results:
+                self._lookups_hit += 1
+        # Sort outside the lock — cheap, ascending by sequence then time.
+        results.sort(
+            key=lambda s: (
+                s.runtime_sequence if s.runtime_sequence is not None else 0,
+                s.created_at,
+                s.id,
+            )
+        )
+        return results[: max(1, limit)]
+
+    def get_signal(self, signal_id: str) -> Optional[SignalSnapshot]:
+        with self._lock:
+            return self._signals.get(signal_id)
+
+    # ---------- Diagnostics ----------
+
+    def status_snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            age = (
+                None
+                if self._last_received_mono is None
+                else round(time.monotonic() - self._last_received_mono, 3)
+            )
+            hit_rate = (
+                round(self._lookups_hit / self._lookups_total, 3)
+                if self._lookups_total > 0
+                else None
+            )
+            bootstrap_age = (
+                None
+                if self._last_bootstrap_mono is None
+                else round(time.monotonic() - self._last_bootstrap_mono, 3)
+            )
+            consumed_set_size_per_trader = {
+                trader_id: len(consumed)
+                for trader_id, consumed in self._consumed_set.items()
+            }
+            return {
+                "size": len(self._signals),
+                "max_entries": self._max_entries,
+                "signals_added_total": self._signals_added,
+                "signals_evicted_total": self._signals_evicted,
+                "consumptions_recorded_total": self._consumptions_recorded,
+                "lookups_total": self._lookups_total,
+                "lookups_hit": self._lookups_hit,
+                "hit_rate": hit_rate,
+                "last_received_age_seconds": age,
+                "traders_hydrated": len(self._consumed_hydrated),
+                "consumed_set_size_per_trader": consumed_set_size_per_trader,
+                "consumed_set_lazy_prunes_total": (
+                    self._consumed_set_lazy_prunes_total
+                ),
+                "upserts_skipped_consumed_overlap": (
+                    self._upserts_skipped_consumed_overlap
+                ),
+                "ready": self._ready,
+                "bootstraps_total": self._bootstraps_total,
+                "last_bootstrap_age_seconds": bootstrap_age,
+                "channel": SIGNAL_PAYLOADS_CHANNEL,
+            }
+
+
+_cache: Optional[SignalCache] = None
+_cache_lock = threading.Lock()
+
+
+def get_signal_cache() -> SignalCache:
+    """Process-wide singleton."""
+    global _cache
+    if _cache is None:
+        with _cache_lock:
+            if _cache is None:
+                _cache = SignalCache()
+    return _cache
+
+
+# ---------------------------------------------------------------------------
+# Bootstrap loader.
+# ---------------------------------------------------------------------------
+
+
+# Bootstrap pulls all currently-pending TradeSignal rows that haven't
+# expired, plus a small window of recently-updated rows so status flips
+# (executed/skipped) the cache may have missed during a Redis gap are
+# reconciled.  At a typical ~few hundred pending signals, this is a
+# tens-of-millisecond DB query — done once at process start and once
+# per Redis reconnect, NEVER on the per-cycle hot path.
+_BOOTSTRAP_RECENT_UPDATE_WINDOW_SECONDS = 600.0
+_BOOTSTRAP_MAX_ROWS = 10_000
+
+
+async def bootstrap_from_db(
+    session_factory: Any | None = None,
+) -> int:
+    """Seed the in-memory cache from DB pending signals.
+
+    Called:
+      * once at trading-plane startup, BEFORE traders begin cycling
+      * once on every successful Redis (re)subscribe — handles publishes
+        dropped during a connection blip
+
+    Returns the number of signals upserted.  Soft-fails by returning 0
+    if the DB isn't reachable; the cache simply isn't marked ready and
+    the hot path falls back to per-cycle DB reads until a future
+    bootstrap succeeds.
+    """
+    cache = get_signal_cache()
+    try:
+        # Late imports keep this module free of DB layer dependencies
+        # at import time (matters for the test fixture).
+        from sqlalchemy import select, or_
+        from models.database import AsyncSessionLocal, TradeSignal
+
+        factory = session_factory or AsyncSessionLocal
+    except Exception as exc:
+        logger.debug("signal_cache bootstrap unavailable: %s", exc)
+        return 0
+    now = utcnow()
+    cutoff_naive = (
+        now.replace(tzinfo=None)
+        if now.tzinfo is not None
+        else now
+    )
+    from datetime import timedelta as _timedelta
+    recent_cutoff = (now - _timedelta(seconds=_BOOTSTRAP_RECENT_UPDATE_WINDOW_SECONDS))
+    recent_cutoff_naive = (
+        recent_cutoff.replace(tzinfo=None)
+        if recent_cutoff.tzinfo is not None
+        else recent_cutoff
+    )
+    rows: list = []
+    try:
+        async with factory() as session:
+            # Pending + non-expired, OR recently-updated (any status).
+            # The recently-updated branch makes the bootstrap reconcile
+            # status flips after a Redis blip without scanning the
+            # whole table.
+            query = (
+                select(TradeSignal)
+                .where(
+                    or_(
+                        # Currently actionable.
+                        TradeSignal.status == "pending",
+                        # Status flips we may have missed on Redis.
+                        TradeSignal.updated_at >= recent_cutoff_naive,
+                    )
+                )
+                .where(
+                    or_(
+                        TradeSignal.expires_at.is_(None),
+                        TradeSignal.expires_at >= cutoff_naive,
+                    )
+                )
+                .limit(_BOOTSTRAP_MAX_ROWS)
+            )
+            result = await session.execute(query)
+            rows = list(result.scalars().all())
+    except Exception as exc:
+        logger.warning("signal_cache bootstrap DB read failed", exc_info=exc)
+        return 0
+    upserted = 0
+    for row in rows:
+        snap = SignalSnapshot.from_db_row(row)
+        if snap is not None:
+            cache.upsert(snap)
+            upserted += 1
+    cache.mark_ready()
+    logger.info(
+        "signal_cache bootstrap complete",
+        upserted=upserted,
+        cache_size=cache.status_snapshot()["size"],
+    )
+    return upserted
+
+
+# ---------------------------------------------------------------------------
+# Subscriber task (trading plane).
+# ---------------------------------------------------------------------------
+
+
+class _Subscriber:
+    def __init__(self) -> None:
+        self._task: Optional[asyncio.Task] = None
+        self._stop_event: Optional[asyncio.Event] = None
+
+    async def start(self) -> None:
+        if self._task is not None and not self._task.done():
+            return
+        self._stop_event = asyncio.Event()
+        self._task = asyncio.create_task(self._run(), name="signal_cache_subscriber")
+
+    async def stop(self) -> None:
+        if self._stop_event is not None:
+            self._stop_event.set()
+        if self._task is not None and not self._task.done():
+            try:
+                await asyncio.wait_for(self._task, timeout=2.0)
+            except asyncio.TimeoutError:
+                self._task.cancel()
+                try:
+                    await self._task
+                except (asyncio.CancelledError, Exception):
+                    pass
+        self._task = None
+        self._stop_event = None
+
+    async def _run(self) -> None:
+        stop_event = self._stop_event
+        assert stop_event is not None
+        cache = get_signal_cache()
+        backoff = 1.0
+        while not stop_event.is_set():
+            client = redis_client.get_client_or_none()
+            if client is None:
+                try:
+                    await asyncio.wait_for(stop_event.wait(), timeout=2.0)
+                except asyncio.TimeoutError:
+                    pass
+                continue
+            pubsub = None
+            try:
+                pubsub = client.pubsub()
+                channel = redis_client.namespaced(SIGNAL_PAYLOADS_CHANNEL)
+                await pubsub.subscribe(channel)
+                logger.info("signal_cache subscribed", channel=channel)
+                backoff = 1.0
+                # Reconcile after every successful (re)subscribe.  The
+                # subscribe-then-bootstrap order matters: any signal
+                # inserted between subscribe and bootstrap-completion
+                # arrives via the channel AND is in the DB read, so
+                # upsert is just idempotent — no missed signals.
+                try:
+                    asyncio.create_task(
+                        bootstrap_from_db(),
+                        name="signal_cache_bootstrap_on_connect",
+                    )
+                except Exception as exc:
+                    logger.debug(
+                        "signal_cache bootstrap-on-connect schedule failed: %s",
+                        exc,
+                    )
+                while not stop_event.is_set():
+                    try:
+                        message = await pubsub.get_message(
+                            ignore_subscribe_messages=True,
+                            timeout=2.0,
+                        )
+                    except asyncio.TimeoutError:
+                        message = None
+                    if message is None:
+                        continue
+                    if message.get("type") != "message":
+                        continue
+                    data = message.get("data")
+                    if isinstance(data, (bytes, bytearray)):
+                        data = data.decode("utf-8", errors="replace")
+                    try:
+                        payload = json.loads(data) if data else None
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        continue
+                    if not isinstance(payload, dict):
+                        continue
+                    snapshot = SignalSnapshot.from_redis_payload(payload)
+                    if snapshot is not None:
+                        cache.upsert(snapshot)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.debug("signal_cache subscriber error: %s", exc)
+                try:
+                    await asyncio.wait_for(stop_event.wait(), timeout=backoff)
+                except asyncio.TimeoutError:
+                    pass
+                backoff = min(backoff * 2.0, 15.0)
+            finally:
+                if pubsub is not None:
+                    try:
+                        await pubsub.aclose()
+                    except Exception:
+                        pass
+
+
+_subscriber = _Subscriber()
+
+
+async def start_subscriber() -> None:
+    """Start the Redis subscriber.  Trading plane only."""
+    await _subscriber.start()
+
+
+async def stop_subscriber() -> None:
+    await _subscriber.stop()
+
+
+def status_snapshot() -> dict[str, Any]:
+    return get_signal_cache().status_snapshot()

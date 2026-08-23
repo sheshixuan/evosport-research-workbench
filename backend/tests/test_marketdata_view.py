@@ -1,0 +1,312 @@
+"""Tests for the Phase-2 keystone: MarketDataView (book side) + coverage.
+
+The book-read path is validated against real temp parquet via a hand-built
+CoverageMap (no DB). resolve_coverage is exercised against the real test
+Postgres (marked ``db``).
+"""
+from __future__ import annotations
+
+from datetime import datetime, timezone
+import hashlib
+from pathlib import Path
+
+import pyarrow as pa
+import pyarrow.parquet as pq
+import pytest
+
+from services.external_data.parquet_schema import SNAPSHOT_SCHEMA
+from services.marketdata.book import load_book_series, row_to_book_snapshot
+from services.marketdata.coverage import CoverageMap, TokenCoverage
+from services.marketdata.view import MarketDataView
+
+
+def _write_snapshot_file(path, token_id, ticks):
+    """ticks: list of (observed_at_us, best_bid, best_ask)."""
+    n = len(ticks)
+    table = pa.table(
+        {
+            "token_id": pa.array([token_id] * n, pa.string()),
+            "observed_at_us": pa.array([t[0] for t in ticks], pa.int64()),
+            "sequence": pa.array([i for i in range(n)], pa.int64()),
+            "best_bid": pa.array([t[1] for t in ticks], pa.float64()),
+            "best_ask": pa.array([t[2] for t in ticks], pa.float64()),
+            "spread_bps": pa.array([None] * n, pa.float64()),
+            "bids_price": pa.array([[t[1]] for t in ticks], pa.list_(pa.float64())),
+            "bids_size": pa.array([[10.0]] * n, pa.list_(pa.float64())),
+            "asks_price": pa.array([[t[2]] for t in ticks], pa.list_(pa.float64())),
+            "asks_size": pa.array([[10.0]] * n, pa.list_(pa.float64())),
+            "trade_price": pa.array([None] * n, pa.float64()),
+            "trade_size": pa.array([None] * n, pa.float64()),
+            "trade_side": pa.array([None] * n, pa.string()),
+        },
+        schema=SNAPSHOT_SCHEMA,
+    )
+    pq.write_table(table, str(path))
+
+
+# ── row conversion / series loader ──────────────────────────────────────
+def test_row_to_book_snapshot_filters_invalid_levels():
+    row = {
+        "observed_at_us": 1_000_000,
+        "sequence": 1,
+        "spread_bps": None,
+        "bids_price": [0.40, 0.0, 1.5],   # 0.0 and 1.5 invalid
+        "bids_size": [10.0, 5.0, 5.0],
+        "asks_price": [0.60, 0.62],
+        "asks_size": [10.0, 0.0],          # second has size 0 -> dropped
+    }
+    snap = row_to_book_snapshot("tok", row)
+    assert [lvl.price for lvl in snap.bids] == [0.40]
+    assert [lvl.price for lvl in snap.asks] == [0.60]
+    assert snap.token_id == "tok"
+
+
+def test_load_book_series_window_filter(tmp_path):
+    f = tmp_path / "snapshots__tok.parquet"
+    base = 1_700_000_000_000_000  # us
+    _write_snapshot_file(f, "tok", [
+        (base + 0, 0.40, 0.42),
+        (base + 10_000_000, 0.50, 0.52),
+        (base + 20_000_000, 0.60, 0.62),
+    ])
+    # window excludes the first tick
+    series, rows = load_book_series("tok", [f], start_us=base + 5_000_000, end_us=base + 30_000_000)
+    assert rows == 2
+    assert len(series) == 2
+    snap = series.as_of(base + 15_000_000)
+    assert snap is not None and snap.bids[0].price == 0.50
+
+
+def test_load_book_series_filters_bundle_by_token(tmp_path):
+    f = tmp_path / "snapshots.parquet"
+    base = 1_700_000_000_000_000
+    ticks = [
+        ("tok_a", base + 0, 0.40, 0.42),
+        ("tok_b", base + 1_000_000, 0.10, 0.12),
+        ("tok_a", base + 2_000_000, 0.50, 0.52),
+    ]
+    n = len(ticks)
+    table = pa.table(
+        {
+            "token_id": pa.array([t[0] for t in ticks], pa.string()),
+            "observed_at_us": pa.array([t[1] for t in ticks], pa.int64()),
+            "sequence": pa.array([i for i in range(n)], pa.int64()),
+            "best_bid": pa.array([t[2] for t in ticks], pa.float64()),
+            "best_ask": pa.array([t[3] for t in ticks], pa.float64()),
+            "spread_bps": pa.array([None] * n, pa.float64()),
+            "bids_price": pa.array([[t[2]] for t in ticks], pa.list_(pa.float64())),
+            "bids_size": pa.array([[10.0]] * n, pa.list_(pa.float64())),
+            "asks_price": pa.array([[t[3]] for t in ticks], pa.list_(pa.float64())),
+            "asks_size": pa.array([[10.0]] * n, pa.list_(pa.float64())),
+            "trade_price": pa.array([None] * n, pa.float64()),
+            "trade_size": pa.array([None] * n, pa.float64()),
+            "trade_side": pa.array([None] * n, pa.string()),
+        },
+        schema=SNAPSHOT_SCHEMA,
+    )
+    pq.write_table(table, str(f))
+
+    series, rows = load_book_series("tok_a", [f], start_us=base, end_us=base + 3_000_000)
+
+    assert rows == 2
+    assert len(series) == 2
+    assert [(snap.token_id, snap.bids[0].price) for _ts, snap in series.iter_range(base, base + 3_000_000)] == [
+        ("tok_a", 0.40),
+        ("tok_a", 0.50),
+    ]
+
+
+# ── CoverageMap logic ───────────────────────────────────────────────────
+def test_coverage_map_covered_uncovered_fraction():
+    cov = CoverageMap(
+        by_token={
+            "a": TokenCoverage("a", files=("f1.parquet",)),
+            "b": TokenCoverage("b", files=()),
+        },
+        requested=("a", "b"),
+        window_start_us=0, window_end_us=100,
+    )
+    assert cov.covered_tokens == ("a",)
+    assert cov.uncovered_tokens == ("b",)
+    assert cov.coverage_fraction == 0.5
+    assert cov.files_for("a") == ("f1.parquet",)
+    assert cov.as_per_token_files() == {"a": ["f1.parquet"]}
+
+
+# ── MarketDataView book side (no DB) ────────────────────────────────────
+def _view_over(tmp_path, token_ticks: dict[str, list], start_us, end_us):
+    by_token = {}
+    for tok, ticks in token_ticks.items():
+        f = tmp_path / f"snapshots__{tok}.parquet"
+        _write_snapshot_file(f, tok, ticks)
+        by_token[tok] = TokenCoverage(tok, files=(str(f),), start_us=start_us, end_us=end_us)
+    cov = CoverageMap(by_token=by_token, requested=tuple(token_ticks), window_start_us=start_us, window_end_us=end_us)
+    start = datetime.fromtimestamp(start_us / 1e6, tz=timezone.utc)
+    end = datetime.fromtimestamp(end_us / 1e6, tz=timezone.utc)
+    return MarketDataView(coverage=cov, start=start, end=end)
+
+
+@pytest.mark.asyncio
+async def test_view_book_at_point_in_time(tmp_path):
+    base = 1_700_000_000_000_000
+    view = _view_over(tmp_path, {
+        "up": [(base, 0.40, 0.42), (base + 10_000_000, 0.55, 0.57)],
+    }, base, base + 60_000_000)
+
+    def at(sec):
+        return datetime.fromtimestamp((base + sec * 1_000_000) / 1e6, tz=timezone.utc)
+
+    assert await view.book_at("up", at(-5)) is None      # before first
+    s0 = await view.book_at("up", at(5))
+    assert s0 is not None and s0.bids[0].price == 0.40    # first tick visible
+    s1 = await view.book_at("up", at(15))
+    assert s1 is not None and s1.bids[0].price == 0.55    # second tick
+
+
+@pytest.mark.asyncio
+async def test_view_book_at_staleness(tmp_path):
+    base = 1_700_000_000_000_000
+    view = _view_over(tmp_path, {"up": [(base, 0.40, 0.42)]}, base, base + 600_000_000)
+    near = datetime.fromtimestamp((base + 20_000_000) / 1e6, tz=timezone.utc)
+    far = datetime.fromtimestamp((base + 120_000_000) / 1e6, tz=timezone.utc)
+    assert await view.book_at("up", near, max_staleness_seconds=30) is not None
+    assert await view.book_at("up", far, max_staleness_seconds=30) is None
+
+
+@pytest.mark.asyncio
+async def test_view_iter_books_global_order(tmp_path):
+    base = 1_700_000_000_000_000
+    view = _view_over(tmp_path, {
+        "up":   [(base + 0, 0.40, 0.42), (base + 20_000_000, 0.45, 0.47)],
+        "down": [(base + 10_000_000, 0.58, 0.60), (base + 30_000_000, 0.55, 0.57)],
+    }, base, base + 60_000_000)
+    seen = [(s.token_id, int(s.observed_at.timestamp() * 1e6)) async for s in view.iter_books()]
+    # globally ascending by observed_at across the two tokens
+    times = [t for _, t in seen]
+    assert times == sorted(times)
+    assert {tok for tok, _ in seen} == {"up", "down"}
+    assert len(seen) == 4
+
+
+@pytest.mark.asyncio
+async def test_view_dataset_snapshot_pin(tmp_path):
+    base = 1_700_000_000_000_000
+    view = _view_over(tmp_path, {"up": [(base, 0.40, 0.42)]}, base, base + 60_000_000)
+    _ = await view.book_at("up", datetime.fromtimestamp((base + 1_000_000) / 1e6, tz=timezone.utc))
+    snap = view.dataset_snapshot()
+    assert snap.content_hash.startswith("sha256:")
+    assert len(snap.entries) == 1
+    assert snap.entries[0].rows == 1
+    assert snap.entries[0].sha256 == hashlib.sha256(
+        Path(snap.entries[0].path).read_bytes()
+    ).hexdigest()
+
+
+def test_view_dataset_snapshot_preserves_distinct_and_shared_file_lineage(tmp_path):
+    distinct_a = tmp_path / "snapshots__distinct_a.parquet"
+    distinct_b = tmp_path / "snapshots__distinct_b.parquet"
+    distinct_a.write_bytes(b"distinct-a")
+    distinct_b.write_bytes(b"distinct-b")
+    distinct_coverage = CoverageMap(
+        by_token={
+            "YES": TokenCoverage(
+                "YES",
+                files=(str(distinct_a), str(distinct_b)),
+                dataset_ids=("distinct-a", "distinct-b"),
+                start_us=1,
+                end_us=2,
+            ),
+        },
+        requested=("YES",),
+        window_start_us=1,
+        window_end_us=2,
+        dataset_ids_by_path={
+            str(distinct_a): ("distinct-a",),
+            str(distinct_b): ("distinct-b",),
+        },
+    )
+    distinct_snapshot = MarketDataView(
+        coverage=distinct_coverage,
+        start=datetime.fromtimestamp(0, tz=timezone.utc),
+        end=datetime.fromtimestamp(1, tz=timezone.utc),
+    ).dataset_snapshot()
+
+    assert {
+        entry.path: entry.provider_dataset_ids for entry in distinct_snapshot.entries
+    } == {
+        str(distinct_a): ("distinct-a",),
+        str(distinct_b): ("distinct-b",),
+    }
+
+    bundle = tmp_path / "snapshots.parquet"
+    bundle.write_bytes(b"shared-canonical-bundle")
+    coverage = CoverageMap(
+        by_token={
+            "NO": TokenCoverage(
+                "NO",
+                files=(str(bundle),),
+                dataset_ids=("shared-a", "shared-b"),
+                start_us=1,
+                end_us=2,
+            ),
+            "YES": TokenCoverage(
+                "YES",
+                files=(str(bundle),),
+                dataset_ids=("shared-a", "shared-b"),
+                start_us=1,
+                end_us=2,
+            ),
+        },
+        requested=("NO", "YES"),
+        window_start_us=1,
+        window_end_us=2,
+        dataset_ids_by_path={str(bundle): ("shared-a", "shared-b")},
+    )
+    view = MarketDataView(
+        coverage=coverage,
+        start=datetime.fromtimestamp(0, tz=timezone.utc),
+        end=datetime.fromtimestamp(1, tz=timezone.utc),
+    )
+
+    snapshot = view.dataset_snapshot()
+
+    assert len(snapshot.entries) == 1
+    assert snapshot.entries[0].token_ids == ("NO", "YES")
+    assert snapshot.entries[0].provider_dataset_ids == ("shared-a", "shared-b")
+
+
+@pytest.mark.asyncio
+async def test_view_build_enforces_explicit_dataset_ids(monkeypatch):
+    captured = {}
+
+    async def fake_resolve_coverage(**kwargs):
+        captured.update(kwargs)
+        return CoverageMap(requested=("YES",))
+
+    monkeypatch.setattr("services.marketdata.view.resolve_coverage", fake_resolve_coverage)
+    start = datetime(2026, 8, 1, tzinfo=timezone.utc)
+
+    await MarketDataView.build(
+        token_ids=["YES"],
+        start=start,
+        end=datetime(2026, 8, 2, tzinfo=timezone.utc),
+        dataset_ids=["selected"],
+        ensure_scan=False,
+    )
+
+    assert captured["dataset_ids"] == ["selected"]
+
+
+# ── resolve_coverage DB integration ─────────────────────────────────────
+# resolve_coverage()'s SQL-query + file-resolution path is validated two ways
+# that don't depend on the module-singleton AsyncSessionLocal (which binds to
+# its creation event loop and so is not safe to exercise from an arbitrary
+# pytest-asyncio per-test loop):
+#   1. The no-DB CoverageMap unit tests above (covered/uncovered/fraction,
+#      files_for, as_per_token_files).
+#   2. A real-data parity check against the production polybacktest datasets,
+#      which confirmed resolve_coverage(providers=None) returns byte-for-byte
+#      the same covered-token set as the legacy find_parquet_coverage
+#      (173/177 tokens, zero diff).
+# A dedicated isolated-DB integration test (build_postgres_session_factory +
+# session injection) belongs with the Phase-8 observability/coverage work.

@@ -1,0 +1,1210 @@
+"""API routes for the worker-driven News Workflow pipeline."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+from datetime import datetime, timedelta, timezone
+from typing import Any, Optional
+
+from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel, Field
+from sqlalchemy import desc, func, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from models.database import (
+    NewsArticleCache,
+    NewsTradeIntent,
+    NewsWorkflowFinding,
+    get_db_session,
+)
+from services.live_price_snapshot import (
+    append_live_binary_price_point,
+    get_live_mid_prices,
+    normalize_binary_price_history,
+)
+from services import shared_state as scanner_shared_state
+from services.news import shared_state
+from services.pause_state import global_pause_state
+from utils.market_urls import build_market_url, infer_market_platform
+from functools import partial
+from utils.converters import normalize_market_id, safe_float, to_iso
+
+_safe_float = partial(safe_float, reject_nan_inf=True)
+
+logger = logging.getLogger(__name__)
+router = APIRouter()
+
+
+def _collect_cluster_article_ids(findings: list[NewsWorkflowFinding]) -> set[str]:
+    article_ids: set[str] = set()
+    for finding in findings:
+        evidence = finding.evidence or {}
+        cluster = evidence.get("cluster") if isinstance(evidence, dict) else None
+        if not isinstance(cluster, dict):
+            continue
+        refs = cluster.get("article_refs")
+        if isinstance(refs, list) and refs:
+            continue
+        raw_ids = cluster.get("article_ids")
+        if not isinstance(raw_ids, list):
+            continue
+        for raw_id in raw_ids:
+            article_id = str(raw_id or "").strip()
+            if article_id:
+                article_ids.add(article_id)
+    return article_ids
+
+
+def _build_supporting_articles_from_finding(
+    finding: Optional[NewsWorkflowFinding],
+    article_cache_by_id: Optional[dict[str, NewsArticleCache]] = None,
+) -> list[dict]:
+    if finding is None:
+        return []
+
+    cache = article_cache_by_id or {}
+    evidence = finding.evidence or {}
+    cluster = evidence.get("cluster") if isinstance(evidence, dict) else None
+    refs: list[dict] = []
+
+    if isinstance(cluster, dict):
+        raw_refs = cluster.get("article_refs")
+        if isinstance(raw_refs, list):
+            for raw in raw_refs:
+                if not isinstance(raw, dict):
+                    continue
+                title = str(raw.get("title") or "").strip()
+                url = str(raw.get("url") or "").strip()
+                if not title and not url:
+                    continue
+                refs.append(
+                    {
+                        "article_id": str(raw.get("article_id") or ""),
+                        "title": title,
+                        "url": url,
+                        "source": str(raw.get("source") or ""),
+                        "published": raw.get("published"),
+                        "fetched_at": raw.get("fetched_at"),
+                    }
+                )
+
+        if not refs:
+            raw_ids = cluster.get("article_ids")
+            if isinstance(raw_ids, list):
+                for raw_id in raw_ids:
+                    article_id = str(raw_id or "").strip()
+                    if not article_id:
+                        continue
+                    row = cache.get(article_id)
+                    title = ((row.title if row else "") or "").strip()
+                    url = ((row.url if row else "") or "").strip()
+                    if not title and not url:
+                        continue
+                    refs.append(
+                        {
+                            "article_id": article_id,
+                            "title": title,
+                            "url": url,
+                            "source": (row.source if row else "") or "",
+                            "published": to_iso(row.published) if row else None,
+                            "fetched_at": to_iso(row.fetched_at) if row else None,
+                        }
+                    )
+
+    if not refs:
+        refs = [
+            {
+                "article_id": finding.article_id,
+                "title": finding.article_title,
+                "url": finding.article_url or "",
+                "source": finding.article_source or "",
+                "published": None,
+                "fetched_at": to_iso(finding.created_at),
+            }
+        ]
+
+    deduped: list[dict] = []
+    seen: set[str] = set()
+    for ref in refs:
+        title = str(ref.get("title") or "").strip()
+        url = str(ref.get("url") or "").strip()
+        if not title and not url:
+            continue
+        key = str(ref.get("article_id") or "").strip() or url or title.lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        deduped.append(ref)
+    return deduped[:8]
+
+
+def _clean_market_text(value: object) -> str:
+    return str(value or "").strip()
+
+
+def _extract_market_context_from_finding(
+    finding: Optional[NewsWorkflowFinding],
+) -> dict[str, Any]:
+    if finding is None:
+        return {}
+
+    evidence_raw = getattr(finding, "evidence", None)
+    event_graph_raw = getattr(finding, "event_graph", None)
+    evidence = evidence_raw if isinstance(evidence_raw, dict) else {}
+    event_graph = event_graph_raw if isinstance(event_graph_raw, dict) else {}
+
+    for parent in (evidence, event_graph):
+        market = parent.get("market")
+        if isinstance(market, dict):
+            return market
+    return {}
+
+
+def _merge_market_context(
+    base_context: dict[str, Any],
+    override_context: Optional[dict[str, Any]],
+) -> dict[str, Any]:
+    if not isinstance(base_context, dict):
+        base_context = {}
+    if not isinstance(override_context, dict):
+        return dict(base_context)
+
+    merged = dict(base_context)
+    for key, value in override_context.items():
+        if value is None:
+            continue
+        if isinstance(value, str) and not value.strip():
+            continue
+        if isinstance(value, list) and not value:
+            continue
+        if isinstance(value, dict) and not value:
+            continue
+        merged[key] = value
+    return merged
+
+
+def _merged_market_context_for_finding(
+    finding: NewsWorkflowFinding,
+    market_context_overrides: Optional[dict[str, dict[str, Any]]] = None,
+) -> dict[str, Any]:
+    base_context = _extract_market_context_from_finding(finding)
+    if not isinstance(market_context_overrides, dict):
+        return base_context
+    finding_id = str(getattr(finding, "id", "") or "").strip()
+    override = market_context_overrides.get(finding_id) if finding_id else None
+    return _merge_market_context(base_context, override)
+
+
+def _build_market_link_payload(
+    *,
+    market_id: object = None,
+    market_question: object = None,
+    market_context: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    context = market_context if isinstance(market_context, dict) else {}
+
+    primary_market_id = _clean_market_text(context.get("id") or context.get("market_id") or market_id)
+    condition_id = _clean_market_text(context.get("condition_id") or context.get("conditionId"))
+    market_slug = _clean_market_text(context.get("slug") or context.get("market_slug"))
+    event_slug = _clean_market_text(context.get("event_slug") or context.get("eventSlug"))
+    event_ticker = _clean_market_text(context.get("event_ticker") or context.get("eventTicker"))
+    explicit_platform = _clean_market_text(context.get("platform")).lower()
+
+    payload = {
+        "id": primary_market_id,
+        "market_id": primary_market_id,
+        "condition_id": condition_id,
+        "slug": market_slug,
+        "event_slug": event_slug,
+        "event_ticker": event_ticker,
+        "platform": explicit_platform,
+        "question": _clean_market_text(context.get("question") or market_question),
+    }
+
+    market_url = None
+    raw_url = context.get("market_url") or context.get("url")
+    if isinstance(raw_url, str):
+        raw_url = raw_url.strip()
+        if raw_url.startswith("http://") or raw_url.startswith("https://"):
+            market_url = raw_url
+    if not market_url:
+        market_url = build_market_url(payload, opportunity_event_slug=event_slug)
+
+    platform = infer_market_platform(payload)
+    polymarket_url = None
+    kalshi_url = None
+    if market_url:
+        if platform == "kalshi":
+            kalshi_url = market_url
+        else:
+            polymarket_url = market_url
+
+    return {
+        "market_platform": platform or None,
+        "market_slug": market_slug or None,
+        "market_event_slug": event_slug or None,
+        "market_event_ticker": event_ticker or None,
+        "market_url": market_url or None,
+        "polymarket_url": polymarket_url,
+        "kalshi_url": kalshi_url,
+    }
+
+
+def _extract_outcome_labels(raw: object) -> list[str]:
+    source: list[object] = []
+    if isinstance(raw, list):
+        source = raw
+    elif isinstance(raw, tuple):
+        source = list(raw)
+    elif isinstance(raw, str):
+        text = raw.strip()
+        if text.startswith("[") and text.endswith("]"):
+            try:
+                parsed = json.loads(text)
+            except Exception:
+                parsed = None
+            if isinstance(parsed, list):
+                source = parsed
+
+    labels: list[str] = []
+    for item in source:
+        if isinstance(item, str):
+            text = item.strip()
+            if text:
+                labels.append(text)
+            continue
+        if not isinstance(item, dict):
+            continue
+        text = str(item.get("outcome") or item.get("label") or item.get("name") or item.get("title") or "").strip()
+        if text:
+            labels.append(text)
+    return labels
+
+
+def _extract_outcome_prices(raw: object) -> list[float]:
+    source: list[object] = []
+    if isinstance(raw, list):
+        source = raw
+    elif isinstance(raw, tuple):
+        source = list(raw)
+    elif isinstance(raw, str):
+        text = raw.strip()
+        if text.startswith("[") and text.endswith("]"):
+            try:
+                parsed = json.loads(text)
+            except Exception:
+                parsed = None
+            if isinstance(parsed, list):
+                source = parsed
+
+    prices: list[float] = []
+    for item in source:
+        if isinstance(item, dict):
+            price = _safe_float(item.get("price"))
+            if price is None:
+                price = _safe_float(item.get("p"))
+            if price is None:
+                price = _safe_float(item.get("value"))
+        else:
+            price = _safe_float(item)
+        if price is None:
+            continue
+        prices.append(float(max(0.0, min(1.0, price))))
+    return prices
+
+
+def _extract_yes_no_from_history(
+    history: list[dict[str, float]],
+) -> tuple[Optional[float], Optional[float]]:
+    if not history:
+        return None, None
+    last = history[-1]
+    yes_price = _safe_float(last.get("yes"))
+    no_price = _safe_float(last.get("no"))
+    return yes_price, no_price
+
+
+def _normalize_history_points(raw_points: object) -> list[dict[str, float]]:
+    if not isinstance(raw_points, list):
+        return []
+
+    normalized: list[dict[str, float]] = []
+    for raw in raw_points:
+        if not isinstance(raw, dict):
+            continue
+
+        point: dict[str, float] = {}
+
+        outcome_prices = _extract_outcome_prices(
+            raw.get("outcome_prices") or raw.get("outcomePrices") or raw.get("prices") or raw.get("values")
+        )
+        for idx, price in enumerate(outcome_prices):
+            point[f"idx_{idx}"] = price
+
+        for key, value in raw.items():
+            if not isinstance(key, str):
+                continue
+            key_norm = key.strip().lower().replace("-", "_").replace(" ", "_")
+            if key_norm in {"t", "ts", "time", "timestamp", "date", "created_at", "updated_at"}:
+                continue
+            match = key_norm.startswith("idx_") or key_norm.startswith("outcome_")
+            if match:
+                parsed = _safe_float(value)
+                if parsed is None:
+                    continue
+                suffix = key_norm.split("_", 1)[1]
+                if suffix.isdigit():
+                    point[f"idx_{suffix}"] = float(max(0.0, min(1.0, parsed)))
+
+        yes_price = _safe_float(raw.get("yes"))
+        no_price = _safe_float(raw.get("no"))
+        if yes_price is None:
+            yes_price = point.get("idx_0")
+        if no_price is None:
+            no_price = point.get("idx_1")
+
+        if yes_price is None and no_price is not None and 0.0 <= no_price <= 1.0:
+            yes_price = 1.0 - no_price
+        if no_price is None and yes_price is not None and 0.0 <= yes_price <= 1.0:
+            no_price = 1.0 - yes_price
+        if yes_price is None or no_price is None:
+            continue
+
+        yes_price = float(max(0.0, min(1.0, yes_price)))
+        no_price = float(max(0.0, min(1.0, no_price)))
+        point["yes"] = yes_price
+        point["no"] = no_price
+        point.setdefault("idx_0", yes_price)
+        point.setdefault("idx_1", no_price)
+
+        ts = _safe_float(raw.get("t"))
+        if ts is not None:
+            point["t"] = ts
+
+        normalized.append(point)
+
+    return normalized
+
+
+def _extract_outcome_labels_from_market_context(market_context: dict[str, Any]) -> list[str]:
+    labels = _extract_outcome_labels(
+        market_context.get("outcome_labels") or market_context.get("outcomeLabels") or market_context.get("outcomes")
+    )
+    if labels:
+        return labels
+
+    tokens = market_context.get("tokens")
+    if isinstance(tokens, list):
+        labels = _extract_outcome_labels(tokens)
+    return labels
+
+
+def _extract_outcome_prices_from_market_context(market_context: dict[str, Any]) -> list[float]:
+    prices = _extract_outcome_prices(
+        market_context.get("outcome_prices") or market_context.get("outcomePrices") or market_context.get("prices")
+    )
+    if prices:
+        return prices
+
+    tokens = market_context.get("tokens")
+    if isinstance(tokens, list):
+        prices = _extract_outcome_prices(tokens)
+    return prices
+
+
+def _history_candidates_for_finding(
+    finding: NewsWorkflowFinding,
+    market_context: Optional[dict[str, Any]] = None,
+) -> list[str]:
+    context = market_context if isinstance(market_context, dict) else _extract_market_context_from_finding(finding)
+    candidates: list[str] = []
+
+    for raw_id in (
+        finding.market_id,
+        context.get("id"),
+        context.get("market_id"),
+        context.get("condition_id"),
+        context.get("conditionId"),
+    ):
+        normalized = normalize_market_id(raw_id)
+        if normalized:
+            candidates.append(normalized)
+
+    token_ids = context.get("token_ids") or context.get("tokenIds")
+    if isinstance(token_ids, list):
+        for token_id in token_ids:
+            normalized = normalize_market_id(token_id)
+            if normalized:
+                candidates.append(normalized)
+
+    # Keep order, drop duplicates.
+    return list(dict.fromkeys(candidates))
+
+
+async def _load_scanner_market_history(
+    session: AsyncSession,
+    *,
+    market_ids: set[str] | list[str] | tuple[str, ...],
+) -> dict[str, list[dict[str, float]]]:
+    history_map: dict[str, list[dict[str, float]]] = {}
+    if not market_ids:
+        return history_map
+    for raw_market_id, raw_points in (
+        await scanner_shared_state.read_scanner_market_history(session, market_ids=market_ids)
+    ).items():
+        market_id = normalize_market_id(raw_market_id)
+        if not market_id:
+            continue
+        points = _normalize_history_points(raw_points)
+        if len(points) >= 2:
+            history_map[market_id] = points[-20:]
+    return history_map
+
+
+def _extract_market_token_ids_from_context(
+    market_context: dict[str, Any],
+) -> list[str]:
+    token_ids: list[str] = []
+    raw_token_ids = market_context.get("token_ids") or market_context.get("tokenIds")
+    if isinstance(raw_token_ids, list):
+        for raw_token_id in raw_token_ids:
+            token_id = str(raw_token_id or "").strip()
+            if token_id:
+                token_ids.append(token_id)
+
+    if len(token_ids) < 2:
+        tokens = market_context.get("tokens")
+        if isinstance(tokens, list):
+            for token in tokens:
+                if not isinstance(token, dict):
+                    continue
+                token_id = str(token.get("token_id") or token.get("tokenId") or token.get("id") or "").strip()
+                if token_id:
+                    token_ids.append(token_id)
+
+    ordered = list(dict.fromkeys(token_ids))
+    return ordered[:2]
+
+
+async def _resolve_market_context_overrides(
+    findings: list[NewsWorkflowFinding],
+) -> dict[str, dict[str, Any]]:
+    if not findings:
+        return {}
+
+    try:
+        from services.polymarket import polymarket_client
+    except Exception:
+        return {}
+
+    pending_by_event_slug: dict[str, list[tuple[str, str, str]]] = {}
+    for finding in findings:
+        finding_id = str(getattr(finding, "id", "") or "").strip()
+        if not finding_id:
+            continue
+        market_context = _extract_market_context_from_finding(finding)
+        if len(_extract_market_token_ids_from_context(market_context)) >= 2:
+            continue
+        event_slug = _clean_market_text(market_context.get("event_slug") or market_context.get("eventSlug"))
+        if not event_slug:
+            continue
+        market_id = (
+            normalize_market_id(
+                market_context.get("id") or market_context.get("market_id") or getattr(finding, "market_id", None)
+            )
+            or ""
+        )
+        market_slug = _clean_market_text(market_context.get("slug") or market_context.get("market_slug"))
+        pending_by_event_slug.setdefault(event_slug, []).append((finding_id, market_id, market_slug))
+
+    if not pending_by_event_slug:
+        return {}
+
+    semaphore = asyncio.Semaphore(6)
+
+    async def _fetch_event(slug: str) -> tuple[str, Any]:
+        async with semaphore:
+            try:
+                event = await polymarket_client.get_event_by_slug(slug)
+            except Exception:
+                event = None
+            return slug, event
+
+    overrides: dict[str, dict[str, Any]] = {}
+    fetched = await asyncio.gather(
+        *[_fetch_event(slug) for slug in pending_by_event_slug.keys()],
+        return_exceptions=True,
+    )
+    for item in fetched:
+        if isinstance(item, Exception):
+            continue
+        event_slug, event = item
+        if event is None:
+            continue
+
+        by_market_id: dict[str, dict[str, Any]] = {}
+        by_condition_id: dict[str, dict[str, Any]] = {}
+        by_slug: dict[str, dict[str, Any]] = {}
+        for market in getattr(event, "markets", []) or []:
+            market_id = normalize_market_id(getattr(market, "id", None))
+            condition_id = normalize_market_id(getattr(market, "condition_id", None))
+            market_slug = _clean_market_text(getattr(market, "slug", ""))
+            token_ids = [
+                str(token_id).strip()
+                for token_id in list(getattr(market, "clob_token_ids", []) or [])
+                if str(token_id or "").strip()
+            ]
+            market_payload = {
+                "id": str(getattr(market, "id", "") or ""),
+                "condition_id": str(getattr(market, "condition_id", "") or ""),
+                "slug": market_slug or None,
+                "event_slug": event_slug,
+                "platform": "polymarket",
+                "question": str(getattr(market, "question", "") or "").strip() or None,
+                "token_ids": token_ids,
+                "clob_token_ids": token_ids,
+                "outcome_prices": list(getattr(market, "outcome_prices", []) or []),
+            }
+            if market_id:
+                by_market_id[market_id] = market_payload
+            if condition_id:
+                by_condition_id[condition_id] = market_payload
+            if market_slug:
+                by_slug[market_slug] = market_payload
+
+        for finding_id, market_id, market_slug in pending_by_event_slug.get(event_slug, []):
+            resolved = None
+            if market_id:
+                resolved = by_market_id.get(market_id) or by_condition_id.get(market_id)
+            if resolved is None and market_slug:
+                resolved = by_slug.get(market_slug)
+            if isinstance(resolved, dict):
+                overrides[finding_id] = resolved
+    return overrides
+
+
+def _resolve_finding_market_id_for_backfill(
+    finding: NewsWorkflowFinding,
+    market_context: dict[str, Any],
+) -> str:
+    for raw_id in (
+        market_context.get("condition_id"),
+        market_context.get("conditionId"),
+        finding.market_id,
+        market_context.get("id"),
+        market_context.get("market_id"),
+    ):
+        normalized = normalize_market_id(raw_id)
+        if normalized:
+            return normalized
+    return ""
+
+
+async def _load_shared_backfill_market_history(
+    findings: list[NewsWorkflowFinding],
+    *,
+    market_context_overrides: Optional[dict[str, dict[str, Any]]] = None,
+) -> dict[str, list[dict[str, float]]]:
+    if not findings:
+        return {}
+
+    try:
+        from models.opportunity import Opportunity
+        from services.scanner import scanner as market_scanner
+    except Exception:
+        return {}
+
+    opportunities: list[Opportunity] = []
+    for finding in findings:
+        market_context = _merged_market_context_for_finding(
+            finding,
+            market_context_overrides=market_context_overrides,
+        )
+        market_id = _resolve_finding_market_id_for_backfill(finding, market_context)
+        if not market_id:
+            continue
+
+        platform = (
+            infer_market_platform(
+                {
+                    "id": market_id,
+                    "condition_id": _clean_market_text(
+                        market_context.get("condition_id") or market_context.get("conditionId")
+                    ),
+                    "slug": _clean_market_text(market_context.get("slug") or market_context.get("market_slug")),
+                    "event_slug": _clean_market_text(
+                        market_context.get("event_slug") or market_context.get("eventSlug")
+                    ),
+                    "event_ticker": _clean_market_text(
+                        market_context.get("event_ticker") or market_context.get("eventTicker")
+                    ),
+                    "platform": _clean_market_text(market_context.get("platform")),
+                }
+            )
+            or "polymarket"
+        )
+
+        yes_price = _safe_float(finding.market_price)
+        no_price = float(round(1.0 - yes_price, 6)) if yes_price is not None and 0.0 <= yes_price <= 1.0 else None
+        token_ids = _extract_market_token_ids_from_context(market_context)
+
+        market_payload: dict[str, Any] = {
+            "id": market_id,
+            "platform": platform,
+        }
+        if yes_price is not None:
+            market_payload["yes_price"] = yes_price
+        if no_price is not None:
+            market_payload["no_price"] = no_price
+        if len(token_ids) >= 2:
+            market_payload["token_ids"] = token_ids
+            market_payload["clob_token_ids"] = token_ids
+
+        opportunities.append(
+            Opportunity(
+                strategy="news_edge",
+                title=str(finding.market_question or finding.article_title or market_id),
+                description="News workflow sparkline history hydration",
+                total_cost=0.0,
+                expected_payout=1.0,
+                gross_profit=0.0,
+                fee=0.0,
+                net_profit=0.0,
+                roi_percent=0.0,
+                risk_score=0.5,
+                confidence=max(0.0, min(1.0, _safe_float(finding.confidence) or 0.5)),
+                markets=[market_payload],
+                min_liquidity=0.0,
+                max_position_size=0.0,
+                positions_to_take=[],
+            )
+        )
+
+    if not opportunities:
+        return {}
+
+    try:
+        await market_scanner.attach_price_history_to_opportunities(
+            opportunities,
+            now=datetime.now(timezone.utc),
+            timeout_seconds=12.0,
+            block_for_backfill=True,
+        )
+    except Exception:
+        return {}
+
+    history_map: dict[str, list[dict[str, float]]] = {}
+    for opportunity in opportunities:
+        for market in opportunity.markets:
+            market_id = normalize_market_id(market.get("id"))
+            if not market_id:
+                continue
+            normalized = normalize_binary_price_history(market.get("price_history"))
+            if len(normalized) >= 2:
+                history_map[market_id] = normalized
+    return history_map
+
+
+def _build_finding_market_snapshot(
+    finding: NewsWorkflowFinding,
+    market_history: dict[str, list[dict[str, float]]],
+    *,
+    market_context: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    market_context = (
+        market_context if isinstance(market_context, dict) else _extract_market_context_from_finding(finding)
+    )
+    history: list[dict[str, float]] = []
+    for candidate in _history_candidates_for_finding(finding, market_context=market_context):
+        points = market_history.get(candidate)
+        if isinstance(points, list) and len(points) >= 2:
+            history = points
+            break
+    history = normalize_binary_price_history(history)
+
+    yes_from_history, no_from_history = _extract_yes_no_from_history(history)
+
+    outcome_labels = _extract_outcome_labels_from_market_context(market_context)
+    outcome_prices = _extract_outcome_prices_from_market_context(market_context)
+    if yes_from_history is not None:
+        if len(outcome_prices) < 1:
+            outcome_prices.append(yes_from_history)
+        else:
+            outcome_prices[0] = yes_from_history
+    if no_from_history is not None:
+        if len(outcome_prices) < 2:
+            while len(outcome_prices) < 1:
+                outcome_prices.append(0.0)
+            outcome_prices.append(no_from_history)
+        else:
+            outcome_prices[1] = no_from_history
+    if outcome_labels and len(outcome_prices) > len(outcome_labels):
+        for idx in range(len(outcome_labels), len(outcome_prices)):
+            outcome_labels.append(f"Outcome {idx + 1}")
+
+    fallback_yes = _safe_float(finding.market_price)
+    if fallback_yes is None and outcome_prices:
+        fallback_yes = outcome_prices[0]
+    fallback_no = outcome_prices[1] if len(outcome_prices) > 1 else None
+    fallback_no = (
+        fallback_no
+        if fallback_no is not None
+        else (float(1.0 - fallback_yes) if fallback_yes is not None and 0.0 <= fallback_yes <= 1.0 else None)
+    )
+
+    current_yes = yes_from_history if yes_from_history is not None else fallback_yes
+    current_no = no_from_history if no_from_history is not None else fallback_no
+    if current_yes is None and current_no is not None and 0.0 <= current_no <= 1.0:
+        current_yes = float(1.0 - current_no)
+    if current_no is None and current_yes is not None and 0.0 <= current_yes <= 1.0:
+        current_no = float(1.0 - current_yes)
+
+    market_token_ids = _extract_market_token_ids_from_context(market_context)
+
+    return {
+        "price_history": history,
+        "yes_price": current_yes,
+        "no_price": current_no,
+        "current_yes_price": current_yes,
+        "current_no_price": current_no,
+        "outcome_labels": outcome_labels,
+        "outcome_prices": outcome_prices,
+        "market_token_ids": market_token_ids,
+    }
+
+
+def _extract_binary_market_tokens_from_finding(
+    finding: dict[str, Any],
+) -> tuple[Optional[str], Optional[str]]:
+    token_ids = finding.get("market_token_ids")
+    if not isinstance(token_ids, list):
+        return None, None
+    cleaned = [str(token_id).strip().lower() for token_id in token_ids if str(token_id or "").strip()]
+    if len(cleaned) < 2:
+        return None, None
+    return cleaned[0], cleaned[1]
+
+
+def _normalize_finding_price_histories(findings: list[dict[str, Any]]) -> None:
+    for finding in findings:
+        normalized = normalize_binary_price_history(finding.get("price_history"))
+        if not normalized:
+            continue
+
+        finding["price_history"] = normalized
+        yes_last, no_last = _extract_yes_no_from_history(normalized)
+        if yes_last is not None and _safe_float(finding.get("yes_price")) is None:
+            finding["yes_price"] = yes_last
+        if yes_last is not None and _safe_float(finding.get("current_yes_price")) is None:
+            finding["current_yes_price"] = yes_last
+        if no_last is not None and _safe_float(finding.get("no_price")) is None:
+            finding["no_price"] = no_last
+        if no_last is not None and _safe_float(finding.get("current_no_price")) is None:
+            finding["current_no_price"] = no_last
+
+
+async def _attach_live_mid_prices_to_findings(
+    findings: list[dict[str, Any]],
+) -> None:
+    if not findings:
+        return
+    _normalize_finding_price_histories(findings)
+
+    token_pairs: list[tuple[dict[str, Any], str, str]] = []
+    unique_tokens: list[str] = []
+    seen_tokens: set[str] = set()
+
+    for finding in findings:
+        yes_token, no_token = _extract_binary_market_tokens_from_finding(finding)
+        if not yes_token or not no_token:
+            continue
+        token_pairs.append((finding, yes_token, no_token))
+        for token_id in (yes_token, no_token):
+            if token_id in seen_tokens:
+                continue
+            seen_tokens.add(token_id)
+            unique_tokens.append(token_id)
+
+    if not token_pairs:
+        return
+
+    live_prices = await get_live_mid_prices(unique_tokens)
+    if not live_prices:
+        return
+
+    for finding, yes_token, no_token in token_pairs:
+        yes_price = live_prices.get(yes_token)
+        no_price = live_prices.get(no_token)
+        if yes_price is None and no_price is not None and 0.0 <= no_price <= 1.0:
+            yes_price = float(1.0 - no_price)
+        if no_price is None and yes_price is not None and 0.0 <= yes_price <= 1.0:
+            no_price = float(1.0 - yes_price)
+        if yes_price is None or no_price is None:
+            continue
+
+        finding["yes_price"] = yes_price
+        finding["no_price"] = no_price
+        finding["current_yes_price"] = yes_price
+        finding["current_no_price"] = no_price
+        finding["outcome_prices"] = [yes_price, no_price]
+        finding["price_history"] = append_live_binary_price_point(
+            finding.get("price_history"),
+            yes_price=yes_price,
+            no_price=no_price,
+        )
+
+
+class WorkflowSettingsRequest(BaseModel):
+    """Update workflow settings."""
+
+    enabled: Optional[bool] = None
+    auto_run: Optional[bool] = None
+    scan_interval_seconds: Optional[int] = Field(None, ge=30, le=3600)
+    top_k: Optional[int] = Field(None, ge=1, le=50)
+    rerank_top_n: Optional[int] = Field(None, ge=1, le=20)
+    similarity_threshold: Optional[float] = Field(None, ge=0.0, le=1.0)
+    keyword_weight: Optional[float] = Field(None, ge=0.0, le=1.0)
+    semantic_weight: Optional[float] = Field(None, ge=0.0, le=1.0)
+    event_weight: Optional[float] = Field(None, ge=0.0, le=1.0)
+    require_verifier: Optional[bool] = None
+    market_min_liquidity: Optional[float] = Field(None, ge=0.0, le=1_000_000.0)
+    market_max_days_to_resolution: Optional[int] = Field(None, ge=1, le=3650)
+    min_keyword_signal: Optional[float] = Field(None, ge=0.0, le=1.0)
+    min_semantic_signal: Optional[float] = Field(None, ge=0.0, le=1.0)
+    min_edge_percent: Optional[float] = Field(None, ge=0.0, le=100.0)
+    min_confidence: Optional[float] = Field(None, ge=0.0, le=1.0)
+    require_second_source: Optional[bool] = None
+    orchestrator_enabled: Optional[bool] = None
+    orchestrator_min_edge: Optional[float] = Field(None, ge=0.0, le=100.0)
+    orchestrator_max_age_minutes: Optional[int] = Field(None, ge=1, le=1440)
+    cycle_spend_cap_usd: Optional[float] = Field(None, ge=0.0, le=100.0)
+    hourly_spend_cap_usd: Optional[float] = Field(None, ge=0.0, le=1000.0)
+    cycle_llm_call_cap: Optional[int] = Field(None, ge=0, le=500)
+    cache_ttl_minutes: Optional[int] = Field(None, ge=1, le=1440)
+    max_edge_evals_per_article: Optional[int] = Field(None, ge=1, le=20)
+    model: Optional[str] = None
+
+
+async def _build_status_payload(session: AsyncSession) -> dict:
+    status = await shared_state.read_news_snapshot(session)
+    control = await shared_state.read_news_control(session)
+    pending = await shared_state.count_pending_news_intents(session)
+    stats = status.get("stats") or {}
+    stats.setdefault("budget_skip_count", int(stats.get("llm_calls_skipped", 0) or 0))
+    stats.setdefault("findings", int(stats.get("findings", 0) or 0))
+    stats.setdefault("intents", int(stats.get("intents", 0) or 0))
+    stats["pending_intents"] = pending
+
+    return {
+        "running": bool(status.get("running", False)),
+        "enabled": bool(control.get("is_enabled", True)) and bool(status.get("enabled", True)),
+        "paused": bool(control.get("is_paused", False)),
+        "interval_seconds": int(control.get("scan_interval_seconds") or status.get("interval_seconds") or 120),
+        "last_scan": status.get("last_scan"),
+        "next_scan": status.get("next_scan"),
+        "current_activity": status.get("current_activity"),
+        "last_error": status.get("last_error"),
+        "degraded_mode": bool(status.get("degraded_mode", False)),
+        "budget_remaining": status.get("budget_remaining"),
+        "pending_intents": pending,
+        "requested_scan_at": (to_iso(control.get("requested_scan_at")) if control.get("requested_scan_at") else None),
+        "stats": stats,
+    }
+
+
+@router.get("/news-workflow/status")
+async def get_workflow_status(session: AsyncSession = Depends(get_db_session)):
+    return await _build_status_payload(session)
+
+
+@router.post("/news-workflow/run")
+async def run_workflow_cycle(session: AsyncSession = Depends(get_db_session)):
+    """Queue a one-time workflow cycle (non-blocking)."""
+    if global_pause_state.is_paused:
+        raise HTTPException(
+            status_code=409,
+            detail="Global pause is active. Resume all workers before queueing runs.",
+        )
+    await shared_state.request_one_news_scan(session)
+    return {
+        "status": "queued",
+        "message": "News workflow cycle requested; worker will run it shortly.",
+        **await _build_status_payload(session),
+    }
+
+
+@router.post("/news-workflow/start")
+async def start_workflow(session: AsyncSession = Depends(get_db_session)):
+    if global_pause_state.is_paused:
+        raise HTTPException(
+            status_code=409,
+            detail="Global pause is active. Use /workers/resume-all first.",
+        )
+    await shared_state.set_news_paused(session, False)
+    return {"status": "started", **await _build_status_payload(session)}
+
+
+@router.post("/news-workflow/pause")
+async def pause_workflow(session: AsyncSession = Depends(get_db_session)):
+    await shared_state.set_news_paused(session, True)
+    return {"status": "paused", **await _build_status_payload(session)}
+
+
+@router.post("/news-workflow/interval")
+async def set_workflow_interval(
+    interval_seconds: int = Query(..., ge=30, le=3600),
+    session: AsyncSession = Depends(get_db_session),
+):
+    await shared_state.set_news_interval(session, interval_seconds)
+    await shared_state.update_news_settings(session, {"scan_interval_seconds": interval_seconds})
+    return {"status": "updated", **await _build_status_payload(session)}
+
+
+@router.get("/news-workflow/findings")
+async def get_findings(
+    min_edge: float = Query(0.0, ge=0, description="Minimum edge %"),
+    actionable_only: bool = Query(True, description="Only actionable findings"),
+    include_debug_rejections: bool = Query(False, description="Include non-actionable debug rejection rows"),
+    max_age_hours: int = Query(24, ge=1, le=336, description="Max age in hours"),
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    session: AsyncSession = Depends(get_db_session),
+):
+    """Get persisted workflow findings."""
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=max_age_hours)
+
+    query = select(NewsWorkflowFinding).where(NewsWorkflowFinding.created_at >= cutoff)
+
+    if min_edge > 0:
+        query = query.where(NewsWorkflowFinding.edge_percent >= min_edge)
+
+    actionable_filter = NewsWorkflowFinding.actionable.is_(True)
+    informative_filter = (NewsWorkflowFinding.edge_percent > 0.0) | (NewsWorkflowFinding.confidence > 0.0)
+
+    if actionable_only:
+        query = query.where(actionable_filter)
+    elif not include_debug_rejections:
+        query = query.where(actionable_filter | informative_filter)
+
+    query = query.order_by(desc(NewsWorkflowFinding.created_at))
+
+    count_q = select(func.count()).select_from(query.subquery())
+    total = (await session.execute(count_q)).scalar() or 0
+
+    query = query.offset(offset).limit(limit)
+    result = await session.execute(query)
+    rows = result.scalars().all()
+    article_ids_needed = _collect_cluster_article_ids(rows)
+    article_cache_by_id: dict[str, NewsArticleCache] = {}
+    if article_ids_needed:
+        article_result = await session.execute(
+            select(NewsArticleCache).where(NewsArticleCache.article_id.in_(list(article_ids_needed)))
+        )
+        cached_rows = article_result.scalars().all()
+        article_cache_by_id = {row.article_id: row for row in cached_rows if row.article_id}
+    market_context_overrides = await _resolve_market_context_overrides(rows)
+    finding_market_ids = {
+        normalize_market_id(getattr(row, "market_id", None))
+        for row in rows
+        if normalize_market_id(getattr(row, "market_id", None))
+    }
+    market_history = await _load_scanner_market_history(session, market_ids=finding_market_ids)
+    shared_history = await _load_shared_backfill_market_history(
+        rows,
+        market_context_overrides=market_context_overrides,
+    )
+    if shared_history:
+        market_history.update(shared_history)
+
+    findings = []
+    for r in rows:
+        market_context = _merged_market_context_for_finding(
+            r,
+            market_context_overrides=market_context_overrides,
+        )
+        supporting_articles = _build_supporting_articles_from_finding(r, article_cache_by_id=article_cache_by_id)
+        market_snapshot = _build_finding_market_snapshot(
+            r,
+            market_history,
+            market_context=market_context,
+        )
+        market_links = _build_market_link_payload(
+            market_id=r.market_id,
+            market_question=r.market_question,
+            market_context=market_context,
+        )
+        findings.append(
+            {
+                "id": r.id,
+                "article_id": r.article_id,
+                "market_id": r.market_id,
+                "article_title": r.article_title,
+                "article_source": r.article_source,
+                "article_url": r.article_url,
+                "signal_key": r.signal_key,
+                "cache_key": r.cache_key,
+                "market_question": r.market_question,
+                "market_price": r.market_price,
+                "model_probability": r.model_probability,
+                "edge_percent": r.edge_percent,
+                "direction": r.direction,
+                "confidence": r.confidence,
+                "retrieval_score": r.retrieval_score,
+                "semantic_score": r.semantic_score,
+                "keyword_score": r.keyword_score,
+                "event_score": r.event_score,
+                "rerank_score": r.rerank_score,
+                "event_graph": r.event_graph,
+                "evidence": r.evidence,
+                "reasoning": r.reasoning,
+                "actionable": r.actionable,
+                "consumed_by_orchestrator": r.consumed_by_orchestrator,
+                "supporting_articles": supporting_articles,
+                "supporting_article_count": int(len(supporting_articles)),
+                **market_snapshot,
+                **market_links,
+                "created_at": to_iso(r.created_at),
+            }
+        )
+
+    await _attach_live_mid_prices_to_findings(findings)
+
+    return {
+        "total": total,
+        "offset": offset,
+        "limit": limit,
+        "findings": findings,
+    }
+
+
+@router.get("/news-workflow/intents")
+async def get_intents(
+    status_filter: Optional[str] = Query(
+        None, description="Filter by status: pending, submitted, executed, skipped, expired"
+    ),
+    limit: int = Query(50, ge=1, le=500),
+    session: AsyncSession = Depends(get_db_session),
+):
+    """Get trade intents."""
+    rows = await shared_state.list_news_intents(session, status_filter=status_filter, limit=limit)
+
+    finding_ids = [r.finding_id for r in rows if r.finding_id]
+    finding_by_id: dict[str, NewsWorkflowFinding] = {}
+    article_cache_by_id: dict[str, NewsArticleCache] = {}
+    if finding_ids:
+        finding_result = await session.execute(
+            select(NewsWorkflowFinding).where(NewsWorkflowFinding.id.in_(finding_ids))
+        )
+        findings = finding_result.scalars().all()
+        finding_by_id = {f.id: f for f in findings if f.id}
+
+        article_ids_needed = _collect_cluster_article_ids(findings)
+        if article_ids_needed:
+            article_result = await session.execute(
+                select(NewsArticleCache).where(NewsArticleCache.article_id.in_(list(article_ids_needed)))
+            )
+            cached_rows = article_result.scalars().all()
+            article_cache_by_id = {row.article_id: row for row in cached_rows if row.article_id}
+
+    intents = []
+    for r in rows:
+        metadata = r.metadata_json if isinstance(r.metadata_json, dict) else {}
+        market_meta = metadata.get("market") if isinstance(metadata.get("market"), dict) else {}
+        finding_for_intent = finding_by_id.get(r.finding_id)
+        if not market_meta and finding_for_intent is not None:
+            market_meta = _extract_market_context_from_finding(finding_for_intent)
+        market_links = _build_market_link_payload(
+            market_id=r.market_id,
+            market_question=r.market_question,
+            market_context=market_meta,
+        )
+        enriched_market_meta = {
+            **market_meta,
+            "platform": market_links.get("market_platform"),
+            "market_url": market_links.get("market_url"),
+            "url": market_links.get("market_url"),
+        }
+        enriched_metadata = {
+            **metadata,
+            "market": enriched_market_meta,
+        }
+        supporting_articles = metadata.get("supporting_articles") or _build_supporting_articles_from_finding(
+            finding_for_intent,
+            article_cache_by_id=article_cache_by_id,
+        )
+        intents.append(
+            {
+                "id": r.id,
+                "signal_key": r.signal_key,
+                "finding_id": r.finding_id,
+                "market_id": r.market_id,
+                "market_question": r.market_question,
+                "direction": r.direction,
+                "entry_price": r.entry_price,
+                "model_probability": r.model_probability,
+                "edge_percent": r.edge_percent,
+                "confidence": r.confidence,
+                "suggested_size_usd": r.suggested_size_usd,
+                "metadata": {
+                    **enriched_metadata,
+                    "supporting_articles": supporting_articles,
+                    "supporting_article_count": int(len(supporting_articles)),
+                },
+                **market_links,
+                "status": r.status,
+                "created_at": to_iso(r.created_at),
+                "consumed_at": to_iso(r.consumed_at),
+            }
+        )
+
+    return {"total": len(intents), "intents": intents}
+
+
+@router.post("/news-workflow/intents/{intent_id}/skip")
+async def skip_intent(intent_id: str, session: AsyncSession = Depends(get_db_session)):
+    """Manually skip a pending intent."""
+    intent_result = await session.execute(select(NewsTradeIntent).where(NewsTradeIntent.id == intent_id))
+    intent = intent_result.scalar_one_or_none()
+    if intent is None:
+        raise HTTPException(status_code=404, detail="Intent not found")
+    if intent.status != "pending":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot skip intent with status '{intent.status}'",
+        )
+
+    ok = await shared_state.mark_news_intent(session, intent_id, "skipped")
+    if not ok:
+        raise HTTPException(status_code=404, detail="Intent not found")
+    return {"status": "skipped", "intent_id": intent_id}
+
+
+@router.get("/news-workflow/settings")
+async def get_workflow_settings(session: AsyncSession = Depends(get_db_session)):
+    """Get current workflow settings."""
+    try:
+        return await shared_state.get_news_settings(session)
+    except Exception as e:
+        logger.error("Failed to get workflow settings: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.put("/news-workflow/settings")
+async def update_workflow_settings(
+    request: WorkflowSettingsRequest,
+    session: AsyncSession = Depends(get_db_session),
+):
+    """Update workflow settings."""
+    try:
+        updates = request.model_dump(exclude_unset=True)
+        settings_payload = await shared_state.update_news_settings(session, updates)
+
+        if "scan_interval_seconds" in updates:
+            await shared_state.set_news_interval(session, int(updates["scan_interval_seconds"]))
+
+        return {"status": "success", "settings": settings_payload}
+    except Exception as e:
+        logger.error("Failed to update workflow settings: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))

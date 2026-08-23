@@ -1,0 +1,701 @@
+/* JetBrains Mono for data/monospace */
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Inter:wght@400;500;600;700&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 230 15% 4%;
+    --foreground: 210 40% 98%;
+    --card: 230 12% 7%;
+    --card-foreground: 210 40% 98%;
+    --popover: 230 12% 7%;
+    --popover-foreground: 210 40% 98%;
+    --primary: 155 100% 50%;
+    --primary-foreground: 230 15% 6%;
+    --secondary: 230 10% 10%;
+    --secondary-foreground: 210 40% 98%;
+    --muted: 230 10% 10%;
+    --muted-foreground: 215 20% 55%;
+    --accent: 230 10% 12%;
+    --accent-foreground: 210 40% 98%;
+    --destructive: 0 84% 60%;
+    --destructive-foreground: 0 0% 100%;
+    --border: 220 13% 13%;
+    --input: 220 13% 13%;
+    --ring: 155 100% 50%;
+    --radius: 0.5rem;
+
+    /* App-specific tokens — enhanced */
+    --bg-primary: #06070a;
+    --bg-secondary: #0c0d12;
+    --bg-tertiary: #12131a;
+    --bg-hover: #1a1b24;
+    --text-primary: #e2e8f0;
+    --text-secondary: #8892a4;
+    --text-muted: #505872;
+    --accent-green: #00ff88;
+    --accent-red: #ff4757;
+    --accent-blue: #3b82f6;
+    --accent-yellow: #fbbf24;
+    --accent-purple: #a855f7;
+    --accent-cyan: #22d3ee;
+
+    /* Sidebar */
+    --sidebar-width: 88px;
+    --sidebar-width-expanded: 200px;
+
+    /* Glow intensities */
+    --glow-green: rgba(0, 255, 136, 0.15);
+    --glow-red: rgba(255, 71, 87, 0.15);
+    --glow-blue: rgba(59, 130, 246, 0.15);
+    --glow-purple: rgba(168, 85, 247, 0.15);
+  }
+
+  .theme-light {
+    --background: 0 0% 98%;
+    --foreground: 0 0% 7%;
+    --card: 0 0% 100%;
+    --card-foreground: 0 0% 7%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 0 0% 7%;
+    --primary: 155 80% 40%;
+    --primary-foreground: 0 0% 100%;
+    --secondary: 0 0% 94%;
+    --secondary-foreground: 0 0% 7%;
+    --muted: 0 0% 94%;
+    --muted-foreground: 0 0% 45%;
+    --accent: 0 0% 94%;
+    --accent-foreground: 0 0% 7%;
+    --destructive: 0 84% 50%;
+    --destructive-foreground: 0 0% 100%;
+    --border: 0 0% 90%;
+    --input: 0 0% 90%;
+    --ring: 155 80% 40%;
+
+    --bg-primary: #f8f9fa;
+    --bg-secondary: #ffffff;
+    --bg-tertiary: #f0f1f3;
+    --bg-hover: #e5e7eb;
+    --text-primary: #111827;
+    --text-secondary: #4b5563;
+    --text-muted: #9ca3af;
+    --accent-green: #16a34a;
+    --accent-red: #dc2626;
+    --accent-blue: #2563eb;
+    --accent-yellow: #ca8a04;
+    --accent-purple: #9333ea;
+    --accent-cyan: #0891b2;
+
+    --glow-green: rgba(22, 163, 74, 0.08);
+    --glow-red: rgba(220, 38, 38, 0.08);
+    --glow-blue: rgba(37, 99, 235, 0.08);
+    --glow-purple: rgba(147, 51, 234, 0.08);
+  }
+}
+
+/* -----------------------------------------------------------------------
+ * OpenUI theme sync
+ * The @openuidev/react-ui defaults.css uses @media(prefers-color-scheme)
+ * which follows the OS, not the app's .theme-light/.theme-dark class.
+ * Override OpenUI CSS custom properties so they track the app toggle.
+ * ----------------------------------------------------------------------- */
+
+/* Force light OpenUI vars when app is in light mode */
+.theme-light {
+  --openui-background: oklch(0.97 0 89.876 / 1);
+  --openui-foreground: oklch(0.994 0 89.876 / 1);
+  --openui-popover-background: oklch(0.994 0 89.876 / 1);
+  --openui-sunk-light: oklch(0.097 0 0 / 0.02);
+  --openui-sunk: oklch(0.097 0 0 / 0.04);
+  --openui-sunk-deep: oklch(0.097 0 0 / 0.08);
+  --openui-elevated-light: oklch(0.097 0 0 / 0.04);
+  --openui-elevated: oklch(0.097 0 0 / 0.08);
+  --openui-elevated-strong: oklch(0.097 0 0 / 0.16);
+  --openui-elevated-intense: oklch(0.097 0 0 / 0.32);
+  --openui-text-neutral-primary: oklch(0.097 0 0 / 1);
+  --openui-text-neutral-secondary: oklch(0.097 0 0 / 0.5);
+  --openui-text-neutral-tertiary: oklch(0.097 0 0 / 0.2);
+  --openui-text-neutral-link: oklch(0.097 0 0 / 1);
+  --openui-text-brand: oklch(0.097 0 0 / 1);
+  --openui-border-default: oklch(0.097 0 0 / 0.06);
+  --openui-border-interactive: oklch(0.097 0 0 / 0.12);
+  --openui-border-interactive-emphasis: oklch(0.097 0 0 / 0.3);
+  --openui-border-interactive-selected: oklch(0.097 0 0 / 1);
+  --openui-interactive-accent-default: oklch(0.097 0 0 / 1);
+  --openui-interactive-accent-hover: oklch(0.097 0 0 / 0.8);
+  --openui-interactive-accent-disabled: oklch(0.097 0 0 / 0.4);
+  --openui-shadow-s: 0 1px 3px -2px oklch(0 0 0 / 0.02), 0 2px 5px -2px oklch(0 0 0 / 0.04);
+  --openui-shadow-m: 0 4px 6px -2px oklch(0 0 0 / 0.025), 0 2px 2px -2px oklch(0 0 0 / 0.05);
+}
+
+/* Force dark OpenUI vars when app is in dark mode */
+.theme-dark {
+  --openui-background: oklch(0.145 0 0 / 1);
+  --openui-foreground: oklch(0.205 0 0 / 1);
+  --openui-popover-background: oklch(0.205 0 0 / 1);
+  --openui-sunk-light: oklch(0.994 0 89.876 / 0.02);
+  --openui-sunk: oklch(0.994 0 89.876 / 0.04);
+  --openui-sunk-deep: oklch(0.994 0 89.876 / 0.08);
+  --openui-elevated-light: oklch(0.994 0 89.876 / 0.04);
+  --openui-elevated: oklch(0.994 0 89.876 / 0.08);
+  --openui-elevated-strong: oklch(0.994 0 89.876 / 0.16);
+  --openui-elevated-intense: oklch(0.994 0 89.876 / 0.32);
+  --openui-text-neutral-primary: oklch(0.985 0 89.876 / 1);
+  --openui-text-neutral-secondary: oklch(0.985 0 89.876 / 0.5);
+  --openui-text-neutral-tertiary: oklch(0.985 0 89.876 / 0.2);
+  --openui-text-neutral-link: oklch(0.985 0 89.876 / 1);
+  --openui-text-brand: oklch(0.994 0 89.876 / 1);
+  --openui-border-default: oklch(0.994 0 89.876 / 0.12);
+  --openui-border-interactive: oklch(0.994 0 89.876 / 0.2);
+  --openui-border-interactive-emphasis: oklch(0.994 0 89.876 / 0.4);
+  --openui-border-interactive-selected: oklch(0.985 0 89.876 / 1);
+  --openui-interactive-accent-default: oklch(0.994 0 89.876 / 1);
+  --openui-interactive-accent-hover: oklch(0.994 0 89.876 / 0.8);
+  --openui-interactive-accent-disabled: oklch(0.994 0 89.876 / 0.4);
+  --openui-shadow-s: 0 1px 3px -2px oklch(0 0 0 / 0.06), 0 2px 5px -2px oklch(0 0 0 / 0.10);
+  --openui-shadow-m: 0 4px 6px -2px oklch(0 0 0 / 0.08), 0 2px 2px -2px oklch(0 0 0 / 0.12);
+}
+
+/* -----------------------------------------------------------------------
+ * OpenUI chart fixes
+ * The default .openui-chart-container has aspect-ratio: 1/1 which is
+ * intended for pie/radial charts but breaks 2D charts (Bar, Area, Line)
+ * inside flex layouts. Override for 2D chart wrappers.
+ * ----------------------------------------------------------------------- */
+.openui-bar-chart-container,
+.openui-area-chart-container,
+.openui-line-chart-container,
+.openui-bar-chart-condensed-container,
+.openui-area-chart-condensed-container,
+.openui-line-chart-condensed-container,
+.openui-horizontal-bar-chart-container,
+.openui-scatter-chart-container,
+.openui-radar-chart-container-wrapper {
+  width: 100%;
+}
+
+.openui-bar-chart-container .openui-chart-container,
+.openui-area-chart-container .openui-chart-container,
+.openui-line-chart-container .openui-chart-container,
+.openui-bar-chart-condensed-container .openui-chart-container,
+.openui-area-chart-condensed-container .openui-chart-container,
+.openui-line-chart-condensed-container .openui-chart-container,
+.openui-horizontal-bar-chart-container .openui-chart-container,
+.openui-scatter-chart-container .openui-chart-container {
+  aspect-ratio: auto;
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  body {
+    @apply bg-background text-foreground;
+    margin: 0;
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+    transition: background-color 0.2s ease, color 0.2s ease;
+    overflow: hidden;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+}
+
+/* Data font class for monospace numbers */
+.font-data {
+  font-family: 'JetBrains Mono', 'Fira Code', 'SF Mono', monospace;
+  font-feature-settings: 'tnum' 1, 'zero' 1;
+}
+
+/* Custom scrollbar */
+::-webkit-scrollbar {
+  width: 5px;
+  height: 5px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: hsl(var(--border));
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: hsl(var(--muted-foreground) / 0.3);
+}
+
+/* ============================================
+   FLASH & PULSE ANIMATIONS
+   ============================================ */
+
+@keyframes flash-update {
+  0% { background-color: rgba(0, 255, 136, 0.08); }
+  100% { background-color: transparent; }
+}
+
+.flash-update {
+  animation: flash-update 0.6s ease-out;
+}
+
+@keyframes flash-update-red {
+  0% { background-color: rgba(255, 71, 87, 0.08); }
+  100% { background-color: transparent; }
+}
+
+.flash-update-red {
+  animation: flash-update-red 0.6s ease-out;
+}
+
+/* Pulse glow for active status indicators */
+@keyframes pulse-glow {
+  0%, 100% { box-shadow: 0 0 4px 0 currentColor; }
+  50% { box-shadow: 0 0 14px 3px currentColor; }
+}
+
+.pulse-glow {
+  animation: pulse-glow 2s ease-in-out infinite;
+}
+
+/* Live dot pulse */
+@keyframes live-dot-pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.5; transform: scale(1.8); }
+}
+
+.live-dot {
+  animation: live-dot-pulse 2s ease-in-out infinite;
+}
+
+/* Sidebar nav item active glow */
+@keyframes nav-glow {
+  0%, 100% { opacity: 0.4; }
+  50% { opacity: 0.7; }
+}
+
+/* ============================================
+   SECTION TRANSITIONS
+   ============================================ */
+
+.section-enter {
+  animation: section-fade-in 0.3s ease-out;
+}
+
+@keyframes section-fade-in {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+/* Staggered card entrance */
+@keyframes card-enter {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.card-stagger > * {
+  animation: card-enter 0.3s ease-out both;
+}
+
+.card-stagger > *:nth-child(1) { animation-delay: 0ms; }
+.card-stagger > *:nth-child(2) { animation-delay: 40ms; }
+.card-stagger > *:nth-child(3) { animation-delay: 80ms; }
+.card-stagger > *:nth-child(4) { animation-delay: 120ms; }
+.card-stagger > *:nth-child(5) { animation-delay: 160ms; }
+.card-stagger > *:nth-child(6) { animation-delay: 200ms; }
+.card-stagger > *:nth-child(7) { animation-delay: 240ms; }
+.card-stagger > *:nth-child(8) { animation-delay: 280ms; }
+.card-stagger > *:nth-child(9) { animation-delay: 320ms; }
+.card-stagger > *:nth-child(10) { animation-delay: 360ms; }
+.card-stagger > *:nth-child(n+11) { animation-delay: 400ms; }
+
+/* ============================================
+   GRADIENT & BORDER EFFECTS
+   ============================================ */
+
+.gradient-border {
+  position: relative;
+}
+
+.gradient-border::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  padding: 1px;
+  background: linear-gradient(135deg,
+    rgba(0, 255, 136, 0.25),
+    rgba(59, 130, 246, 0.25),
+    rgba(168, 85, 247, 0.25)
+  );
+  -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+  -webkit-mask-composite: xor;
+  mask-composite: exclude;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.3s ease;
+}
+
+.gradient-border:hover::before {
+  opacity: 1;
+}
+
+/* Always-visible gradient border (for active cards) */
+.gradient-border-active::before {
+  opacity: 1;
+}
+
+/* ============================================
+   GLASSMORPHISM
+   ============================================ */
+
+.glass-panel {
+  background: hsl(var(--card) / 0.5);
+  backdrop-filter: blur(16px) saturate(180%);
+  -webkit-backdrop-filter: blur(16px) saturate(180%);
+  border: 1px solid hsl(var(--border) / 0.5);
+}
+
+/* Card with subtle glow on hover */
+.card-glow {
+  transition: box-shadow 0.3s ease, border-color 0.3s ease, transform 0.2s ease;
+}
+
+.card-glow:hover {
+  box-shadow: 0 0 20px -5px var(--glow-blue),
+              0 4px 20px -8px rgba(0, 0, 0, 0.4);
+  border-color: hsl(var(--border) / 0.8);
+  transform: translateY(-1px);
+}
+
+/* Green glow variant for positive values */
+.card-glow-green:hover {
+  box-shadow: 0 0 20px -5px var(--glow-green),
+              0 4px 20px -8px rgba(0, 0, 0, 0.4);
+}
+
+/* Red glow variant */
+.card-glow-red:hover {
+  box-shadow: 0 0 20px -5px var(--glow-red),
+              0 4px 20px -8px rgba(0, 0, 0, 0.4);
+}
+
+/* Data update glow pulse on card border */
+@keyframes border-glow-pulse {
+  0% { box-shadow: 0 0 0 0 var(--glow-green); }
+  50% { box-shadow: 0 0 16px 0 var(--glow-green); }
+  100% { box-shadow: 0 0 0 0 var(--glow-green); }
+}
+
+.border-glow-pulse {
+  animation: border-glow-pulse 0.8s ease-out;
+}
+
+
+/* ============================================
+   METRIC VALUE EFFECTS
+   ============================================ */
+
+.metric-positive {
+  color: var(--accent-green);
+  text-shadow: 0 0 24px rgba(0, 255, 136, 0.25);
+}
+
+.metric-negative {
+  color: var(--accent-red);
+  text-shadow: 0 0 24px rgba(255, 71, 87, 0.25);
+}
+
+/* Subtle glow text for key data points */
+.data-glow-green {
+  text-shadow: 0 0 12px rgba(0, 255, 136, 0.2);
+}
+
+.data-glow-red {
+  text-shadow: 0 0 12px rgba(255, 71, 87, 0.2);
+}
+
+.data-glow-blue {
+  text-shadow: 0 0 12px rgba(59, 130, 246, 0.2);
+}
+
+/* ============================================
+   FINANCIAL TICK FLASH — Bloomberg-style
+   Green pulse on uptick, red pulse on downtick.
+   Background washes in then fades out smoothly.
+   ============================================ */
+.tick-flash {
+  border-radius: 2px;
+  padding: 0px 2px;
+  transition: color 0.8s ease-out;
+}
+
+/* Uptick: green background pulse */
+.tick-up {
+  animation: tick-pulse-up 1.2s ease-out forwards;
+  color: #16a34a; /* green-600 */
+}
+:is(.dark) .tick-up {
+  animation: tick-pulse-up-dark 1.2s ease-out forwards;
+  color: #4ade80; /* green-400 */
+}
+
+/* Downtick: red background pulse */
+.tick-down {
+  animation: tick-pulse-down 1.2s ease-out forwards;
+  color: #dc2626; /* red-600 */
+}
+:is(.dark) .tick-down {
+  animation: tick-pulse-down-dark 1.2s ease-out forwards;
+  color: #f87171; /* red-400 */
+}
+
+@keyframes tick-pulse-up {
+  0%   { background-color: rgba(22, 163, 74, 0.25); box-shadow: 0 0 6px rgba(22, 163, 74, 0.2); }
+  30%  { background-color: rgba(22, 163, 74, 0.12); box-shadow: 0 0 3px rgba(22, 163, 74, 0.1); }
+  100% { background-color: transparent; box-shadow: none; color: inherit; }
+}
+
+@keyframes tick-pulse-up-dark {
+  0%   { background-color: rgba(74, 222, 128, 0.18); box-shadow: 0 0 8px rgba(74, 222, 128, 0.15); }
+  30%  { background-color: rgba(74, 222, 128, 0.08); box-shadow: 0 0 4px rgba(74, 222, 128, 0.08); }
+  100% { background-color: transparent; box-shadow: none; color: inherit; }
+}
+
+@keyframes tick-pulse-down {
+  0%   { background-color: rgba(220, 38, 38, 0.25); box-shadow: 0 0 6px rgba(220, 38, 38, 0.2); }
+  30%  { background-color: rgba(220, 38, 38, 0.12); box-shadow: 0 0 3px rgba(220, 38, 38, 0.1); }
+  100% { background-color: transparent; box-shadow: none; color: inherit; }
+}
+
+@keyframes tick-pulse-down-dark {
+  0%   { background-color: rgba(248, 113, 113, 0.18); box-shadow: 0 0 8px rgba(248, 113, 113, 0.15); }
+  30%  { background-color: rgba(248, 113, 113, 0.08); box-shadow: 0 0 4px rgba(248, 113, 113, 0.08); }
+  100% { background-color: transparent; box-shadow: none; color: inherit; }
+}
+
+/* ============================================
+   TICKER TAPE
+   ============================================ */
+
+@keyframes ticker-scroll {
+  0% { transform: translateX(0); }
+  100% { transform: translateX(-50%); }
+}
+
+.ticker-animate {
+  animation: ticker-scroll var(--ticker-duration, 30s) linear infinite;
+}
+
+.ticker-animate:hover {
+  animation-play-state: paused;
+}
+
+/* ============================================
+   SCANLINE OVERLAY (optional, subtle)
+   ============================================ */
+
+.scanlines::after {
+  content: '';
+  position: fixed;
+  inset: 0;
+  background: repeating-linear-gradient(
+    0deg,
+    transparent,
+    transparent 2px,
+    rgba(0, 0, 0, 0.015) 2px,
+    rgba(0, 0, 0, 0.015) 4px
+  );
+  pointer-events: none;
+  z-index: 9999;
+}
+
+/* ============================================
+   ACCORDION ANIMATIONS
+   ============================================ */
+
+@keyframes accordion-down {
+  from { height: 0; opacity: 0; }
+  to { height: var(--radix-accordion-content-height); opacity: 1; }
+}
+
+@keyframes accordion-up {
+  from { height: var(--radix-accordion-content-height); opacity: 1; }
+  to { height: 0; opacity: 0; }
+}
+
+/* ============================================
+   SETTINGS CARD HOVER
+   ============================================ */
+
+.settings-card {
+  transition: border-color 0.2s ease, background-color 0.2s ease, box-shadow 0.2s ease;
+}
+
+.settings-card:hover {
+  border-color: hsl(var(--border) / 0.8);
+  background-color: hsl(var(--card) / 0.8);
+  box-shadow: 0 2px 12px -4px rgba(0, 0, 0, 0.3);
+}
+
+/* ============================================
+   HEADER STAT PILLS
+   ============================================ */
+
+.stat-pill {
+  background: hsl(var(--card) / 0.6);
+  backdrop-filter: blur(8px);
+  border: 1px solid hsl(var(--border) / 0.4);
+  transition: border-color 0.2s ease, background-color 0.2s ease;
+}
+
+.stat-pill:hover {
+  border-color: hsl(var(--border) / 0.7);
+  background: hsl(var(--card) / 0.8);
+}
+
+/* ============================================
+   SIDEBAR ENHANCEMENTS
+   ============================================ */
+
+.sidebar-item-active {
+  background: linear-gradient(135deg, rgba(0, 255, 136, 0.08), rgba(0, 255, 136, 0.03));
+  box-shadow: inset 2px 0 0 0 hsl(var(--primary));
+}
+
+/* ============================================
+   TERMINAL VIEW
+   ============================================ */
+
+.terminal-view {
+  position: relative;
+  isolation: isolate;
+  font-variant-ligatures: none;
+  -webkit-font-feature-settings: "liga" 0;
+  font-feature-settings: "liga" 0;
+}
+
+.terminal-surface {
+  background: #0a0c10;
+  border-color: rgba(34, 197, 94, 0.2);
+}
+
+.terminal-header {
+  background: #0d1017;
+  border-bottom: 1px solid rgba(34, 197, 94, 0.15);
+}
+
+.theme-light .terminal-surface {
+  background: #f7f8f4;
+  border-color: rgba(22, 101, 52, 0.25);
+  color: #1e293b;
+}
+
+.theme-light .terminal-header {
+  background: #eef0e9;
+  border-bottom-color: rgba(22, 101, 52, 0.2);
+}
+
+.terminal-view ::-webkit-scrollbar-thumb {
+  background: rgba(0, 255, 136, 0.15);
+}
+
+.terminal-view ::-webkit-scrollbar-thumb:hover {
+  background: rgba(0, 255, 136, 0.25);
+}
+
+.theme-light .terminal-view ::-webkit-scrollbar-thumb {
+  background: rgba(22, 101, 52, 0.25);
+}
+
+.theme-light .terminal-view ::-webkit-scrollbar-thumb:hover {
+  background: rgba(22, 101, 52, 0.4);
+}
+
+/* Terminal scanline effect */
+.terminal-view::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: repeating-linear-gradient(
+    0deg,
+    transparent,
+    transparent 2px,
+    rgba(0, 255, 136, 0.008) 2px,
+    rgba(0, 255, 136, 0.008) 4px
+  );
+  pointer-events: none;
+  z-index: 1;
+}
+
+.theme-light .terminal-view::after {
+  background: repeating-linear-gradient(
+    0deg,
+    transparent,
+    transparent 2px,
+    rgba(22, 101, 52, 0.02) 2px,
+    rgba(22, 101, 52, 0.02) 4px
+  );
+}
+
+/* Light-mode terminal text overrides — keep the green/cyan/red semantics
+   readable on a light background. Tailwind's text-green-400 etc. read
+   fine on dark but wash out on white, so we remap to darker shades while
+   preserving alpha-modifier variants.                                       */
+.theme-light .terminal-view .text-green-400 { color: #15803d; }
+.theme-light .terminal-view .text-green-300\/80 { color: rgb(22 101 52 / 0.85); }
+.theme-light .terminal-view .text-green-300\/50 { color: rgb(22 101 52 / 0.7); }
+.theme-light .terminal-view .text-green-100\/70 { color: rgb(20 83 45 / 0.95); }
+.theme-light .terminal-view .text-green-500\/35 { color: rgb(21 128 61 / 0.6); }
+.theme-light .terminal-view .text-green-500\/30 { color: rgb(21 128 61 / 0.55); }
+.theme-light .terminal-view .text-green-500\/25 { color: rgb(21 128 61 / 0.5); }
+.theme-light .terminal-view .text-green-500\/15 { color: rgb(21 128 61 / 0.4); }
+.theme-light .terminal-view .text-green-500\/10 { color: rgb(21 128 61 / 0.35); }
+.theme-light .terminal-view .text-green-500\/\[0\.06\] { background-color: rgb(21 128 61 / 0.08); }
+.theme-light .terminal-view .text-green-500\/\[0\.03\] { background-color: rgb(21 128 61 / 0.04); }
+.theme-light .terminal-view .bg-green-500\/\[0\.06\] { background-color: rgb(21 128 61 / 0.1); }
+.theme-light .terminal-view .bg-green-500\/\[0\.03\] { background-color: rgb(21 128 61 / 0.05); }
+.theme-light .terminal-view .text-green-400\/70 { color: rgb(21 128 61 / 0.9); }
+.theme-light .terminal-view .text-green-400\/60 { color: rgb(21 128 61 / 0.8); }
+.theme-light .terminal-view .text-green-400\/50 { color: rgb(21 128 61 / 0.75); }
+.theme-light .terminal-view .text-green-400\/40 { color: rgb(21 128 61 / 0.65); }
+.theme-light .terminal-view .text-green-400\/25 { color: rgb(21 128 61 / 0.5); }
+.theme-light .terminal-view .border-green-500\/20 { border-color: rgb(21 128 61 / 0.35); }
+.theme-light .terminal-view .bg-green-400 { background-color: #15803d; }
+.theme-light .terminal-view .bg-red-400 { background-color: #b91c1c; }
+.theme-light .terminal-view .text-red-400 { color: #b91c1c; }
+.theme-light .terminal-view .text-red-400\/70 { color: rgb(185 28 28 / 0.9); }
+.theme-light .terminal-view .text-yellow-400 { color: #b45309; }
+.theme-light .terminal-view .text-yellow-400\/50 { color: rgb(180 83 9 / 0.8); }
+.theme-light .terminal-view .text-cyan-400 { color: #0e7490; }
+.theme-light .terminal-view .text-purple-400 { color: #6d28d9; }
+.theme-light .terminal-view .text-purple-400\/70 { color: rgb(109 40 217 / 0.9); }
+.theme-light .terminal-view .text-purple-300\/40 { color: rgb(109 40 217 / 0.6); }
+.theme-light .terminal-view .text-blue-400 { color: #1d4ed8; }
+.theme-light .terminal-view .text-blue-400\/70 { color: rgb(29 78 216 / 0.9); }
+.theme-light .terminal-view .text-blue-400\/50 { color: rgb(29 78 216 / 0.7); }
+.theme-light .terminal-view .text-indigo-400\/70 { color: rgb(67 56 202 / 0.9); }
+.theme-light .terminal-view .text-emerald-400\/70 { color: rgb(5 150 105 / 0.9); }
+
+/* ============================================
+   COMPACT CARD GRID ENHANCEMENTS
+   ============================================ */
+
+/* Grid stagger animation for cards */
+.card-stagger > * {
+  animation: card-enter 0.25s ease-out both;
+}
+
+/* Opportunity card hover lift */
+.group:hover .card-hover-lift {
+  transform: translateY(-1px);
+}
+

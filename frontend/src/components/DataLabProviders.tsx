@@ -1,0 +1,2563 @@
+/**
+ * Data Lab → Providers tab.
+ *
+ * Lets the operator browse external data providers (currently only
+ * polybacktest.com), search their market catalog, kick off historical
+ * imports, watch the import jobs make progress, and review the
+ * imported datasets that the Backtest Studio can now consume.
+ *
+ * State machine:
+ *   1. Pick provider (defaults to first configured).
+ *   2. Pick coin → search → checkbox-pick markets.
+ *   3. Set time window + click Import → enqueues a ProviderImportJob.
+ *   4. Active jobs panel polls every 2s while any are running.
+ *   5. Imported datasets panel lists the catalog with delete + use-in-
+ *      backtest hooks.
+ *
+ * No hardcoded settings — the API key + base URL come from
+ * Settings → Providers (per the no-hidden-defaults policy).
+ */
+import { useEffect, useMemo, useState } from 'react'
+import { useTranslation } from 'react-i18next'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import {
+  AlertTriangle,
+  CircleAlert,
+  CheckCircle2,
+  Database,
+  Download,
+  ExternalLink,
+  Loader2,
+  Search,
+  Server,
+  Trash2,
+  X,
+} from 'lucide-react'
+
+import { Badge } from './ui/badge'
+import { Button } from './ui/button'
+import { Input } from './ui/input'
+import { Label } from './ui/label'
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from './ui/select'
+import { ScrollArea } from './ui/scroll-area'
+import { cn } from '../lib/utils'
+import {
+  cancelImportJob,
+  deleteProviderDataset,
+  getParquetRoot,
+  setParquetRoots,
+  getProviderSettings,
+  getTelonexAvailability,
+  getTelonexCatalogStatus,
+  getTelonexQuota,
+  importPolybacktest,
+  importTelonex,
+  listImportJobs,
+  listParquetDatasets,
+  listPolybacktestMarkets,
+  listProviderDatasets,
+  listProviders,
+  listTelonexMarkets,
+  refreshTelonexCatalog,
+  rescanParquetRoot,
+  updateProviderSettings,
+  type ImportJob,
+  type ImportJobStatus,
+  type ParquetDataset,
+  type ParquetRescanReport,
+  type PolybacktestMarket,
+  type ProviderDataset,
+  type ProviderInfo,
+  type ProviderSettings,
+  type TelonexAvailability,
+  type TelonexImportRequest,
+  type TelonexImportResponse,
+  type TelonexMarket,
+  type TelonexMarketsPage,
+  type TelonexQuota,
+} from '../services/apiProviders'
+import {
+  listRecordingSessions,
+  runRecorderBackfill,
+  type BackfillResult,
+  type BackfillScope,
+} from '../services/apiDataset'
+
+
+const COINS = ['btc', 'eth', 'sol'] as const
+
+const TIME_PRESETS: Array<{ label: string; hours: number }> = [
+  { label: '24 h', hours: 24 },
+  { label: '3 d', hours: 24 * 3 },
+  { label: '7 d', hours: 24 * 7 },
+  { label: '30 d', hours: 24 * 30 },
+]
+
+
+// Synthetic provider key for the built-in Polymarket REST backfill — it's
+// not part of /api/providers (which only exposes configurable third-party
+// vendors like polybacktest), but we surface it as a sub-tab so the
+// operator finds historical-gap-filling tools next to other importers.
+const POLYMARKET_TAB_KEY = '__polymarket__'
+
+// Synthetic provider key for the parquet bring-your-own-data sub-tab.
+// Operator drops parquet files into HOMERUN_PARQUET_ROOT; the
+// auto-discovery scanner upserts them into provider_datasets and the
+// backtester's resolver picks them up automatically.
+const PARQUET_TAB_KEY = '__parquet__'
+
+export default function DataLabProviders() {
+  const { t } = useTranslation()
+  // ── Providers list ───────────────────────────────────────────────
+  const providersQuery = useQuery({
+    queryKey: ['providers', 'list'],
+    queryFn: listProviders,
+    staleTime: 60_000,
+  })
+  const providers: ProviderInfo[] = providersQuery.data ?? []
+  const [activeProvider, setActiveProvider] = useState<string | null>(null)
+  // Auto-select the first provider when the list arrives.
+  useEffect(() => {
+    if (activeProvider == null && providers.length > 0) {
+      setActiveProvider(providers[0].key)
+    }
+  }, [providers, activeProvider])
+  const selected = providers.find((p) => p.key === activeProvider) ?? null
+  const isPolymarketTab = activeProvider === POLYMARKET_TAB_KEY
+  const isParquetTab = activeProvider === PARQUET_TAB_KEY
+
+  return (
+    <div className="flex h-full min-h-0 flex-col gap-3 p-3">
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <div className="flex items-center gap-2">
+            <Server className="h-4 w-4 text-violet-400" />
+            <span className="text-sm font-semibold">{t('dataLabProviders.title')}</span>
+          </div>
+          <p className="mt-0.5 text-[10px] text-muted-foreground">
+            {t('dataLabProviders.subtitle')}
+          </p>
+        </div>
+      </div>
+
+      {providersQuery.isLoading ? (
+        <div className="flex h-32 items-center justify-center text-xs text-muted-foreground">
+          <Loader2 className="mr-2 h-4 w-4 animate-spin" /> {t('dataLabProviders.loadingProviders')}
+        </div>
+      ) : null}
+
+      {/* Provider sub-tabs — one pill per integrated provider.  Polymarket
+          is a built-in sub-tab (it's the source for the REST backfill
+          synthesizer); Polybacktest etc. come from /api/providers. */}
+      <div className="flex items-center gap-1 border-b border-border/30">
+        {providers.map((p) => (
+          <button
+            key={p.key}
+            type="button"
+            onClick={() => setActiveProvider(p.key)}
+            className={cn(
+              '-mb-px flex items-center gap-1.5 border-b-2 px-3 py-1.5 text-[11px] font-medium transition-colors',
+              activeProvider === p.key
+                ? 'border-violet-500 text-foreground'
+                : 'border-transparent text-muted-foreground hover:text-foreground',
+            )}
+          >
+            <Server className="h-3 w-3" />
+            {p.label}
+            <ProviderHealthDot provider={p} />
+          </button>
+        ))}
+        <button
+          type="button"
+          onClick={() => setActiveProvider(POLYMARKET_TAB_KEY)}
+          className={cn(
+            '-mb-px flex items-center gap-1.5 border-b-2 px-3 py-1.5 text-[11px] font-medium transition-colors',
+            isPolymarketTab
+              ? 'border-violet-500 text-foreground'
+              : 'border-transparent text-muted-foreground hover:text-foreground',
+          )}
+        >
+          <Download className="h-3 w-3 rotate-180" />
+          {t('dataLabProviders.polymarketLabel')}
+        </button>
+        <button
+          type="button"
+          onClick={() => setActiveProvider(PARQUET_TAB_KEY)}
+          className={cn(
+            '-mb-px flex items-center gap-1.5 border-b-2 px-3 py-1.5 text-[11px] font-medium transition-colors',
+            isParquetTab
+              ? 'border-violet-500 text-foreground'
+              : 'border-transparent text-muted-foreground hover:text-foreground',
+          )}
+        >
+          <Server className="h-3 w-3" />
+          Parquet
+        </button>
+      </div>
+
+      {isPolymarketTab ? (
+        <PolymarketSection />
+      ) : isParquetTab ? (
+        <ParquetSection />
+      ) : selected?.key === 'polybacktest' ? (
+        <PolybacktestSection provider={selected} />
+      ) : selected?.key === 'telonex' ? (
+        <TelonexSection provider={selected} />
+      ) : selected ? (
+        <div className="rounded-md border border-border/40 bg-card/40 p-4 text-[11px] text-muted-foreground">
+          {t('dataLabProviders.notImplemented', { label: selected.label })}
+        </div>
+      ) : null}
+    </div>
+  )
+}
+
+
+// ─── Telonex section ─────────────────────────────────────────────────
+// First-pass scaffold: surfaces the API key form + a health pill so
+// the operator can plug their credential in and confirm the upstream
+// is reachable.  Market browser + import panels land once the API
+// surface is wired up in telonex_client.py.
+
+function TelonexSection({ provider }: { provider: ProviderInfo }) {
+  return (
+    <div className="flex min-h-0 flex-1 flex-col gap-3">
+      <div className="rounded-md border border-border/40 bg-card/40 p-3">
+        <div className="flex items-start justify-between gap-3">
+          <div className="min-w-0">
+            <div className="flex items-center gap-2">
+              <span className="text-sm font-semibold">{provider.label}</span>
+              <ProviderHealthBadge provider={provider} />
+            </div>
+            <p className="mt-1 text-[11px] text-muted-foreground">{provider.description}</p>
+            <div className="mt-1 flex flex-wrap items-center gap-3 text-[10px] text-muted-foreground">
+              <a
+                href={provider.homepage}
+                target="_blank"
+                rel="noreferrer"
+                className="inline-flex items-center gap-1 hover:text-foreground"
+              >
+                Homepage <ExternalLink className="h-3 w-3" />
+              </a>
+              <a
+                href={provider.docs_url}
+                target="_blank"
+                rel="noreferrer"
+                className="inline-flex items-center gap-1 hover:text-foreground"
+              >
+                API docs <ExternalLink className="h-3 w-3" />
+              </a>
+              <span>Exchanges: polymarket, binance</span>
+            </div>
+          </div>
+        </div>
+        {!provider.configured ? (
+          <div className="mt-2 rounded-sm border border-amber-500/30 bg-amber-500/5 p-2 text-[11px] text-amber-700 dark:text-amber-200">
+            Add your Telonex API key below to unlock downloads. The free trial allows 5 total downloads.
+          </div>
+        ) : null}
+        {provider.configured && provider.health.ok === false ? (
+          <div className="mt-2 rounded-sm border border-rose-500/30 bg-rose-500/5 p-2 text-[11px] text-rose-700 dark:text-rose-300">
+            Telonex API unreachable
+            {provider.health.error ? <>: <span className="font-mono">{provider.health.error}</span></> : null}
+            . The probe runs against the public datasets endpoint and uses no quota.
+          </div>
+        ) : null}
+        {provider.configured && provider.health.ok ? (
+          <div className="mt-2 rounded-sm border border-emerald-500/30 bg-emerald-500/5 p-2 text-[11px] text-emerald-700 dark:text-emerald-200">
+            Telonex API reachable
+            {typeof provider.health.elapsed_ms === 'number' ? (
+              <span className="ml-1 font-mono text-[10px]">({provider.health.elapsed_ms} ms)</span>
+            ) : null}
+            . API key is saved — the first download will verify it end-to-end.
+          </div>
+        ) : null}
+      </div>
+
+      {provider.configured ? (
+        <>
+          <TelonexImportPanel />
+          <TelonexDatasetsPanel />
+        </>
+      ) : (
+        <div className="rounded-md border border-dashed border-border/40 bg-card/20 p-4 text-[11px] text-muted-foreground">
+          Add your API key in <strong>Settings → Data Providers</strong> to unlock the market browser + import panel.
+        </div>
+      )}
+    </div>
+  )
+}
+
+
+// ─── Telonex quota pill ──────────────────────────────────────────────
+
+function TelonexQuotaPill() {
+  const quotaQuery = useQuery({
+    queryKey: ['providers', 'telonex', 'quota'],
+    queryFn: getTelonexQuota,
+    staleTime: 10_000,
+  })
+  const q: TelonexQuota | undefined = quotaQuery.data
+  const remaining = q?.remaining
+  if (remaining == null) {
+    return (
+      <Badge variant="outline" className="text-[10px]">
+        Quota: unknown — runs once you import
+      </Badge>
+    )
+  }
+  const tone =
+    remaining <= 0 ? 'border-rose-500/40 text-rose-700 dark:text-rose-300'
+      : remaining <= 2 ? 'border-amber-500/40 text-amber-700 dark:text-amber-300'
+      : 'border-emerald-500/40 text-emerald-700 dark:text-emerald-300'
+  return (
+    <Badge variant="outline" className={cn('text-[10px]', tone)}>
+      Downloads remaining: {remaining}
+    </Badge>
+  )
+}
+
+
+// ─── Telonex import panel (market browser + import form) ─────────────
+
+const TELONEX_EXCHANGES = ['polymarket', 'binance'] as const
+type TelonexExchange = (typeof TELONEX_EXCHANGES)[number]
+
+const TELONEX_CHANNELS_BY_EXCHANGE: Record<TelonexExchange, string[]> = {
+  polymarket: [
+    'trades',
+    'quotes',
+    'book_snapshot_5',
+    'book_snapshot_25',
+    'book_snapshot_full',
+    'onchain_fills',
+  ],
+  binance: ['trades', 'quotes', 'book_snapshot_5', 'book_snapshot_25'],
+}
+
+function _fmtRelativeTime(epochSeconds: number | null | undefined): string {
+  if (!epochSeconds) return '—'
+  const ms = Date.now() - epochSeconds * 1000
+  if (ms < 60_000) return 'just now'
+  if (ms < 3_600_000) return `${Math.floor(ms / 60_000)}m ago`
+  if (ms < 86_400_000) return `${Math.floor(ms / 3_600_000)}h ago`
+  return `${Math.floor(ms / 86_400_000)}d ago`
+}
+
+function _fmtBytes(n: number): string {
+  if (n < 1024) return `${n} B`
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`
+  if (n < 1024 * 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(1)} MB`
+  return `${(n / (1024 * 1024 * 1024)).toFixed(2)} GB`
+}
+
+function _daysBetween(start: string, end: string): number {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(start) || !/^\d{4}-\d{2}-\d{2}$/.test(end)) return 0
+  const s = new Date(start + 'T00:00:00Z').getTime()
+  const e = new Date(end + 'T00:00:00Z').getTime()
+  if (Number.isNaN(s) || Number.isNaN(e) || e < s) return 0
+  return Math.floor((e - s) / 86_400_000) + 1
+}
+
+function _clipDate(value: string | null | undefined): string {
+  if (!value) return ''
+  // Telonex returns either YYYY-MM-DD or ISO timestamps; keep just the day.
+  return value.slice(0, 10)
+}
+
+function TelonexImportPanel() {
+  const queryClient = useQueryClient()
+  const [exchange, setExchange] = useState<TelonexExchange>('polymarket')
+  const [search, setSearch] = useState('')
+  const [appliedSearch, setAppliedSearch] = useState('')
+  const [statusFilter, setStatusFilter] = useState<string>('all')
+  const [channelFilter, setChannelFilter] = useState<string>('all')
+
+  // Selected asset state.  Two paths:
+  //   - polymarket: pick a market row → both outcomes are imported
+  //     by default (operator almost always wants both books for any
+  //     analysis; the cost preview makes the doubling visible).
+  //   - binance: type a symbol directly (single-sided).
+  const [selectedMarket, setSelectedMarket] = useState<TelonexMarket | null>(null)
+  const [binanceSymbol, setBinanceSymbol] = useState<string>('')
+
+  // Import params
+  const [channel, setChannel] = useState<string>('trades')
+  const [startDate, setStartDate] = useState<string>('')
+  const [endDate, setEndDate] = useState<string>('')
+  // When true (polymarket only): import every binary sub-market in
+  // the selected market's event_id, not just the picked row.
+  const [importFullEvent, setImportFullEvent] = useState<boolean>(false)
+
+  // Reset asset selection when switching exchange.
+  useEffect(() => {
+    setSelectedMarket(null)
+    setBinanceSymbol('')
+    setImportFullEvent(false)
+    setStartDate(''); setEndDate('')
+    setChannel(TELONEX_CHANNELS_BY_EXCHANGE[exchange][0] || 'trades')
+  }, [exchange])
+
+  const catalogQuery = useQuery({
+    queryKey: ['providers', 'telonex', 'catalog', exchange],
+    queryFn: () => getTelonexCatalogStatus(exchange),
+    staleTime: 30_000,
+    enabled: exchange === 'polymarket',
+  })
+
+  const refreshCatalogMutation = useMutation({
+    mutationFn: () => refreshTelonexCatalog(exchange),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['providers', 'telonex', 'catalog'] })
+      queryClient.invalidateQueries({ queryKey: ['providers', 'telonex', 'markets'] })
+    },
+  })
+
+  const marketsQuery = useQuery({
+    queryKey: ['providers', 'telonex', 'markets', exchange, appliedSearch, statusFilter, channelFilter],
+    queryFn: () =>
+      listTelonexMarkets({
+        exchange,
+        search: appliedSearch || undefined,
+        status: statusFilter === 'all' ? undefined : statusFilter,
+        channel: channelFilter === 'all' ? undefined : channelFilter,
+        limit: 100,
+      }),
+    enabled: exchange === 'polymarket' && (catalogQuery.data?.exists ?? false),
+    staleTime: 60_000,
+  })
+  const marketsPage: TelonexMarketsPage | undefined = marketsQuery.data
+
+  // Reuse the same quota query as TelonexQuotaPill (React Query
+  // dedupes on the shared key) so the over-quota guard below stays
+  // in sync with the pill at the top of the panel.
+  const quotaQuery = useQuery({
+    queryKey: ['providers', 'telonex', 'quota'],
+    queryFn: getTelonexQuota,
+    staleTime: 10_000,
+  })
+  const quota: TelonexQuota | undefined = quotaQuery.data
+
+  // When the operator opts into "Import full event", fetch every
+  // binary sub-market sharing the selected market's event_id.  Each
+  // row is its own (asset_id_0, asset_id_1) pair — total outcomes =
+  // 2 × siblings.  We pull up to 500 (Polymarket events with more are
+  // vanishingly rare; the UI warns if we hit the cap).
+  const eventSiblingsQuery = useQuery({
+    queryKey: ['providers', 'telonex', 'event-siblings', selectedMarket?.event_id],
+    queryFn: () =>
+      listTelonexMarkets({
+        exchange: 'polymarket',
+        event_id: selectedMarket?.event_id || undefined,
+        limit: 500,
+      }),
+    enabled: !!(exchange === 'polymarket' && importFullEvent && selectedMarket?.event_id),
+    staleTime: 60_000,
+  })
+
+  // For binance we fetch availability on-demand because there's no
+  // markets catalog to consult.
+  const binanceAvailabilityQuery = useQuery<TelonexAvailability>({
+    queryKey: ['providers', 'telonex', 'availability', 'binance', binanceSymbol],
+    queryFn: () => getTelonexAvailability({ exchange: 'binance', slug: binanceSymbol.trim().toLowerCase() }),
+    enabled: exchange === 'binance' && binanceSymbol.trim().length > 0,
+    retry: false,
+    staleTime: 60_000,
+  })
+
+  // Derive the channel windows for the active asset.
+  const activeChannels: { [channel: string]: { from_date: string | null; to_date: string | null } } = (() => {
+    if (exchange === 'polymarket') {
+      return selectedMarket?.channels ?? {}
+    }
+    return binanceAvailabilityQuery.data?.channels ?? {}
+  })()
+
+  const channelWindow = activeChannels[channel]
+  const channelStart = _clipDate(channelWindow?.from_date)
+  const channelEnd = _clipDate(channelWindow?.to_date)
+
+  // Auto-fill date range to the channel's full window the first time
+  // the operator picks a (market, channel) combo.
+  useEffect(() => {
+    if (channelStart && !startDate) setStartDate(channelStart)
+    if (channelEnd && !endDate) setEndDate(channelEnd)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [channelStart, channelEnd, selectedMarket?.market_id, binanceSymbol, channel])
+
+  // Auto-clip when the channel changes and previously-set dates fall outside.
+  useEffect(() => {
+    if (channelStart && startDate && startDate < channelStart) setStartDate(channelStart)
+    if (channelEnd && endDate && endDate > channelEnd) setEndDate(channelEnd)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [channel, channelStart, channelEnd])
+
+  // Sequential mutation: imports each outcome's parquet for the
+  // chosen date range.  Polymarket fires twice (Yes + No); binance
+  // fires once.  Sequential rather than parallel so the operator sees
+  // a quota counter that decrements in lockstep with each side.
+  const importMutation = useMutation({
+    mutationFn: async (reqs: TelonexImportRequest[]): Promise<TelonexImportResponse[]> => {
+      const out: TelonexImportResponse[] = []
+      for (const req of reqs) {
+        out.push(await importTelonex(req))
+      }
+      return out
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['providers', 'telonex', 'quota'] })
+      queryClient.invalidateQueries({ queryKey: ['providers', 'telonex', 'datasets'] })
+      queryClient.invalidateQueries({ queryKey: ['providers'] })
+    },
+  })
+
+  const daysSelected = _daysBetween(startDate, endDate)
+
+  // Flatten all (market, outcome) pairs we'll import.  When
+  // ``importFullEvent`` is on for polymarket, this expands across
+  // every binary sub-market in the event_id; otherwise it's just the
+  // selected market's pair.  Outcomes with no asset_id and no
+  // slug+label fallback are skipped — they're resolved/blanked rows
+  // with no actual data behind them.
+  type ImportableOutcome = {
+    asset_id?: string
+    slug?: string
+    outcome?: string
+    label: string  // human label for the result panel ("Yes", "Lakers", etc.)
+  }
+  const importableOutcomes: ImportableOutcome[] = (() => {
+    if (exchange === 'polymarket') {
+      const sourceMarkets: TelonexMarket[] = importFullEvent
+        ? (eventSiblingsQuery.data?.markets ?? [])
+        : (selectedMarket ? [selectedMarket] : [])
+      const out: ImportableOutcome[] = []
+      for (const m of sourceMarkets) {
+        for (const o of m.outcomes) {
+          const label = o.label || ''
+          // Tag with the market question when importing an event so
+          // the result panel disambiguates "Yes (Lakers)" vs
+          // "Yes (Celtics)" etc.
+          const displayLabel = importFullEvent
+            ? `${label || '(unnamed)'} — ${(m.question || m.slug || m.market_id || '?').slice(0, 40)}`
+            : (label || '(unnamed)')
+          if (o.asset_id) {
+            out.push({ asset_id: o.asset_id, label: displayLabel })
+          } else if (m.slug && label) {
+            out.push({ slug: m.slug, outcome: label, label: displayLabel })
+          }
+        }
+      }
+      return out
+    }
+    if (exchange === 'binance' && binanceSymbol.trim()) {
+      return [{ slug: binanceSymbol.trim().toLowerCase(), label: binanceSymbol.trim().toLowerCase() }]
+    }
+    return []
+  })()
+
+  const totalDownloads = daysSelected * importableOutcomes.length
+
+  const canImport = (() => {
+    if (!channel || !startDate || !endDate) return false
+    if (daysSelected <= 0) return false
+    return importableOutcomes.length > 0
+  })()
+
+  const buildImportRequests = (): TelonexImportRequest[] => {
+    if (!canImport) return []
+    return importableOutcomes.map((o) => {
+      const base: TelonexImportRequest = {
+        exchange,
+        channel,
+        start_date: startDate,
+        end_date: endDate,
+      }
+      if (o.asset_id) base.asset_id = o.asset_id
+      else if (o.slug) {
+        base.slug = o.slug
+        if (o.outcome) base.outcome = o.outcome
+      }
+      return base
+    })
+  }
+
+  return (
+    <div className="rounded-md border border-border/40 bg-card/40 p-3">
+      <div className="flex items-center justify-between gap-2">
+        <div className="text-xs font-semibold flex items-center gap-2">
+          <Download className="h-3.5 w-3.5 text-violet-400" />
+          Import historical data
+        </div>
+        <TelonexQuotaPill />
+      </div>
+
+      {/* Exchange + catalog controls */}
+      <div className="mt-3 grid grid-cols-2 gap-2">
+        <div>
+          <Label className="text-[10px] uppercase text-muted-foreground">Exchange</Label>
+          <Select value={exchange} onValueChange={(v) => setExchange(v as TelonexExchange)}>
+            <SelectTrigger className="h-8 text-xs"><SelectValue /></SelectTrigger>
+            <SelectContent>
+              {TELONEX_EXCHANGES.map((ex) => (
+                <SelectItem key={ex} value={ex} className="text-xs">{ex}</SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
+        <div>
+          <Label className="text-[10px] uppercase text-muted-foreground">Channel</Label>
+          <Select value={channel} onValueChange={setChannel}>
+            <SelectTrigger className="h-8 text-xs"><SelectValue /></SelectTrigger>
+            <SelectContent>
+              {TELONEX_CHANNELS_BY_EXCHANGE[exchange].map((ch) => {
+                const hasData = !!activeChannels[ch]
+                return (
+                  <SelectItem key={ch} value={ch} className="text-xs">
+                    {ch}{hasData ? '' : ' (no data)'}
+                  </SelectItem>
+                )
+              })}
+            </SelectContent>
+          </Select>
+        </div>
+      </div>
+
+      {/* Polymarket: markets browser */}
+      {exchange === 'polymarket' ? (
+        <div className="mt-3 space-y-2">
+          {catalogQuery.data?.exists ? (
+            <div className="flex items-center justify-between gap-2 rounded-sm border border-border/30 bg-background/40 p-2 text-[10px]">
+              <div>
+                Catalog: <span className="font-mono">{(catalogQuery.data.rows ?? 0).toLocaleString()}</span> markets · refreshed{' '}
+                <span className="font-mono">{_fmtRelativeTime(catalogQuery.data.downloaded_at_epoch)}</span>
+              </div>
+              <Button
+                size="sm" variant="ghost" className="h-6 text-[10px]"
+                disabled={refreshCatalogMutation.isPending}
+                onClick={() => refreshCatalogMutation.mutate()}
+                title="Re-download the public markets dataset (free, no quota cost)"
+              >
+                {refreshCatalogMutation.isPending ? (
+                  <><Loader2 className="h-3 w-3 mr-1 animate-spin" /> Refreshing…</>
+                ) : (
+                  'Refresh'
+                )}
+              </Button>
+            </div>
+          ) : (
+            <div className="rounded-sm border border-amber-500/30 bg-amber-500/5 p-2 text-[11px] text-amber-700 dark:text-amber-200 flex items-center justify-between gap-2">
+              <span>
+                Markets catalog not downloaded yet. ~660 MB one-time fetch from Telonex's public
+                dataset endpoint — no quota cost.
+              </span>
+              <Button
+                size="sm" className="h-7 text-[11px]"
+                disabled={refreshCatalogMutation.isPending}
+                onClick={() => refreshCatalogMutation.mutate()}
+              >
+                {refreshCatalogMutation.isPending ? (
+                  <><Loader2 className="h-3 w-3 mr-1 animate-spin" /> Downloading…</>
+                ) : (
+                  'Download catalog'
+                )}
+              </Button>
+            </div>
+          )}
+
+          {/* Search + filter */}
+          <div className="grid grid-cols-2 gap-2">
+            <div className="col-span-2 flex items-center gap-1">
+              <Input
+                value={search}
+                onChange={(e) => setSearch(e.target.value)}
+                onKeyDown={(e) => { if (e.key === 'Enter') setAppliedSearch(search) }}
+                placeholder="Search slug, question, event title…"
+                className="h-8 text-xs"
+              />
+              <Button
+                size="sm" variant="outline" className="h-8 gap-1 text-[10px]"
+                onClick={() => setAppliedSearch(search)}
+                disabled={!catalogQuery.data?.exists}
+              >
+                <Search className="h-3 w-3" /> Search
+              </Button>
+            </div>
+            <div>
+              <Label className="text-[10px] uppercase text-muted-foreground">Status</Label>
+              <Select value={statusFilter} onValueChange={setStatusFilter}>
+                <SelectTrigger className="h-8 text-xs"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="all" className="text-xs">All</SelectItem>
+                  <SelectItem value="resolved" className="text-xs">resolved</SelectItem>
+                  <SelectItem value="active" className="text-xs">active</SelectItem>
+                  <SelectItem value="closed" className="text-xs">closed</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+            <div>
+              <Label className="text-[10px] uppercase text-muted-foreground">Has data for</Label>
+              <Select value={channelFilter} onValueChange={setChannelFilter}>
+                <SelectTrigger className="h-8 text-xs"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="all" className="text-xs">Any channel</SelectItem>
+                  {TELONEX_CHANNELS_BY_EXCHANGE.polymarket.map((ch) => (
+                    <SelectItem key={ch} value={ch} className="text-xs">{ch}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+          </div>
+
+          {/* Markets list */}
+          <ScrollArea className="h-56 rounded-sm border border-border/30 bg-background/40">
+            {marketsQuery.isLoading ? (
+              <div className="flex h-full items-center justify-center text-[11px] text-muted-foreground">
+                <Loader2 className="mr-2 h-3 w-3 animate-spin" /> Loading…
+              </div>
+            ) : marketsPage?.catalog_missing ? (
+              <div className="p-3 text-[11px] text-muted-foreground">Download the catalog above first.</div>
+            ) : marketsQuery.isError ? (
+              <div className="p-3 text-[11px] text-rose-700 dark:text-rose-300">
+                {String((marketsQuery.error as Error)?.message || 'Failed to load')}
+              </div>
+            ) : (marketsPage?.markets.length ?? 0) === 0 ? (
+              <div className="p-3 text-[11px] text-muted-foreground">No markets found.</div>
+            ) : (
+              <div className="divide-y divide-border/20">
+                {marketsPage!.markets.map((m) => {
+                  const isSel = selectedMarket?.market_id === m.market_id && selectedMarket?.slug === m.slug
+                  return (
+                    <button
+                      key={`${m.market_id}_${m.slug}`}
+                      type="button"
+                      onClick={() => { setSelectedMarket(m) }}
+                      className={cn(
+                        'block w-full px-2 py-1.5 text-left text-[11px] transition-colors hover:bg-card/40',
+                        isSel && 'bg-violet-500/10',
+                      )}
+                    >
+                      <div className="flex items-center gap-2">
+                        <input type="radio" checked={isSel} readOnly className="h-3 w-3 accent-violet-500" />
+                        <span className="flex-1 truncate font-medium">{m.question || m.slug || m.market_id}</span>
+                        {m.status ? (
+                          <Badge variant="outline" className="text-[9px]">{m.status}</Badge>
+                        ) : null}
+                      </div>
+                      <div className="ml-5 flex items-center gap-2 text-[10px] text-muted-foreground">
+                        <span className="font-mono truncate max-w-[200px]">{m.slug || m.market_id}</span>
+                        {m.category ? <span>· {m.category}</span> : null}
+                        {m.end_date ? <span>· ends {m.end_date.slice(0, 10)}</span> : null}
+                      </div>
+                    </button>
+                  )
+                })}
+              </div>
+            )}
+          </ScrollArea>
+
+          {marketsPage && marketsPage.total > marketsPage.markets.length ? (
+            <div className="text-[10px] text-muted-foreground text-center">
+              Showing {marketsPage.markets.length} of {marketsPage.total.toLocaleString()} — refine search to narrow
+            </div>
+          ) : null}
+
+          {/* Outcome summary — both sides import by default.
+              If the market is part of a multi-market event, offer the
+              "Import full event" toggle so the operator can fan out
+              across every sub-market with one click. */}
+          {selectedMarket ? (
+            <div className="space-y-2">
+              <div className="rounded-sm border border-border/30 bg-background/40 p-2 text-[10px] text-muted-foreground">
+                <span className="font-semibold text-foreground">
+                  {importFullEvent ? 'Importing full event' : 'Importing both outcomes'}:
+                </span>{' '}
+                {importFullEvent ? (
+                  eventSiblingsQuery.isLoading ? (
+                    <><Loader2 className="inline h-3 w-3 mr-1 animate-spin" /> Loading sibling markets…</>
+                  ) : eventSiblingsQuery.isError ? (
+                    <span className="text-rose-700 dark:text-rose-300">
+                      Failed to load event markets: {String((eventSiblingsQuery.error as Error)?.message || '')}
+                    </span>
+                  ) : (
+                    <>
+                      <span className="font-mono">
+                        {eventSiblingsQuery.data?.markets.length ?? 0}
+                      </span>{' '}
+                      sub-market{(eventSiblingsQuery.data?.markets.length ?? 0) === 1 ? '' : 's'} ×{' '}
+                      2 outcomes each
+                      {selectedMarket.event_title ? <> · <span className="italic">{selectedMarket.event_title}</span></> : null}
+                    </>
+                  )
+                ) : (
+                  <>
+                    {selectedMarket.outcomes
+                      .map((o) => o.label || '(unnamed)')
+                      .filter(Boolean)
+                      .join(' + ')}
+                    {' '}— each side counts as its own download per day.
+                  </>
+                )}
+              </div>
+              {selectedMarket.event_id ? (
+                <label className="flex items-center gap-2 cursor-pointer text-[11px] text-foreground select-none">
+                  <input
+                    type="checkbox"
+                    checked={importFullEvent}
+                    onChange={(e) => setImportFullEvent(e.target.checked)}
+                    className="h-3.5 w-3.5 accent-violet-500"
+                  />
+                  <span>
+                    Import <strong>all binary markets</strong> in this event
+                    {selectedMarket.event_title ? <> (<span className="italic">{selectedMarket.event_title}</span>)</> : null}
+                  </span>
+                </label>
+              ) : null}
+            </div>
+          ) : null}
+        </div>
+      ) : (
+        // Binance: symbol input + on-demand availability lookup
+        <div className="mt-3 space-y-2">
+          <div>
+            <Label className="text-[10px] uppercase text-muted-foreground">Symbol (lowercase, e.g. btcusdt)</Label>
+            <Input
+              value={binanceSymbol}
+              onChange={(e) => setBinanceSymbol(e.target.value.toLowerCase())}
+              placeholder="btcusdt"
+              className="h-8 font-mono text-xs"
+            />
+          </div>
+          {binanceSymbol.trim().length > 0 ? (
+            binanceAvailabilityQuery.isLoading ? (
+              <div className="rounded-sm border border-border/30 bg-background/40 p-2 text-[11px] text-muted-foreground">
+                <Loader2 className="inline h-3 w-3 mr-1 animate-spin" /> Looking up availability…
+              </div>
+            ) : binanceAvailabilityQuery.isError ? (
+              <div className="rounded-sm border border-rose-500/30 bg-rose-500/5 p-2 text-[11px] text-rose-700 dark:text-rose-300">
+                {String((binanceAvailabilityQuery.error as Error)?.message || 'No data for this symbol')}
+              </div>
+            ) : binanceAvailabilityQuery.data ? (
+              <div className="rounded-sm border border-border/30 bg-background/40 p-2 text-[10px]">
+                <div className="font-semibold text-foreground mb-1">Channels with data:</div>
+                {Object.entries(binanceAvailabilityQuery.data.channels).map(([ch, w]) => (
+                  <div key={ch} className="flex items-center gap-2 text-muted-foreground">
+                    <span className="font-mono">{ch}</span>
+                    <span>{w.from_date} → {w.to_date}</span>
+                  </div>
+                ))}
+              </div>
+            ) : null
+          ) : null}
+        </div>
+      )}
+
+      {/* Channel window info + date pickers */}
+      {(exchange === 'polymarket' ? selectedMarket : binanceSymbol.trim().length > 0) && channelWindow ? (
+        <div className="mt-3 grid grid-cols-2 gap-2">
+          <div className="col-span-2 text-[10px] text-muted-foreground">
+            <span className="font-semibold text-foreground">{channel}</span> available from{' '}
+            <span className="font-mono">{channelStart || '?'}</span> to{' '}
+            <span className="font-mono">{channelEnd || '?'}</span>
+          </div>
+          <div>
+            <Label className="text-[10px] uppercase text-muted-foreground">Start date</Label>
+            <Input
+              type="date" value={startDate}
+              min={channelStart || undefined} max={channelEnd || undefined}
+              onChange={(e) => setStartDate(e.target.value)}
+              className="h-8 text-xs"
+            />
+          </div>
+          <div>
+            <Label className="text-[10px] uppercase text-muted-foreground">End date</Label>
+            <Input
+              type="date" value={endDate}
+              min={channelStart || undefined} max={channelEnd || undefined}
+              onChange={(e) => setEndDate(e.target.value)}
+              className="h-8 text-xs"
+            />
+          </div>
+        </div>
+      ) : (exchange === 'polymarket' ? selectedMarket : binanceSymbol.trim().length > 0) ? (
+        <div className="mt-3 rounded-sm border border-amber-500/30 bg-amber-500/5 p-2 text-[11px] text-amber-700 dark:text-amber-200">
+          No <span className="font-mono">{channel}</span> data for this asset. Pick a different channel.
+        </div>
+      ) : null}
+
+      {/* Import action + quota guard */}
+      {canImport && quota?.remaining != null && totalDownloads > quota.remaining ? (
+        <div className="mt-3 rounded-sm border border-rose-500/30 bg-rose-500/5 p-2 text-[11px] text-rose-700 dark:text-rose-300">
+          <strong>Over quota:</strong> this import wants{' '}
+          <span className="font-mono">{totalDownloads}</span> downloads but only{' '}
+          <span className="font-mono">{quota.remaining}</span> remain. Shrink the date range or
+          unselect "Import all binary markets" to fit your quota.
+        </div>
+      ) : null}
+      <div className="mt-3 flex items-center justify-between gap-2">
+        <span className="text-[10px] text-muted-foreground">
+          {canImport ? (
+            <>
+              This will cost <span className="font-mono">{totalDownloads}</span> download{totalDownloads === 1 ? '' : 's'}
+              {importableOutcomes.length > 1 ? (
+                <> (<span className="font-mono">{daysSelected}</span>{' '}
+                day{daysSelected === 1 ? '' : 's'} × <span className="font-mono">{importableOutcomes.length}</span> outcomes)</>
+              ) : null}
+              {quota?.remaining != null ? (
+                <> · <span className="font-mono">{quota.remaining}</span> remaining after</>
+              ) : null}
+              .
+            </>
+          ) : (
+            <>Pick an asset, channel, and date range to import.</>
+          )}
+        </span>
+        <Button
+          size="sm" className="h-8 gap-1.5 text-[11px]"
+          disabled={!canImport || importMutation.isPending || (quota?.remaining != null && totalDownloads > quota.remaining)}
+          onClick={() => {
+            const reqs = buildImportRequests()
+            if (reqs.length === 0) return
+            // Belt-and-braces confirm when spending non-trivial quota.
+            if (totalDownloads >= 5) {
+              const ok = window.confirm(
+                `This import will spend ${totalDownloads} downloads. Continue?`
+              )
+              if (!ok) return
+            }
+            importMutation.mutate(reqs)
+          }}
+        >
+          {importMutation.isPending ? (
+            <Loader2 className="h-3 w-3 animate-spin" />
+          ) : (
+            <Download className="h-3 w-3" />
+          )}
+          Import {totalDownloads > 0 ? `(${totalDownloads}dl)` : ''}
+        </Button>
+      </div>
+
+      {/* Import result panel — one entry per outcome */}
+      {importMutation.data ? (
+        <div className="mt-2 space-y-2">
+          {importMutation.data.map((r, i) => (
+            <TelonexImportResultPanel key={i} result={r} label={importableOutcomes[i]?.label} />
+          ))}
+        </div>
+      ) : null}
+      {importMutation.isError ? (
+        <div className="mt-2 rounded-sm border border-rose-500/30 bg-rose-500/5 p-2 text-[10px] text-rose-700 dark:text-rose-300">
+          {(importMutation.error as Error)?.message || 'Import failed'}
+        </div>
+      ) : null}
+    </div>
+  )
+}
+
+
+function TelonexImportResultPanel({ result, label }: { result: TelonexImportResponse; label?: string }) {
+  const failed = result.day_results.filter((d) => !d.ok)
+  const hasFailures = failed.length > 0
+  return (
+    <div className="rounded-sm border border-border/30 bg-background/40 p-2 text-[10px]">
+      <div className="flex items-center justify-between gap-2">
+        <div className="font-semibold text-foreground text-[11px]">
+          {label ? <>Outcome <span className="font-mono">{label}</span> — </> : null}
+          Import complete
+        </div>
+        {result.quota_remaining != null ? (
+          <Badge variant="outline" className="text-[10px]">{result.quota_remaining} downloads left</Badge>
+        ) : null}
+      </div>
+      <div className="mt-1 text-muted-foreground">
+        {result.days_succeeded}/{result.days_requested} days · {_fmtBytes(result.bytes_downloaded)}
+        {result.storage_uri ? (
+          <>
+            {' '}· <span className="font-mono">{result.storage_uri}</span>
+          </>
+        ) : null}
+      </div>
+      {hasFailures ? (
+        <details className="mt-1">
+          <summary className="cursor-pointer text-rose-700 dark:text-rose-300">
+            {failed.length} day{failed.length === 1 ? '' : 's'} failed
+          </summary>
+          <ul className="mt-1 ml-3 list-disc">
+            {failed.slice(0, 8).map((d) => (
+              <li key={d.date}>
+                <span className="font-mono">{d.date}</span>: {d.error || 'unknown error'}
+              </li>
+            ))}
+            {failed.length > 8 ? <li>…and {failed.length - 8} more</li> : null}
+          </ul>
+        </details>
+      ) : null}
+    </div>
+  )
+}
+
+
+// ─── Imported Telonex datasets (catalog rows) ────────────────────────
+
+function TelonexDatasetsPanel() {
+  const queryClient = useQueryClient()
+  const datasetsQuery = useQuery({
+    queryKey: ['providers', 'telonex', 'datasets'],
+    queryFn: () => listProviderDatasets({ provider: 'telonex', limit: 200 }),
+    staleTime: 30_000,
+  })
+  const datasets: ProviderDataset[] = datasetsQuery.data ?? []
+  const deleteMutation = useMutation({
+    mutationFn: (id: string) => deleteProviderDataset(id),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['providers', 'telonex', 'datasets'] })
+    },
+  })
+  if (datasetsQuery.isLoading) {
+    return (
+      <div className="rounded-md border border-border/40 bg-card/40 p-3 text-[11px] text-muted-foreground">
+        <Loader2 className="inline h-3 w-3 mr-1 animate-spin" /> Loading imported datasets…
+      </div>
+    )
+  }
+  return (
+    <div className="rounded-md border border-border/40 bg-card/40 p-3">
+      <div className="text-xs font-semibold flex items-center gap-2">
+        <Database className="h-3.5 w-3.5 text-violet-400" />
+        Imported Telonex datasets
+        <Badge variant="outline" className="text-[10px]">{datasets.length}</Badge>
+      </div>
+      {datasets.length === 0 ? (
+        <p className="mt-2 text-[11px] text-muted-foreground">
+          No datasets imported yet. Pick an asset above and click <strong>Import</strong>.
+        </p>
+      ) : (
+        <div className="mt-2 divide-y divide-border/20">
+          {datasets.map((d) => (
+            <div key={d.id} className="flex items-center gap-2 py-1.5 text-[11px]">
+              <div className="min-w-0 flex-1">
+                <div className="truncate font-medium">{d.title || d.external_id}</div>
+                <div className="text-[10px] text-muted-foreground font-mono truncate">
+                  {d.start_ts?.slice(0, 10)} → {d.end_ts?.slice(0, 10)} · {d.snapshot_count} files
+                </div>
+                {d.storage_uri ? (
+                  <div className="text-[9px] text-muted-foreground font-mono truncate" title={d.storage_uri}>
+                    {d.storage_uri}
+                  </div>
+                ) : null}
+              </div>
+              <Button
+                size="sm" variant="ghost" className="h-7 w-7 p-0 text-rose-500 hover:text-rose-600"
+                onClick={() => {
+                  if (window.confirm(`Delete dataset "${d.title || d.external_id}"? Files on disk are kept.`)) {
+                    deleteMutation.mutate(d.id)
+                  }
+                }}
+                title="Delete catalog entry"
+              >
+                <Trash2 className="h-3.5 w-3.5" />
+              </Button>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
+
+/** Tiny health pulse beside the provider tab label. */
+function ProviderHealthDot({ provider }: { provider: ProviderInfo }) {
+  const tone = !provider.configured
+    ? 'bg-amber-500/70'
+    : provider.health.ok === false
+    ? 'bg-rose-500/70'
+    : 'bg-emerald-500/70'
+  return <span className={cn('h-1.5 w-1.5 rounded-full', tone)} />
+}
+
+
+function ProviderHealthBadge({ provider }: { provider: ProviderInfo }) {
+  const { t } = useTranslation()
+  if (!provider.configured) {
+    return (
+      <Badge variant="outline" className="gap-1 border-amber-500/40 text-amber-700 dark:text-amber-300">
+        <CircleAlert className="h-3 w-3" />
+        {t('dataLabProviders.needsApiKey')}
+      </Badge>
+    )
+  }
+  if (provider.health.ok === false) {
+    return (
+      <Badge variant="outline" className="gap-1 border-rose-500/40 text-rose-700 dark:text-rose-300">
+        <AlertTriangle className="h-3 w-3" />
+        {t('dataLabProviders.unreachable')}
+      </Badge>
+    )
+  }
+  return (
+    <Badge variant="outline" className="gap-1 border-emerald-500/40 text-emerald-700 dark:text-emerald-300">
+      <CheckCircle2 className="h-3 w-3" />
+      {t('dataLabProviders.healthy')}
+    </Badge>
+  )
+}
+
+
+function PolybacktestSection({ provider }: { provider: ProviderInfo }) {
+  const { t } = useTranslation()
+  return (
+    <div className="flex min-h-0 flex-1 flex-col gap-3">
+      {/* Provider summary strip — health, links, coin support. */}
+      <div className="rounded-md border border-border/40 bg-card/40 p-3">
+        <div className="flex items-start justify-between gap-3">
+          <div className="min-w-0">
+            <div className="flex items-center gap-2">
+              <span className="text-sm font-semibold">{provider.label}</span>
+              <ProviderHealthBadge provider={provider} />
+            </div>
+            <p className="mt-1 text-[11px] text-muted-foreground">{provider.description}</p>
+            <div className="mt-1 flex flex-wrap items-center gap-3 text-[10px] text-muted-foreground">
+              <a
+                href={provider.homepage}
+                target="_blank"
+                rel="noreferrer"
+                className="inline-flex items-center gap-1 hover:text-foreground"
+              >
+                {t('dataLabProviders.homepage')} <ExternalLink className="h-3 w-3" />
+              </a>
+              <a
+                href={provider.docs_url}
+                target="_blank"
+                rel="noreferrer"
+                className="inline-flex items-center gap-1 hover:text-foreground"
+              >
+                {t('dataLabProviders.apiDocs')} <ExternalLink className="h-3 w-3" />
+              </a>
+              <span>{t('dataLabProviders.coins', { list: provider.supported_coins.join(', ') })}</span>
+            </div>
+          </div>
+        </div>
+        {!provider.configured ? (
+          <div className="mt-2 rounded-sm border border-amber-500/30 bg-amber-500/5 p-2 text-[11px] text-amber-700 dark:text-amber-200" dangerouslySetInnerHTML={{ __html: t('dataLabProviders.addApiKeyHint') }} />
+        ) : null}
+      </div>
+
+      <ProviderSettingsCard providerKey="polybacktest" />
+
+      {provider.configured ? (
+        <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
+          <PolybacktestImportPanel />
+          <PolybacktestActiveJobsPanel />
+        </div>
+      ) : null}
+
+      <PolybacktestDatasetsPanel />
+    </div>
+  )
+}
+
+
+/**
+ * Settings card — covers the polybacktest API key + numeric reverse-
+ * engineer defaults (max iterations, target score, cost cap).
+ *
+ * The default LLM *model* for the reverse-engineer agent lives in
+ * AI → Models (under "Strategy Reverse-Engineer") so it sits next to
+ * every other per-purpose model override.
+ */
+function ProviderSettingsCard({ providerKey: _providerKey }: { providerKey: string }) {
+  const { t } = useTranslation()
+  const queryClient = useQueryClient()
+  const settingsQuery = useQuery({
+    queryKey: ['providers', 'settings'],
+    queryFn: getProviderSettings,
+    staleTime: 60_000,
+  })
+  const settings: ProviderSettings | null = settingsQuery.data ?? null
+
+  const [apiKey, setApiKey] = useState<string>('')
+  const [showKey, setShowKey] = useState<boolean>(false)
+  const [baseUrl, setBaseUrl] = useState<string>('')
+  const [maxIter, setMaxIter] = useState<string>('')
+  const [targetScore, setTargetScore] = useState<string>('')
+  const [maxCost, setMaxCost] = useState<string>('')
+  const [maxTrades, setMaxTrades] = useState<string>('')
+
+  // Hydrate the form from the server snapshot once.
+  useEffect(() => {
+    if (!settings) return
+    setApiKey(settings.polybacktest_api_key_set ? '********' : '')
+    setBaseUrl(settings.polybacktest_base_url ?? '')
+    setMaxIter(settings.reverse_engineer_max_iterations?.toString() ?? '')
+    setTargetScore(settings.reverse_engineer_target_score?.toString() ?? '')
+    setMaxCost(settings.reverse_engineer_max_cost_usd?.toString() ?? '')
+    setMaxTrades(settings.reverse_engineer_max_wallet_trades?.toString() ?? '')
+  }, [settings])
+
+  const saveMutation = useMutation({
+    mutationFn: () =>
+      updateProviderSettings({
+        polybacktest_api_key: apiKey === '********' ? null : apiKey,
+        polybacktest_base_url: baseUrl,
+        reverse_engineer_max_iterations: maxIter ? parseInt(maxIter, 10) : null,
+        reverse_engineer_target_score: targetScore ? parseFloat(targetScore) : null,
+        reverse_engineer_max_cost_usd: maxCost ? parseFloat(maxCost) : null,
+        reverse_engineer_max_wallet_trades: maxTrades ? parseInt(maxTrades, 10) : null,
+      }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['providers'] })
+    },
+  })
+
+  return (
+    <details className="rounded-md border border-border/40 bg-card/40 p-3">
+      <summary className="cursor-pointer text-xs font-semibold flex items-center gap-1.5">
+        <Server className="h-3.5 w-3.5 text-violet-400" />
+        {t('dataLabProviders.providerSettings')}
+        <span className="ml-auto text-[10px] font-normal text-muted-foreground">
+          {settings?.polybacktest_api_key_set ? t('dataLabProviders.configured') : t('dataLabProviders.notConfigured')}
+        </span>
+      </summary>
+      <div className="mt-3 space-y-3">
+        {/* API key */}
+        <div>
+          <Label className="text-[10px] uppercase text-muted-foreground">
+            {t('dataLabProviders.polybacktestApiKey')}
+          </Label>
+          <div className="flex items-center gap-1">
+            <Input
+              type={showKey ? 'text' : 'password'}
+              value={apiKey}
+              onChange={(e) => setApiKey(e.target.value)}
+              placeholder={settings?.polybacktest_api_key_set ? t('dataLabProviders.apiKeyPlaceholderSet') : t('dataLabProviders.apiKeyPlaceholder')}
+              className="h-8 font-mono text-xs"
+            />
+            <Button
+              size="sm"
+              variant="ghost"
+              className="h-8 w-8 p-0"
+              onClick={() => setShowKey((v) => !v)}
+              title={showKey ? t('dataLabProviders.hideKey') : t('dataLabProviders.showKey')}
+            >
+              {showKey ? '🙈' : '👁'}
+            </Button>
+          </div>
+          <p className="mt-0.5 text-[10px] text-muted-foreground" dangerouslySetInnerHTML={{ __html: t('dataLabProviders.apiKeyHelp', { interpolation: { escapeValue: false } }).replace('<a>', '<a href="https://polybacktest.com/dashboard" target="_blank" rel="noreferrer" class="underline">') }} />
+        </div>
+
+        <div>
+          <Label className="text-[10px] uppercase text-muted-foreground">{t('dataLabProviders.baseUrl')}</Label>
+          <Input
+            value={baseUrl}
+            onChange={(e) => setBaseUrl(e.target.value)}
+            placeholder={t('dataLabProviders.baseUrlPlaceholder')}
+            className="h-8 font-mono text-xs"
+          />
+        </div>
+
+        <div className="border-t border-border/30 pt-3">
+          <div className="text-[11px] font-semibold mb-1">{t('dataLabProviders.reverseEngineerDefaults')}</div>
+          <p className="mb-2 text-[10px] text-muted-foreground" dangerouslySetInnerHTML={{ __html: t('dataLabProviders.reverseEngineerDefaultsHelp') }} />
+          <div className="grid grid-cols-2 gap-2">
+            <div>
+              <Label className="text-[10px] uppercase text-muted-foreground">{t('dataLabProviders.maxIterations')}</Label>
+              <Input
+                value={maxIter}
+                onChange={(e) => setMaxIter(e.target.value)}
+                placeholder="10"
+                className="h-8 text-xs"
+              />
+            </div>
+            <div>
+              <Label className="text-[10px] uppercase text-muted-foreground">{t('dataLabProviders.targetScore')}</Label>
+              <Input
+                value={targetScore}
+                onChange={(e) => setTargetScore(e.target.value)}
+                placeholder="0.7"
+                className="h-8 text-xs"
+              />
+            </div>
+            <div>
+              <Label className="text-[10px] uppercase text-muted-foreground">{t('dataLabProviders.maxCostUsd')}</Label>
+              <Input
+                value={maxCost}
+                onChange={(e) => setMaxCost(e.target.value)}
+                placeholder={t('dataLabProviders.maxCostPlaceholder')}
+                className="h-8 text-xs"
+              />
+            </div>
+            <div className="col-span-2">
+              <Label className="text-[10px] uppercase text-muted-foreground">{t('dataLabProviders.maxWalletTrades')}</Label>
+              <Input
+                value={maxTrades}
+                onChange={(e) => setMaxTrades(e.target.value)}
+                placeholder="50000"
+                className="h-8 text-xs"
+              />
+            </div>
+          </div>
+          <p className="mt-1 text-[10px] text-muted-foreground" dangerouslySetInnerHTML={{ __html: t('dataLabProviders.fallbackHelp') }} />
+        </div>
+
+        <div className="flex items-center justify-end gap-2">
+          {saveMutation.isError ? (
+            <span className="text-[10px] text-rose-700 dark:text-rose-300">
+              {(saveMutation.error as Error)?.message || t('dataLabProviders.saveFailed')}
+            </span>
+          ) : null}
+          {saveMutation.isSuccess ? (
+            <span className="text-[10px] text-emerald-700 dark:text-emerald-300">{t('dataLabProviders.saved')}</span>
+          ) : null}
+          <Button
+            size="sm"
+            className="h-7 text-[11px]"
+            onClick={() => saveMutation.mutate()}
+            disabled={saveMutation.isPending}
+          >
+            {saveMutation.isPending ? <Loader2 className="h-3 w-3 animate-spin" /> : t('dataLabProviders.save')}
+          </Button>
+        </div>
+      </div>
+    </details>
+  )
+}
+
+
+// ─── Import panel: pick markets + window, kick off job ──────────────
+
+type MarketTypeFilter = 'all' | '5m' | '15m' | '1h' | '4h' | '24h'
+type ResolvedFilter = 'all' | 'resolved' | 'open'
+
+function PolybacktestImportPanel() {
+  const { t } = useTranslation()
+  const queryClient = useQueryClient()
+  const [coin, setCoin] = useState<(typeof COINS)[number]>('btc')
+  const [search, setSearch] = useState('')
+  const [appliedSearch, setAppliedSearch] = useState('')
+  const [marketType, setMarketType] = useState<MarketTypeFilter>('all')
+  const [resolvedFilter, setResolvedFilter] = useState<ResolvedFilter>('all')
+  const [selected, setSelected] = useState<Set<string>>(new Set())
+  const [hours, setHours] = useState<number>(24 * 7)
+
+  const marketsQuery = useQuery({
+    queryKey: [
+      'polybacktest',
+      'markets',
+      coin,
+      appliedSearch,
+      marketType,
+      resolvedFilter,
+    ],
+    queryFn: () =>
+      listPolybacktestMarkets({
+        coin,
+        search: appliedSearch || undefined,
+        market_type: marketType === 'all' ? undefined : marketType,
+        resolved:
+          resolvedFilter === 'all'
+            ? undefined
+            : resolvedFilter === 'resolved',
+        limit: 100,
+      }),
+    staleTime: 60_000,
+  })
+  const markets: PolybacktestMarket[] = marketsQuery.data?.markets ?? []
+
+  const importMutation = useMutation({
+    mutationFn: () => {
+      // Use each market's ACTUAL window when available — that gives
+      // us the full 5m/15m/1h slice the operator selected, not an
+      // arbitrary "last N days" overlay.  For markets that haven't
+      // closed yet, fall back to the operator's chosen lookback.
+      const selectedMarkets = markets.filter((m) => selected.has(m.market_id))
+      let start: Date
+      let end: Date
+      if (selectedMarkets.length > 0 && selectedMarkets.every((m) => m.start_time && m.end_time)) {
+        const starts = selectedMarkets.map((m) => new Date(m.start_time!).getTime())
+        const ends = selectedMarkets.map((m) => new Date(m.end_time!).getTime())
+        start = new Date(Math.min(...starts))
+        end = new Date(Math.max(...ends))
+      } else {
+        end = new Date()
+        start = new Date(end.getTime() - hours * 3600 * 1000)
+      }
+      return importPolybacktest({
+        coin,
+        market_ids: Array.from(selected),
+        start: start.toISOString(),
+        end: end.toISOString(),
+      })
+    },
+    onSuccess: () => {
+      setSelected(new Set())
+      queryClient.invalidateQueries({ queryKey: ['providers', 'import-jobs'] })
+    },
+  })
+
+  return (
+    <div className="flex min-h-0 flex-col rounded-md border border-border/40 bg-card/40 p-3">
+      <div className="flex items-center justify-between gap-2">
+        <div className="text-xs font-semibold">{t('dataLabProviders.importHistorical')}</div>
+        <Badge variant="outline" className="text-[10px]">{t('dataLabProviders.selectedCount', { n: selected.size })}</Badge>
+      </div>
+
+      <div className="mt-2 grid grid-cols-2 gap-2">
+        <div>
+          <Label className="text-[10px] uppercase text-muted-foreground">{t('dataLabProviders.coin')}</Label>
+          <Select value={coin} onValueChange={(v) => setCoin(v as (typeof COINS)[number])}>
+            <SelectTrigger className="h-8 text-xs"><SelectValue /></SelectTrigger>
+            <SelectContent>
+              {COINS.map((c) => (
+                <SelectItem key={c} value={c} className="text-xs">{c.toUpperCase()}</SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
+        <div>
+          <Label className="text-[10px] uppercase text-muted-foreground">{t('dataLabProviders.horizon')}</Label>
+          <Select value={marketType} onValueChange={(v) => setMarketType(v as MarketTypeFilter)}>
+            <SelectTrigger className="h-8 text-xs"><SelectValue /></SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all" className="text-xs">{t('dataLabProviders.allHorizons')}</SelectItem>
+              {(['5m', '15m', '1h', '4h', '24h'] as const).map((mt) => (
+                <SelectItem key={mt} value={mt} className="text-xs">{mt}</SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
+        <div>
+          <Label className="text-[10px] uppercase text-muted-foreground">{t('dataLabProviders.status')}</Label>
+          <Select value={resolvedFilter} onValueChange={(v) => setResolvedFilter(v as ResolvedFilter)}>
+            <SelectTrigger className="h-8 text-xs"><SelectValue /></SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all" className="text-xs">{t('dataLabProviders.all')}</SelectItem>
+              <SelectItem value="resolved" className="text-xs">{t('dataLabProviders.resolvedOnly')}</SelectItem>
+              <SelectItem value="open" className="text-xs">{t('dataLabProviders.openOnly')}</SelectItem>
+            </SelectContent>
+          </Select>
+        </div>
+        <div>
+          <Label className="text-[10px] uppercase text-muted-foreground">
+            {t('dataLabProviders.fallbackWindow')}
+          </Label>
+          <Select value={String(hours)} onValueChange={(v) => setHours(Number(v))}>
+            <SelectTrigger className="h-8 text-xs"><SelectValue /></SelectTrigger>
+            <SelectContent>
+              {TIME_PRESETS.map((p) => (
+                <SelectItem key={p.hours} value={String(p.hours)} className="text-xs">
+                  {t('dataLabProviders.lastRange', { label: p.label })}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
+      </div>
+
+      <div className="mt-2 flex items-center gap-1">
+        <Input
+          value={search}
+          onChange={(e) => setSearch(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter') setAppliedSearch(search)
+          }}
+          placeholder={t('dataLabProviders.searchMarkets')}
+          className="h-8 text-xs"
+        />
+        <Button
+          size="sm"
+          variant="outline"
+          className="h-8 gap-1 text-[10px]"
+          onClick={() => setAppliedSearch(search)}
+          disabled={marketsQuery.isFetching}
+        >
+          <Search className="h-3 w-3" /> {t('dataLabProviders.search')}
+        </Button>
+      </div>
+
+      <ScrollArea className="mt-2 h-56 rounded-sm border border-border/30 bg-background/40">
+        {marketsQuery.isLoading ? (
+          <div className="flex h-full items-center justify-center text-[11px] text-muted-foreground">
+            <Loader2 className="mr-2 h-3 w-3 animate-spin" /> {t('dataLabProviders.loading')}
+          </div>
+        ) : marketsQuery.isError ? (
+          <div className="p-3 text-[11px] text-rose-700 dark:text-rose-300">
+            {String((marketsQuery.error as Error)?.message || t('dataLabProviders.failedToLoad'))}
+          </div>
+        ) : markets.length === 0 ? (
+          <div className="p-3 text-[11px] text-muted-foreground">{t('dataLabProviders.noMarketsFound')}</div>
+        ) : (
+          <div className="divide-y divide-border/20">
+            {markets.map((m) => {
+              const isSel = selected.has(m.market_id)
+              return (
+                <button
+                  key={m.market_id}
+                  type="button"
+                  onClick={() => {
+                    setSelected((prev) => {
+                      const next = new Set(prev)
+                      if (next.has(m.market_id)) next.delete(m.market_id)
+                      else next.add(m.market_id)
+                      return next
+                    })
+                  }}
+                  className={cn(
+                    'block w-full px-2 py-1.5 text-left text-[11px] transition-colors hover:bg-card/40',
+                    isSel && 'bg-violet-500/10',
+                  )}
+                >
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="checkbox"
+                      checked={isSel}
+                      readOnly
+                      className="h-3 w-3 accent-violet-500"
+                    />
+                    <span className="flex-1 truncate font-medium">{m.title}</span>
+                    {m.winner ? (
+                      <Badge
+                        variant="outline"
+                        className={cn(
+                          'text-[9px]',
+                          m.winner === 'Up'
+                            ? 'border-emerald-500/40 text-emerald-700 dark:text-emerald-300'
+                            : 'border-rose-500/40 text-rose-700 dark:text-rose-300',
+                        )}
+                      >
+                        {m.winner.toUpperCase()}
+                      </Badge>
+                    ) : null}
+                  </div>
+                  <div className="ml-5 flex items-center gap-2 text-[10px] text-muted-foreground">
+                    <span className="font-mono">{m.market_id}</span>
+                    {m.market_type ? <span>· {m.market_type}</span> : null}
+                    {m.final_volume != null ? (
+                      <span>· vol ${m.final_volume.toLocaleString()}</span>
+                    ) : null}
+                  </div>
+                </button>
+              )
+            })}
+          </div>
+        )}
+      </ScrollArea>
+
+      <div className="mt-2 flex items-center justify-between gap-2">
+        <span className="text-[10px] text-muted-foreground">
+          {t('dataLabProviders.depthDescription')}
+        </span>
+        <Button
+          size="sm"
+          className="h-8 gap-1.5 text-[11px]"
+          disabled={selected.size === 0 || importMutation.isPending}
+          onClick={() => importMutation.mutate()}
+        >
+          {importMutation.isPending ? (
+            <Loader2 className="h-3 w-3 animate-spin" />
+          ) : (
+            <Download className="h-3 w-3" />
+          )}
+          {selected.size === 1 ? t('dataLabProviders.importNMarkets', { n: selected.size }) : t('dataLabProviders.importNMarketsPlural', { n: selected.size })}
+        </Button>
+      </div>
+
+      {importMutation.isError ? (
+        <div className="mt-2 rounded-sm border border-rose-500/30 bg-rose-500/5 p-2 text-[10px] text-rose-700 dark:text-rose-300">
+          {String((importMutation.error as Error)?.message || t('dataLabProviders.importFailed'))}
+        </div>
+      ) : null}
+      {importMutation.isSuccess ? (
+        <div className="mt-2 rounded-sm border border-emerald-500/30 bg-emerald-500/5 p-2 text-[10px] text-emerald-700 dark:text-emerald-300" dangerouslySetInnerHTML={{ __html: t('dataLabProviders.jobQueued', { id: importMutation.data.id }) }} />
+      ) : null}
+    </div>
+  )
+}
+
+
+// ─── Active import jobs panel (auto-polling) ─────────────────────────
+
+function PolybacktestActiveJobsPanel() {
+  const { t } = useTranslation()
+  const queryClient = useQueryClient()
+  const jobsQuery = useQuery({
+    queryKey: ['providers', 'import-jobs'],
+    queryFn: () => listImportJobs({ limit: 20 }),
+    refetchInterval: (q) => {
+      const data = q.state.data as ImportJob[] | undefined
+      const anyActive = (data ?? []).some(
+        (j) => j.status === 'queued' || j.status === 'running',
+      )
+      return anyActive ? 2_000 : 30_000
+    },
+  })
+  const jobs: ImportJob[] = jobsQuery.data ?? []
+
+  const cancelMutation = useMutation({
+    mutationFn: (id: string) => cancelImportJob(id),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['providers', 'import-jobs'] }),
+  })
+
+  return (
+    <div className="flex min-h-0 flex-col rounded-md border border-border/40 bg-card/40 p-3">
+      <div className="flex items-center justify-between">
+        <div className="text-xs font-semibold">{t('dataLabProviders.activeImportJobs')}</div>
+        <Badge variant="outline" className="text-[10px]">{jobs.length}</Badge>
+      </div>
+      <ScrollArea className="mt-2 max-h-72">
+        {jobs.length === 0 ? (
+          <div className="px-1 py-4 text-center text-[11px] text-muted-foreground">
+            {t('dataLabProviders.noImportsYet')}
+          </div>
+        ) : (
+          <div className="space-y-1.5">
+            {jobs.map((job) => (
+              <ImportJobRow
+                key={job.id}
+                job={job}
+                onCancel={() => cancelMutation.mutate(job.id)}
+              />
+            ))}
+          </div>
+        )}
+      </ScrollArea>
+    </div>
+  )
+}
+
+
+function statusColor(status: ImportJobStatus): string {
+  switch (status) {
+    case 'completed':
+      return 'border-emerald-500/40 text-emerald-700 dark:text-emerald-300'
+    case 'failed':
+      return 'border-rose-500/40 text-rose-700 dark:text-rose-300'
+    case 'cancelled':
+      return 'border-zinc-500/40 text-zinc-300'
+    case 'running':
+      return 'border-blue-500/40 text-blue-700 dark:text-blue-300'
+    default:
+      return 'border-amber-500/40 text-amber-700 dark:text-amber-300'
+  }
+}
+
+
+function ImportJobRow({ job, onCancel }: { job: ImportJob; onCancel: () => void }) {
+  const { t } = useTranslation()
+  const payload = job.payload as { coin?: string; market_ids?: string[] } | null
+  const coin = payload?.coin ?? '?'
+  const marketCount = payload?.market_ids?.length ?? 0
+  const pct = Math.max(0, Math.min(1, job.progress)) * 100
+  const isActive = job.status === 'queued' || job.status === 'running'
+
+  return (
+    <div className="rounded-sm border border-border/30 bg-background/40 p-2">
+      <div className="flex items-center justify-between gap-2">
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center gap-1.5 text-[11px]">
+            <Badge variant="outline" className={cn('text-[9px]', statusColor(job.status))}>
+              {job.status}
+            </Badge>
+            <span className="font-mono text-[10px] text-muted-foreground">{job.id}</span>
+          </div>
+          <div className="mt-0.5 truncate text-[11px]">
+            {marketCount === 1 ? t('dataLabProviders.marketCount', { coin: coin.toUpperCase(), n: marketCount }) : t('dataLabProviders.marketCountPlural', { coin: coin.toUpperCase(), n: marketCount })}
+          </div>
+          <div className="mt-0.5 truncate text-[10px] text-muted-foreground">
+            {job.message || job.error || t('dataLabProviders.snapshotsInsertedShort', { n: job.snapshots_inserted.toLocaleString() })}
+          </div>
+        </div>
+        {isActive ? (
+          <Button
+            size="sm"
+            variant="ghost"
+            className="h-6 w-6 p-0 text-rose-700 dark:text-rose-300 hover:bg-rose-500/10"
+            onClick={onCancel}
+            title={t('dataLabProviders.cancel')}
+          >
+            <X className="h-3 w-3" />
+          </Button>
+        ) : null}
+      </div>
+      {isActive ? (
+        <div className="mt-1.5 h-1.5 w-full overflow-hidden rounded-full bg-card/40">
+          <div
+            className="h-full rounded-full bg-violet-500/60 transition-all"
+            style={{ width: `${pct.toFixed(1)}%` }}
+          />
+        </div>
+      ) : null}
+      {job.snapshots_inserted > 0 || job.api_calls > 0 ? (
+        <div className="mt-1 flex flex-wrap gap-2 text-[9px] text-muted-foreground">
+          <span>{t('dataLabProviders.apiCalls', { n: job.api_calls.toLocaleString() })}</span>
+          <span>{t('dataLabProviders.snapshotsInserted', { n: job.snapshots_inserted.toLocaleString() })}</span>
+          <span>{t('dataLabProviders.tradesFetched', { n: job.trades_fetched.toLocaleString() })}</span>
+          {job.bytes_downloaded ? (
+            <span>{t('dataLabProviders.kbDownloaded', { n: (job.bytes_downloaded / 1024).toFixed(0) })}</span>
+          ) : null}
+        </div>
+      ) : null}
+    </div>
+  )
+}
+
+
+// ─── Imported datasets panel ─────────────────────────────────────────
+
+function PolybacktestDatasetsPanel() {
+  const { t } = useTranslation()
+  const queryClient = useQueryClient()
+  const datasetsQuery = useQuery({
+    queryKey: ['providers', 'datasets'],
+    queryFn: () => listProviderDatasets({ limit: 200 }),
+    refetchInterval: 30_000,
+  })
+  const rows: ProviderDataset[] = datasetsQuery.data ?? []
+  const deleteMutation = useMutation({
+    mutationFn: (id: string) => deleteProviderDataset(id),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['providers', 'datasets'] }),
+  })
+
+  return (
+    <div className="flex min-h-0 flex-col rounded-md border border-border/40 bg-card/40 p-3">
+      <div className="mb-2 flex items-center justify-between">
+        <div>
+          <div className="flex items-center gap-1.5 text-xs font-semibold">
+            <Database className="h-3.5 w-3.5 text-violet-400" />
+            {t('dataLabProviders.importedDatasets')}
+          </div>
+          <p className="mt-0.5 text-[10px] text-muted-foreground" dangerouslySetInnerHTML={{ __html: t('dataLabProviders.importedDatasetsHint') }} />
+        </div>
+        <Badge variant="outline" className="text-[10px]">{rows.length}</Badge>
+      </div>
+
+      <ScrollArea className="max-h-80">
+        {rows.length === 0 ? (
+          <div className="py-4 text-center text-[11px] text-muted-foreground">
+            {t('dataLabProviders.noDatasetsYet')}
+          </div>
+        ) : (
+          <table className="w-full text-[11px]">
+            <thead className="text-[10px] uppercase text-muted-foreground">
+              <tr className="border-b border-border/30">
+                <th className="px-2 py-1.5 text-left">{t('dataLabProviders.colProvider')}</th>
+                <th className="px-2 py-1.5 text-left">{t('dataLabProviders.colCoin')}</th>
+                <th className="px-2 py-1.5 text-left">{t('dataLabProviders.colMarket')}</th>
+                <th className="px-2 py-1.5 text-right">{t('dataLabProviders.colSnapshots')}</th>
+                <th className="px-2 py-1.5 text-right">{t('dataLabProviders.colTrades')}</th>
+                <th className="px-2 py-1.5 text-left">{t('dataLabProviders.colWindow')}</th>
+                <th className="px-2 py-1.5"></th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((row) => (
+                <tr key={row.id} className="border-b border-border/20 hover:bg-card/30">
+                  <td className="px-2 py-1.5 font-mono text-[10px]">{row.provider}</td>
+                  <td className="px-2 py-1.5 font-mono">{row.coin ?? '—'}</td>
+                  <td className="px-2 py-1.5">
+                    <div className="truncate font-medium">{row.title || row.external_slug || row.external_id}</div>
+                    <div className="truncate font-mono text-[9px] text-muted-foreground">
+                      {row.external_id}
+                    </div>
+                  </td>
+                  <td className="px-2 py-1.5 text-right font-mono">{row.snapshot_count.toLocaleString()}</td>
+                  <td className="px-2 py-1.5 text-right font-mono">{row.trade_count.toLocaleString()}</td>
+                  <td className="px-2 py-1.5 text-[10px] text-muted-foreground">
+                    {row.start_ts ? new Date(row.start_ts).toLocaleDateString() : '—'} →{' '}
+                    {row.end_ts ? new Date(row.end_ts).toLocaleDateString() : '—'}
+                  </td>
+                  <td className="px-2 py-1.5 text-right">
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      className="h-6 w-6 p-0 text-rose-700 dark:text-rose-300 hover:bg-rose-500/10"
+                      onClick={() => {
+                        if (confirm(t('dataLabProviders.confirmDeleteDataset', { title: row.title || row.external_id, n: row.snapshot_count.toLocaleString() }))) {
+                          deleteMutation.mutate(row.id)
+                        }
+                      }}
+                      title={t('dataLabProviders.delete')}
+                    >
+                      <Trash2 className="h-3 w-3" />
+                    </Button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </ScrollArea>
+    </div>
+  )
+}
+
+
+// ─── Polymarket REST backfill ────────────────────────────────────────
+//
+// The "Polymarket" sub-tab synthesizes book snapshots from Polymarket's
+// /prices-history endpoint to fill historical gaps that the live WS
+// recorder didn't reach.  Rows land in the same MarketMicrostructureSnapshot
+// table the recorder writes to (tagged synthetic = true so the
+// backtester can downweight).
+
+const BACKFILL_INTERVAL_KEYS: { value: string; labelKey: string }[] = [
+  { value: '1m', labelKey: 'interval1m' },
+  { value: '1h', labelKey: 'interval1h' },
+  { value: '6h', labelKey: 'interval6h' },
+  { value: '1d', labelKey: 'interval1d' },
+  { value: 'max', labelKey: 'intervalMax' },
+]
+
+const BACKFILL_SCOPE_KEYS: { value: BackfillScope; labelKey: string; hintKey: string }[] = [
+  { value: 'token', labelKey: 'scopeToken', hintKey: 'scopeTokenHint' },
+  { value: 'strategy', labelKey: 'scopeStrategy', hintKey: 'scopeStrategyHint' },
+  { value: 'session', labelKey: 'scopeSession', hintKey: 'scopeSessionHint' },
+  { value: 'catalog_top_liquid', labelKey: 'scopeCatalog', hintKey: 'scopeCatalogHint' },
+]
+
+function PolymarketBackfillFlyout({ open, onClose }: { open: boolean; onClose: () => void }) {
+  const { t } = useTranslation()
+  const [scope, setScope] = useState<BackfillScope>('strategy')
+  const [tokenText, setTokenText] = useState('')
+  const [strategySlug, setStrategySlug] = useState('')
+  const [sessionId, setSessionId] = useState('')
+  const [startInput, setStartInput] = useState('')
+  const [endInput, setEndInput] = useState('')
+  const [lookbackDays, setLookbackDays] = useState('14')
+  const [interval, setInterval] = useState('1h')
+  const [syntheticSpreadBps, setSyntheticSpreadBps] = useState('50')
+  const [catalogMaxTokens, setCatalogMaxTokens] = useState('500')
+  const [catalogMinLiquidity, setCatalogMinLiquidity] = useState('100')
+  const [maxTokens, setMaxTokens] = useState('1000')
+  const [result, setResult] = useState<BackfillResult | null>(null)
+  const [error, setError] = useState<string | null>(null)
+
+  // Sessions list for the picker
+  const sessionsQuery = useQuery({
+    queryKey: ['data-lab', 'recording-sessions-for-backfill'],
+    queryFn: () => listRecordingSessions(undefined, 50),
+    enabled: open && scope === 'session',
+  })
+
+  const queryClient = useQueryClient()
+  const backfillMutation = useMutation({
+    mutationFn: runRecorderBackfill,
+    onSuccess: (data) => {
+      setResult(data)
+      setError(null)
+      queryClient.invalidateQueries({ queryKey: ['data-lab', 'storage'] })
+      queryClient.invalidateQueries({ queryKey: ['data-lab', 'query'] })
+    },
+    onError: (err) => setError((err as Error).message || t('dataLabProviders.errBackfillFailed')),
+  })
+
+  useEffect(() => {
+    if (!open) return
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [open, onClose])
+
+  const submit = () => {
+    setError(null)
+    setResult(null)
+
+    let start: string | undefined
+    let end: string | undefined
+    if (startInput && endInput) {
+      start = new Date(startInput).toISOString()
+      end = new Date(endInput).toISOString()
+    } else {
+      const days = parseInt(lookbackDays, 10) || 14
+      const e = new Date()
+      const s = new Date(e.getTime() - days * 24 * 3600 * 1000)
+      start = s.toISOString()
+      end = e.toISOString()
+    }
+
+    const payload: any = {
+      scope,
+      start,
+      end,
+      interval,
+      synthetic_spread_bps: parseFloat(syntheticSpreadBps) || 50,
+      catalog_max_tokens: parseInt(catalogMaxTokens, 10) || 500,
+      catalog_min_liquidity_usd: parseFloat(catalogMinLiquidity) || 100,
+      max_tokens: parseInt(maxTokens, 10) || 1000,
+      concurrency: 5,
+    }
+    if (scope === 'token') {
+      const tokens = tokenText.split(/[\s,]+/).map((s) => s.trim()).filter(Boolean)
+      if (tokens.length === 0) { setError(t('dataLabProviders.errProvideToken')); return }
+      payload.target_values = tokens
+    } else if (scope === 'strategy') {
+      if (!strategySlug.trim()) { setError(t('dataLabProviders.errProvideStrategy')); return }
+      payload.strategy_slug = strategySlug.trim()
+    } else if (scope === 'session') {
+      if (!sessionId) { setError(t('dataLabProviders.errPickSession')); return }
+      payload.session_id = sessionId
+    }
+    backfillMutation.mutate(payload)
+  }
+
+  return (
+    <>
+      <div
+        className={cn(
+          'fixed inset-0 z-40 bg-black/40 backdrop-blur-sm transition-opacity',
+          open ? 'opacity-100' : 'pointer-events-none opacity-0',
+        )}
+        onClick={onClose}
+      />
+      <div
+        className={cn(
+          'fixed inset-y-0 right-0 z-50 flex w-[520px] max-w-[95vw] flex-col border-l border-border/60 bg-background/95 shadow-2xl backdrop-blur transition-transform duration-200',
+          open ? 'translate-x-0' : 'translate-x-full',
+        )}
+      >
+        <div className="flex items-center justify-between border-b border-border/40 px-4 py-3">
+          <div className="flex items-center gap-2">
+            <Download className="h-4 w-4 text-violet-700 dark:text-violet-300 rotate-180" />
+            <div>
+              <div className="text-sm font-semibold leading-tight">{t('dataLabProviders.backfillTitle')}</div>
+              <div className="text-[10px] text-muted-foreground leading-tight">
+                {t('dataLabProviders.backfillSub')}
+              </div>
+            </div>
+          </div>
+          <button
+            onClick={onClose}
+            className="rounded-sm p-1 text-muted-foreground hover:bg-muted/40 hover:text-foreground"
+          >
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+
+        <ScrollArea className="flex-1 min-h-0">
+          <div className="space-y-4 p-4">
+            {/* Caveat banner */}
+            <div className="rounded-md border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-[11px] text-amber-700 dark:text-amber-300">
+              <div className="font-medium">{t('dataLabProviders.syntheticDataCaveat')}</div>
+              <div className="mt-1 text-amber-700/90 dark:text-amber-300/90" dangerouslySetInnerHTML={{ __html: t('dataLabProviders.syntheticDataCaveatBody') }} />
+            </div>
+
+            {/* Scope */}
+            <div className="space-y-2 rounded-md border border-border/40 bg-card/30 p-3">
+              <div className="text-[10px] uppercase tracking-wide text-muted-foreground">{t('dataLabProviders.scope')}</div>
+              <div className="grid grid-cols-2 gap-1.5">
+                {BACKFILL_SCOPE_KEYS.map((o) => {
+                  const active = scope === o.value
+                  return (
+                    <button
+                      key={o.value}
+                      onClick={() => setScope(o.value)}
+                      className={cn(
+                        'rounded-sm border px-2 py-1.5 text-left transition-colors',
+                        active
+                          ? 'border-violet-500/50 bg-violet-500/10 text-violet-700 dark:text-violet-300'
+                          : 'border-border/40 text-muted-foreground hover:text-foreground',
+                      )}
+                    >
+                      <div className="text-[11px] font-medium">{t(`dataLabProviders.${o.labelKey}`)}</div>
+                      <div className="text-[9px] text-muted-foreground/80">{t(`dataLabProviders.${o.hintKey}`)}</div>
+                    </button>
+                  )
+                })}
+              </div>
+
+              {scope === 'token' ? (
+                <div className="space-y-1">
+                  <Label className="text-[10px]">{t('dataLabProviders.tokenIdsLabel')}</Label>
+                  <textarea
+                    value={tokenText}
+                    onChange={(e) => setTokenText(e.target.value)}
+                    placeholder={t('dataLabProviders.tokenIdsPlaceholder')}
+                    className="min-h-[80px] w-full rounded-sm border border-border/40 bg-background/60 px-2 py-1.5 font-mono text-[11px]"
+                  />
+                </div>
+              ) : null}
+
+              {scope === 'strategy' ? (
+                <div className="space-y-1">
+                  <Label className="text-[10px]">{t('dataLabProviders.strategySlug')}</Label>
+                  <Input
+                    value={strategySlug}
+                    onChange={(e) => setStrategySlug(e.target.value)}
+                    placeholder={t('dataLabProviders.strategySlugPlaceholder')}
+                    className="h-8 text-[12px]"
+                  />
+                  <div className="text-[10px] text-muted-foreground">
+                    {t('dataLabProviders.strategySlugHint')}
+                  </div>
+                </div>
+              ) : null}
+
+              {scope === 'session' ? (
+                <div className="space-y-1">
+                  <Label className="text-[10px]">{t('dataLabProviders.recordingSession')}</Label>
+                  <select
+                    value={sessionId}
+                    onChange={(e) => setSessionId(e.target.value)}
+                    className="h-8 w-full rounded-md border border-input bg-background px-3 text-[11px]"
+                  >
+                    <option value="">{t('dataLabProviders.pickSession')}</option>
+                    {(sessionsQuery.data ?? []).map((s) => (
+                      <option key={s.id} value={s.id}>
+                        {t('dataLabProviders.sessionOptionLabel', { name: s.name, status: s.status, n: s.target_token_ids.length })}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              ) : null}
+
+              {scope === 'catalog_top_liquid' ? (
+                <div className="grid grid-cols-2 gap-2">
+                  <div className="space-y-1">
+                    <Label className="text-[10px]">{t('dataLabProviders.capTokens')}</Label>
+                    <Input
+                      type="number"
+                      min={10}
+                      max={5000}
+                      value={catalogMaxTokens}
+                      onChange={(e) => setCatalogMaxTokens(e.target.value)}
+                      className="h-8 text-[12px]"
+                    />
+                  </div>
+                  <div className="space-y-1">
+                    <Label className="text-[10px]">{t('dataLabProviders.minLiquidityUsd')}</Label>
+                    <Input
+                      type="number"
+                      min={0}
+                      value={catalogMinLiquidity}
+                      onChange={(e) => setCatalogMinLiquidity(e.target.value)}
+                      className="h-8 text-[12px]"
+                    />
+                  </div>
+                </div>
+              ) : null}
+            </div>
+
+            {/* Window + cadence */}
+            <div className="space-y-2 rounded-md border border-border/40 bg-card/30 p-3">
+              <div className="text-[10px] uppercase tracking-wide text-muted-foreground">
+                {t('dataLabProviders.windowCadence')}
+              </div>
+              <div className="grid grid-cols-2 gap-2">
+                <div className="space-y-1">
+                  <Label className="text-[10px]">{t('dataLabProviders.lookbackDays')}</Label>
+                  <Input
+                    type="number"
+                    min={1}
+                    max={180}
+                    value={lookbackDays}
+                    onChange={(e) => setLookbackDays(e.target.value)}
+                    className="h-8 text-[12px]"
+                  />
+                </div>
+                <div className="space-y-1">
+                  <Label className="text-[10px]">{t('dataLabProviders.intervalFidelity')}</Label>
+                  <select
+                    value={interval}
+                    onChange={(e) => setInterval(e.target.value)}
+                    className="h-8 w-full rounded-md border border-input bg-background px-3 text-[11px]"
+                  >
+                    {BACKFILL_INTERVAL_KEYS.map((i) => (
+                      <option key={i.value} value={i.value}>{t(`dataLabProviders.${i.labelKey}`)}</option>
+                    ))}
+                  </select>
+                </div>
+                <div className="space-y-1">
+                  <Label className="text-[10px]">{t('dataLabProviders.startOverridesLookback')}</Label>
+                  <Input
+                    type="datetime-local"
+                    value={startInput}
+                    onChange={(e) => setStartInput(e.target.value)}
+                    className="h-8 text-[12px]"
+                  />
+                </div>
+                <div className="space-y-1">
+                  <Label className="text-[10px]">{t('dataLabProviders.endLabel')}</Label>
+                  <Input
+                    type="datetime-local"
+                    value={endInput}
+                    onChange={(e) => setEndInput(e.target.value)}
+                    className="h-8 text-[12px]"
+                  />
+                </div>
+              </div>
+            </div>
+
+            {/* Synth + caps */}
+            <div className="space-y-2 rounded-md border border-border/40 bg-card/30 p-3">
+              <div className="text-[10px] uppercase tracking-wide text-muted-foreground">
+                {t('dataLabProviders.synthCaps')}
+              </div>
+              <div className="grid grid-cols-2 gap-2">
+                <div className="space-y-1">
+                  <Label className="text-[10px]">{t('dataLabProviders.syntheticSpreadBps')}</Label>
+                  <Input
+                    type="number"
+                    min={1}
+                    max={1000}
+                    value={syntheticSpreadBps}
+                    onChange={(e) => setSyntheticSpreadBps(e.target.value)}
+                    className="h-8 text-[12px]"
+                  />
+                </div>
+                <div className="space-y-1">
+                  <Label className="text-[10px]">{t('dataLabProviders.maxTokensCap')}</Label>
+                  <Input
+                    type="number"
+                    min={10}
+                    max={10000}
+                    value={maxTokens}
+                    onChange={(e) => setMaxTokens(e.target.value)}
+                    className="h-8 text-[12px]"
+                  />
+                </div>
+              </div>
+            </div>
+
+            {error ? (
+              <div className="rounded-sm bg-rose-500/10 px-3 py-2 text-[12px] text-rose-700 dark:text-rose-300">{error}</div>
+            ) : null}
+
+            {result ? (
+              <div className="rounded-md border border-emerald-500/30 bg-emerald-500/5 p-3 text-[11px]">
+                <div className="font-medium text-emerald-700 dark:text-emerald-300">{t('dataLabProviders.backfillComplete')}</div>
+                <div className="mt-1 grid grid-cols-2 gap-1 text-emerald-700 dark:text-emerald-300">
+                  <div>{t('dataLabProviders.backfillJob')} <span className="font-mono">{result.job_id}</span></div>
+                  <div>{t('dataLabProviders.backfillDuration', { n: result.duration_seconds.toFixed(1) })}</div>
+                  <div>{t('dataLabProviders.backfillTokensTargeted')} <strong>{result.target_token_count.toLocaleString()}</strong></div>
+                  <div>{t('dataLabProviders.backfillTokensWithData', { n: result.tokens_with_data.toLocaleString() })}</div>
+                  <div>{t('dataLabProviders.backfillRowsInserted')} <strong>{result.rows_inserted_total.toLocaleString()}</strong></div>
+                  <div>{t('dataLabProviders.backfillPointsFetched', { n: result.points_fetched_total.toLocaleString() })}</div>
+                  <div>{t('dataLabProviders.backfillExistingSkipped', { n: result.skipped_existing_total.toLocaleString() })}</div>
+                  <div>{t('dataLabProviders.backfillErrorsCount', { n: result.tokens_with_errors })}</div>
+                </div>
+                {result.tokens_with_errors > 0 ? (
+                  <details className="mt-2">
+                    <summary className="cursor-pointer text-rose-700 dark:text-rose-300">
+                      {t('dataLabProviders.backfillFailedTokens', { n: result.tokens_with_errors })}
+                    </summary>
+                    <div className="mt-1 max-h-[140px] space-y-0.5 overflow-y-auto">
+                      {result.per_token.filter((tk) => tk.error).slice(0, 50).map((tk) => (
+                        <div key={tk.token_id} className="font-mono text-[10px] text-rose-700 dark:text-rose-300/90">
+                          {tk.token_id.slice(0, 14)} — {tk.error}
+                        </div>
+                      ))}
+                    </div>
+                  </details>
+                ) : null}
+              </div>
+            ) : null}
+          </div>
+        </ScrollArea>
+
+        <div className="flex items-center justify-between gap-2 border-t border-border/40 px-4 py-3">
+          <span className="text-[10px] text-muted-foreground">
+            {t('dataLabProviders.backfillIdempotent')}
+          </span>
+          <div className="flex items-center gap-2">
+            <Button size="sm" variant="outline" className="h-8 text-[11px]" onClick={onClose}>
+              {t('dataLabProviders.close')}
+            </Button>
+            <Button
+              size="sm"
+              className="h-8 gap-1 text-[11px]"
+              onClick={submit}
+              disabled={backfillMutation.isPending}
+            >
+              {backfillMutation.isPending ? (
+                <Loader2 className="h-3 w-3 animate-spin" />
+              ) : (
+                <Download className="h-3 w-3 rotate-180" />
+              )}
+              {t('dataLabProviders.runBackfill')}
+            </Button>
+          </div>
+        </div>
+      </div>
+    </>
+  )
+}
+
+function PolymarketSection() {
+  const { t } = useTranslation()
+  const [open, setOpen] = useState(false)
+  return (
+    <div className="flex min-h-0 flex-1 flex-col gap-3">
+      <div className="rounded-md border border-border/40 bg-card/40 p-3">
+        <div className="flex items-start justify-between gap-3">
+          <div className="min-w-0">
+            <div className="flex items-center gap-2">
+              <span className="text-sm font-semibold">{t('dataLabProviders.polymarketLabel')}</span>
+              <Badge variant="outline" className="gap-1 border-emerald-500/40 text-emerald-700 dark:text-emerald-300">
+                <CheckCircle2 className="h-3 w-3" />
+                {t('dataLabProviders.polymarketBuiltIn')}
+              </Badge>
+            </div>
+            <p className="mt-1 text-[11px] text-muted-foreground">
+              {t('dataLabProviders.polymarketDescription')}
+            </p>
+          </div>
+        </div>
+      </div>
+
+      <div className="rounded-md border border-border/40 bg-card/30">
+        <div className="flex items-center justify-between border-b border-border/30 px-3 py-2">
+          <div className="flex items-center gap-2">
+            <Download className="h-3.5 w-3.5 rotate-180 text-violet-700 dark:text-violet-300" />
+            <span className="text-xs font-semibold">{t('dataLabProviders.restBackfill')}</span>
+            <span className="text-[10px] text-muted-foreground">
+              {t('dataLabProviders.restBackfillSub')}
+            </span>
+          </div>
+          <Button
+            size="sm"
+            variant="outline"
+            className="h-6 gap-1 text-[10px]"
+            onClick={() => setOpen(true)}
+          >
+            <Download className="h-3 w-3 rotate-180" />
+            {t('dataLabProviders.newBackfill')}
+          </Button>
+        </div>
+        <div className="px-3 py-2 text-[10px] text-muted-foreground">
+          {t('dataLabProviders.restBackfillBody')}
+        </div>
+      </div>
+      <PolymarketBackfillFlyout open={open} onClose={() => setOpen(false)} />
+    </div>
+  )
+}
+
+
+// ─── Parquet sub-tab ───────────────────────────────────────────────────
+//
+// Local-single-user shop: there's no upload UI.  The operator copies
+// parquet files into ``HOMERUN_PARQUET_ROOT`` (the path is shown in the
+// header card so they know where) using whatever tool — Explorer,
+// scp, rsync, a download script — and hits Rescan.  The backtester's
+// source resolver picks up parquet-covered tokens automatically on
+// the next run.
+//
+// Files must follow the layout in services/external_data/parquet_schema.py:
+//   {root}/{provider}/{coin}/{startISO}__{endISO}/{kind}__{token_id}.parquet
+//
+// The auto-discovery scanner also runs once every 60s when a backtest
+// kicks off, so a file dropped just before pressing Run is picked up
+// without an explicit Rescan press.
+
+function ParquetSection() {
+  const queryClient = useQueryClient()
+  const rootQuery = useQuery({
+    queryKey: ['providers', 'parquet', 'root'],
+    queryFn: getParquetRoot,
+    staleTime: 5 * 60_000,
+  })
+  const datasetsQuery = useQuery({
+    queryKey: ['providers', 'parquet', 'datasets'],
+    queryFn: listParquetDatasets,
+    staleTime: 30_000,
+  })
+  const rescanMutation = useMutation({
+    mutationFn: rescanParquetRoot,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['providers', 'parquet', 'datasets'] })
+    },
+  })
+
+  // Multi-root edit state.  ``drafts`` is the working list the
+  // operator is editing; we sync from the server's ``overrides`` on
+  // first load and whenever the persisted list changes (e.g. another
+  // tab edited).  Save persists the entire list as a full
+  // replacement.  Add/Remove mutate the draft locally.
+  const [drafts, setDrafts] = useState<string[]>([])
+  const [saveError, setSaveError] = useState<string | null>(null)
+  const serverOverrides: string[] = useMemo(
+    () => rootQuery.data?.overrides ?? [],
+    [rootQuery.data],
+  )
+  const serverRoots = rootQuery.data?.roots ?? []
+  const serverSource = rootQuery.data?.source ?? 'default'
+  useEffect(() => {
+    setDrafts(serverOverrides.length > 0 ? [...serverOverrides] : [])
+  }, [serverOverrides])
+
+  const saveMutation = useMutation({
+    mutationFn: async (next: string[]) => {
+      // Drop empty / whitespace-only entries before sending — backend
+      // does the same de-dupe but UX feels cleaner if obvious junk
+      // never reaches the wire.
+      const cleaned = next.map((s) => s.trim()).filter((s) => s.length > 0)
+      return setParquetRoots(cleaned)
+    },
+    onSuccess: (data) => {
+      setSaveError(null)
+      queryClient.setQueryData(['providers', 'parquet', 'root'], data)
+      queryClient.invalidateQueries({ queryKey: ['providers', 'parquet', 'datasets'] })
+    },
+    onError: (err: unknown) => {
+      const msg =
+        (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail
+        ?? (err instanceof Error ? err.message : 'failed to save')
+      setSaveError(msg)
+    },
+  })
+
+  const datasets = datasetsQuery.data ?? []
+  const lastReport: ParquetRescanReport | undefined = rescanMutation.data
+
+  // Dirty-check: any draft entry differs from the corresponding
+  // server entry, OR the lengths differ.
+  const cleanedDrafts = drafts.map((s) => s.trim()).filter((s) => s.length > 0)
+  const isDirty =
+    cleanedDrafts.length !== serverOverrides.length
+    || cleanedDrafts.some((d, i) => d !== serverOverrides[i])
+
+  const sourceLabel =
+    serverSource === 'configured'
+      ? `${serverRoots.length} configured`
+      : 'default location (no overrides set)'
+
+  const updateDraft = (idx: number, value: string) => {
+    setDrafts((prev) => prev.map((p, i) => (i === idx ? value : p)))
+    setSaveError(null)
+  }
+  const removeDraft = (idx: number) => {
+    setDrafts((prev) => prev.filter((_, i) => i !== idx))
+    setSaveError(null)
+  }
+  const addDraft = () => {
+    setDrafts((prev) => [...prev, ''])
+    setSaveError(null)
+  }
+
+  return (
+    <div className="flex h-full min-h-0 flex-col gap-3">
+      {/* Storage roots — operator drops parquet files into any of these directories. */}
+      <div className="rounded-md border border-border/40 bg-card/40 p-3">
+        <div className="flex items-start justify-between gap-3">
+          <div className="min-w-0 flex-1">
+            <div className="flex items-center gap-1.5">
+              <Database className="h-3.5 w-3.5 text-violet-400" />
+              <span className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
+                Parquet storage roots
+              </span>
+              <span className="text-[10px] text-muted-foreground">· {sourceLabel}</span>
+            </div>
+
+            {/* When falling back to default and no drafts are being
+                edited yet, surface the active default path so the
+                operator knows where to drop files.  Server-effective
+                roots take precedence over the (empty) drafts list. */}
+            {drafts.length === 0 && serverRoots.length > 0 && serverSource === 'default' ? (
+              <div className="mt-1.5 rounded-sm border border-border/30 bg-background/40 px-2 py-1.5 text-[10px] text-muted-foreground">
+                <span className="uppercase tracking-wide text-[9px] mr-1">Active default</span>
+                <code className="font-mono text-[10.5px] text-foreground">{serverRoots[0].path}</code>
+                {!serverRoots[0].exists ? (
+                  <span className="ml-2 text-amber-500">(does not exist)</span>
+                ) : null}
+              </div>
+            ) : null}
+
+            {/* One row per draft entry.  Existence dot reflects the
+                SERVER's view (we don't probe the filesystem from the
+                browser) — only updates after Save. */}
+            <div className="mt-1.5 space-y-1.5">
+              {drafts.map((d, i) => {
+                const serverEntry = serverRoots.find((r) => r.path === d.trim())
+                const exists = serverEntry?.exists ?? null
+                return (
+                  <div key={i} className="flex items-center gap-2">
+                    <span
+                      className={cn(
+                        'h-2 w-2 shrink-0 rounded-full',
+                        exists === true && 'bg-emerald-500',
+                        exists === false && 'bg-red-500',
+                        exists === null && 'bg-muted-foreground/40',
+                      )}
+                      title={
+                        exists === true
+                          ? 'Directory exists on the server'
+                          : exists === false
+                            ? 'Directory does NOT exist on the server'
+                            : 'Status will appear after Save'
+                      }
+                    />
+                    <Input
+                      value={d}
+                      onChange={(e) => updateDraft(i, e.target.value)}
+                      placeholder={i === 0 ? 'C:\\path\\to\\parquet' : 'Additional root...'}
+                      disabled={saveMutation.isPending}
+                      className="h-7 flex-1 font-mono text-[11px]"
+                      spellCheck={false}
+                    />
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      className="h-7 w-7 p-0 text-muted-foreground hover:bg-red-500/15 hover:text-red-600 dark:hover:text-red-400"
+                      onClick={() => removeDraft(i)}
+                      disabled={saveMutation.isPending}
+                      title="Remove this root"
+                    >
+                      <X className="h-3 w-3" />
+                    </Button>
+                  </div>
+                )
+              })}
+              <div className="flex items-center gap-2">
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="h-7 gap-1 text-[10px]"
+                  onClick={addDraft}
+                  disabled={saveMutation.isPending}
+                >
+                  + Add root
+                </Button>
+                {isDirty ? (
+                  <>
+                    <Button
+                      size="sm"
+                      variant="default"
+                      className="h-7 gap-1 text-[10px]"
+                      disabled={saveMutation.isPending}
+                      onClick={() => saveMutation.mutate(drafts)}
+                    >
+                      {saveMutation.isPending ? <Loader2 className="h-3 w-3 animate-spin" /> : null}
+                      Save changes
+                    </Button>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      className="h-7 text-[10px]"
+                      onClick={() => { setDrafts([...serverOverrides]); setSaveError(null) }}
+                      disabled={saveMutation.isPending}
+                    >
+                      Reset
+                    </Button>
+                  </>
+                ) : null}
+              </div>
+            </div>
+
+            <p className="mt-2 text-[10px] text-muted-foreground">
+              Configure one or more directories.  The scanner walks each
+              one and discovers parquet files following the layout{' '}
+              <code className="text-[10px]">
+                {'{provider}/{coin}/{startISO}__{endISO}/{kind}__{token_id}.parquet'}
+              </code>
+              .
+            </p>
+            {saveError && (
+              <p className="mt-1 text-[10px] text-red-500">{saveError}</p>
+            )}
+          </div>
+          <Button
+            size="sm"
+            variant="outline"
+            className="h-7 gap-1 text-[10px] shrink-0"
+            disabled={rescanMutation.isPending}
+            onClick={() => rescanMutation.mutate()}
+          >
+            {rescanMutation.isPending ? (
+              <Loader2 className="h-3 w-3 animate-spin" />
+            ) : (
+              <Search className="h-3 w-3" />
+            )}
+            Rescan
+          </Button>
+        </div>
+        {lastReport && (
+          <div className="mt-2 rounded border border-border/30 bg-muted/20 p-2 text-[10px] text-muted-foreground">
+            Last rescan: <span className="font-medium">{lastReport.groups_seen}</span> group(s) across{' '}
+            <span className="font-medium">{lastReport.roots?.length ?? 1}</span> root(s) in{' '}
+            {lastReport.elapsed_ms.toFixed(0)} ms.
+            {lastReport.per_root && lastReport.per_root.length > 1 ? (
+              <div className="mt-1 space-y-0.5">
+                {lastReport.per_root.map((pr, i) => (
+                  <div key={i} className="font-mono text-[9.5px]">
+                    <span className={cn(
+                      'mr-1.5 inline-block h-1.5 w-1.5 rounded-full align-middle',
+                      pr.exists ? 'bg-emerald-500' : 'bg-red-500',
+                    )} />
+                    {pr.root} → {pr.groups_seen} group(s)
+                  </div>
+                ))}
+              </div>
+            ) : null}
+            {lastReport.results.some((r) => r.error) && (
+              <span className="ml-1 text-amber-500">
+                {lastReport.results.filter((r) => r.error).length} group(s) errored.
+              </span>
+            )}
+          </div>
+        )}
+      </div>
+
+      {/* Catalog table */}
+      <div className="flex-1 min-h-0 rounded-md border border-border/40 bg-card/40">
+        <div className="border-b border-border/30 px-3 py-2 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
+          Discovered datasets ({datasets.length})
+        </div>
+        {datasetsQuery.isLoading ? (
+          <div className="flex h-32 items-center justify-center text-xs text-muted-foreground">
+            <Loader2 className="mr-2 h-4 w-4 animate-spin" /> Loading…
+          </div>
+        ) : datasets.length === 0 ? (
+          <div className="px-3 py-6 text-center text-[11px] text-muted-foreground">
+            No parquet datasets discovered yet.  Drop files into the storage
+            root above and hit Rescan.
+          </div>
+        ) : (
+          <ScrollArea className="h-full">
+            <table className="w-full text-[11px]">
+              <thead className="sticky top-0 bg-card/95 backdrop-blur">
+                <tr className="border-b border-border/30 text-left text-[10px] uppercase tracking-wide text-muted-foreground">
+                  <th className="px-3 py-2 font-medium">Provider</th>
+                  <th className="px-3 py-2 font-medium">Coin</th>
+                  <th className="px-3 py-2 font-medium">Window</th>
+                  <th className="px-3 py-2 text-right font-medium">Tokens</th>
+                  <th className="px-3 py-2 text-right font-medium">Snapshots</th>
+                  <th className="px-3 py-2 text-right font-medium">Trades</th>
+                  <th className="px-3 py-2 font-medium">Last imported</th>
+                </tr>
+              </thead>
+              <tbody>
+                {datasets.map((d: ParquetDataset) => (
+                  <tr
+                    key={d.id}
+                    className="border-b border-border/20 hover:bg-muted/20"
+                  >
+                    <td className="px-3 py-1.5 font-mono">{d.provider}</td>
+                    <td className="px-3 py-1.5 font-mono">{d.coin ?? '—'}</td>
+                    <td className="px-3 py-1.5 text-muted-foreground">
+                      {d.start_ts && d.end_ts
+                        ? `${d.start_ts.slice(0, 10)} → ${d.end_ts.slice(0, 10)}`
+                        : '—'}
+                    </td>
+                    <td className="px-3 py-1.5 text-right tabular-nums">
+                      {d.token_count.toLocaleString()}
+                    </td>
+                    <td className="px-3 py-1.5 text-right tabular-nums">
+                      {d.snapshot_count.toLocaleString()}
+                    </td>
+                    <td className="px-3 py-1.5 text-right tabular-nums">
+                      {d.trade_count.toLocaleString()}
+                    </td>
+                    <td className="px-3 py-1.5 text-[10px] text-muted-foreground">
+                      {d.last_imported_at
+                        ? d.last_imported_at.replace('T', ' ').slice(0, 19)
+                        : '—'}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </ScrollArea>
+        )}
+      </div>
+    </div>
+  )
+}

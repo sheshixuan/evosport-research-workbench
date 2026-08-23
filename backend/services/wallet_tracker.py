@@ -1,0 +1,304 @@
+import asyncio
+import re
+from typing import Optional
+
+from sqlalchemy import select, update
+
+from models.database import AsyncSessionLocal, TrackedWallet, WalletTrade, release_conn
+from services.pause_state import global_pause_state
+from services.polymarket import polymarket_client
+from utils.logger import get_logger
+
+logger = get_logger("wallet_tracker")
+
+
+_ETH_ADDRESS_RE = re.compile(r"^0x[a-fA-F0-9]{40}$")
+
+
+class WalletTracker:
+    """Track specific wallets for trade activity"""
+
+    def __init__(self):
+        self.client = polymarket_client
+        self.tracked_wallets: dict[str, dict] = {}  # In-memory cache with positions/trades
+        self._running = False
+        self._callbacks: list[callable] = []
+        self._initialized = False
+        self._username_cache: dict[str, str] = {}  # address -> username
+
+    def add_callback(self, callback: callable):
+        """Add callback for new trade notifications"""
+        self._callbacks.append(callback)
+
+    async def _ensure_initialized(self):
+        """Load wallets from database on first access"""
+        if self._initialized:
+            return
+
+        pending_updates: list[tuple[str, str, str | None, str | None, str | None]] = []
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(select(TrackedWallet))
+            db_wallets = result.scalars().all()
+
+            async with release_conn(session):
+                for wallet in db_wallets:
+                    stored_address = str(wallet.address or "").strip().lower()
+                    resolved_address = stored_address
+                    resolved_username = None
+
+                    if stored_address and not _ETH_ADDRESS_RE.match(stored_address):
+                        try:
+                            resolved = await self.client.resolve_wallet_identifier(stored_address)
+                            resolved_address = str(resolved.get("address") or "").strip().lower()
+                            resolved_username = str(resolved.get("username") or "").strip() or None
+                        except Exception:
+                            resolved_address = stored_address
+
+                    pending_updates.append(
+                        (
+                            str(wallet.address or "").strip().lower(),
+                            resolved_address,
+                            resolved_username,
+                            str(wallet.label or "").strip() or None,
+                            wallet.added_at.isoformat() if wallet.added_at else None,
+                        )
+                    )
+
+            for stored_address, resolved_address, resolved_username, wallet_label, added_at_iso in pending_updates:
+                if resolved_address and resolved_address != stored_address and _ETH_ADDRESS_RE.match(resolved_address):
+                    existing_resolved = await session.get(TrackedWallet, resolved_address)
+                    if existing_resolved is None:
+                        session.add(
+                            TrackedWallet(
+                                address=resolved_address,
+                                label=wallet_label or resolved_address[:10] + "...",
+                            )
+                        )
+                    await session.execute(
+                        update(WalletTrade)
+                        .where(WalletTrade.wallet_address == stored_address)
+                        .values(wallet_address=resolved_address)
+                    )
+                    original_wallet = await session.get(TrackedWallet, stored_address)
+                    if original_wallet is not None:
+                        await session.delete(original_wallet)
+                    await session.commit()
+
+                cache_key = resolved_address or stored_address
+                display_address = resolved_address or stored_address
+                self.tracked_wallets[cache_key] = {
+                    "address": display_address,
+                    "label": wallet_label or display_address[:10] + "...",
+                    "username": resolved_username,
+                    "last_trade_id": None,
+                    "positions": [],
+                    "recent_trades": [],
+                    "added_at": added_at_iso,
+                }
+
+        self._initialized = True
+
+    async def _lookup_username(self, address: str) -> Optional[str]:
+        """Look up Polymarket username for an address, with caching."""
+        address_lower = address.lower()
+        if address_lower in self._username_cache:
+            return self._username_cache[address_lower]
+
+        try:
+            profile = await self.client.get_user_profile(address)
+            username = profile.get("username")
+            if username:
+                self._username_cache[address_lower] = username
+                return username
+        except Exception as e:
+            logger.warning("Username lookup failed for %s", address, exc_info=e)
+
+        return None
+
+    async def add_wallet(
+        self,
+        address: str,
+        label: Optional[str] = None,
+        *,
+        fetch_initial: bool = True,
+    ):
+        """Add a wallet to track (persisted to database).
+
+        Parameters
+        ----------
+        address : str
+            Wallet address to track.
+        label : str | None
+            Optional display label.
+        fetch_initial : bool
+            When True, fetch username/positions/trades immediately.
+            Group operations can set this to False to avoid expensive
+            N-wallet bootstrap calls in a single request.
+        """
+        await self._ensure_initialized()
+        raw_address = str(address or "").strip()
+        resolved_username = None
+        if _ETH_ADDRESS_RE.match(raw_address):
+            resolved_address = raw_address.lower()
+        else:
+            resolved = await self.client.resolve_wallet_identifier(raw_address)
+            resolved_address = str(resolved.get("address") or "").strip().lower()
+            resolved_username = str(resolved.get("username") or "").strip() or None
+
+        if not _ETH_ADDRESS_RE.match(resolved_address):
+            raise ValueError(f"Could not resolve wallet identifier '{address}' to an on-chain address")
+
+        address_lower = resolved_address
+
+        # Add to database
+        async with AsyncSessionLocal() as session:
+            existing = await session.get(TrackedWallet, address_lower)
+            if not existing:
+                wallet = TrackedWallet(address=address_lower, label=label or resolved_address[:10] + "...")
+                session.add(wallet)
+                await session.commit()
+
+        username = resolved_username
+        if fetch_initial:
+            looked_up = await self._lookup_username(resolved_address)
+            if looked_up:
+                username = looked_up
+
+        # Add to in-memory cache
+        self.tracked_wallets[address_lower] = {
+            "address": resolved_address,
+            "label": label or resolved_address[:10] + "...",
+            "username": username,
+            "last_trade_id": None,
+            "positions": [],
+            "recent_trades": [],
+        }
+
+        # Fetch initial state only when requested.
+        if fetch_initial:
+            await self._update_wallet(resolved_address)
+
+    async def remove_wallet(self, address: str):
+        """Remove a wallet from tracking"""
+        address_lower = address.lower()
+
+        # Remove from database
+        async with AsyncSessionLocal() as session:
+            wallet = await session.get(TrackedWallet, address_lower)
+            if wallet:
+                await session.delete(wallet)
+                await session.commit()
+
+        # Remove from in-memory cache
+        self.tracked_wallets.pop(address_lower, None)
+
+    async def _update_wallet(self, address: str) -> list[dict]:
+        """Update wallet state and return new trades"""
+        address_lower = address.lower()
+        wallet = self.tracked_wallets.get(address_lower)
+        if not wallet:
+            return []
+
+        new_trades = []
+
+        try:
+            # Refresh username if not cached yet
+            if not wallet.get("username"):
+                username = await self._lookup_username(address)
+                if username:
+                    wallet["username"] = username
+
+            # Fetch positions
+            positions = await self.client.get_wallet_positions(address)
+            wallet["positions"] = positions
+
+            # Fetch recent trades
+            trades = await self.client.get_wallet_trades(address, limit=200)
+            wallet["recent_trades"] = trades
+
+            # Check for new trades
+            last_id = wallet.get("last_trade_id")
+            if last_id and trades:
+                new_trades = [t for t in trades if t.get("id", "") > last_id]
+
+            # Update last trade ID
+            if trades:
+                wallet["last_trade_id"] = trades[0].get("id", "")
+
+        except Exception as e:
+            logger.warning("Error updating wallet %s", address, exc_info=e)
+
+        return new_trades
+
+    async def check_all_wallets(self) -> list[dict]:
+        """Check all tracked wallets for new activity (concurrent)."""
+        all_new_trades = []
+
+        # Update wallets concurrently instead of sequentially to avoid
+        # blocking the event loop for extended periods when many wallets
+        # are tracked.
+        addresses = list(self.tracked_wallets.keys())
+        if addresses:
+            results = await asyncio.gather(
+                *[self._update_wallet(addr) for addr in addresses],
+                return_exceptions=True,
+            )
+            for address, result in zip(addresses, results):
+                if isinstance(result, Exception):
+                    logger.warning("Wallet update error for %s", address, exc_info=result)
+                    continue
+                if result:
+                    wallet = self.tracked_wallets.get(address)
+                    if wallet:
+                        for trade in result:
+                            trade["_wallet_label"] = wallet["label"]
+                            trade["_wallet_address"] = address
+                        all_new_trades.extend(result)
+
+        # Notify callbacks
+        for trade in all_new_trades:
+            for callback in self._callbacks:
+                try:
+                    await callback(trade)
+                except Exception as e:
+                    logger.warning("Wallet callback error", exc_info=e)
+
+        return all_new_trades
+
+    async def start_monitoring(self, interval_seconds: int = 30):
+        """Start continuous wallet monitoring"""
+        self._running = True
+        logger.info("Starting wallet monitor (interval: %ds)", interval_seconds)
+
+        while self._running:
+            if not global_pause_state.is_paused:
+                try:
+                    new_trades = await self.check_all_wallets()
+                    if new_trades:
+                        logger.info("%d new trades detected", len(new_trades))
+                except Exception as e:
+                    logger.warning("Wallet monitor error", exc_info=e)
+
+            await asyncio.sleep(interval_seconds)
+
+    def stop(self):
+        """Stop wallet monitoring"""
+        self._running = False
+
+    async def get_wallet_info(self, address: str) -> Optional[dict]:
+        """Get current info for a wallet"""
+        await self._ensure_initialized()
+        return self.tracked_wallets.get(address.lower())
+
+    async def get_all_wallets(self) -> list[dict]:
+        """Get all tracked wallets (returns cached data).
+
+        Data is refreshed in the background by the monitoring loop. This
+        method returns immediately so API endpoints stay responsive.
+        """
+        await self._ensure_initialized()
+        return list(self.tracked_wallets.values())
+
+
+# Singleton instance
+wallet_tracker = WalletTracker()

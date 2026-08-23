@@ -1,0 +1,122 @@
+{
+  "runId": 1781480353805,
+  "workflowRunId": 27515514252,
+  "workflowId": 230872278,
+  "workflowName": "CI",
+  "workflowUrl": "https://github.com/braedonsaunders/homerun/actions/runs/27515514252",
+  "branch": "main",
+  "headSha": "b77ce68c85e2ae0ec77305413b04e4a214816cdc",
+  "prNumber": null,
+  "passes": [
+    {
+      "pass": 1,
+      "cluster": {
+        "type": "lint",
+        "files": [
+          "backend/workers/trader_orchestrator_worker.py"
+        ],
+        "failures": [
+          {
+            "type": "lint",
+            "file": "backend/workers/trader_orchestrator_worker.py",
+            "line": 1647,
+            "column": 5,
+            "message": "Local variable `missing_snapshot_ids` is assigned to but never used",
+            "rule": "F841",
+            "rawLog": "F841 Local variable `missing_snapshot_ids` is assigned to but never used\n    --> workers/trader_orchestrator_worker.py:1647:5",
+            "confidence": 0.95
+          }
+        ],
+        "strategy": "llm"
+      },
+      "commitSha": "5581f9f36db1cf996e0dd5547cae7b03ca8473be",
+      "filesChanged": [
+        "backend/workers/trader_orchestrator_worker.py"
+      ],
+      "result": "fixed",
+      "newFailures": [],
+      "costCents": 1,
+      "durationMs": 47014
+    }
+  ],
+  "totalCostCents": 1,
+  "startedAt": "2026-06-14T23:39:13.805Z",
+  "result": null,
+  "commits": [
+    "5581f9f36db1cf996e0dd5547cae7b03ca8473be"
+  ],
+  "latestFailures": [
+    {
+      "type": "test-failure",
+      "file": "backend/tests/test_in_process_runtime_delivery.py",
+      "line": null,
+      "column": null,
+      "message": "AssertionError: snapshot-backed runtime trigger must not query trade_signals",
+      "rule": null,
+      "rawLog": "FAILED tests/test_in_process_runtime_delivery.py::test_triggered_orchestrator_cycle_uses_batch_snapshots_without_db - AssertionError: snapshot-backed runtime trigger must not query trade_signals",
+      "confidence": 0.7
+    },
+    {
+      "type": "test-failure",
+      "file": "backend/tests/test_intent_runtime_ws_freshness.py",
+      "line": null,
+      "column": null,
+      "message": "sqlalchemy.exc.ProgrammingError: (sqlalchemy.dialects.postgresql.asyncpg.ProgrammingError) <class 'asyncpg.exceptions.UndefinedTableError'>: relation \"trade_signals\" does not exist",
+      "rule": null,
+      "rawLog": "FAILED tests/test_intent_runtime_ws_freshness.py::test_project_upserts_scopes_source_sweep_by_strategy_type - sqlalchemy.exc.ProgrammingError: (sqlalchemy.dialects.postgresql.asyncpg.ProgrammingError) <class 'asyncpg.exceptions.UndefinedTableError'>: relation \"trade_signals\" does not exist",
+      "confidence": 0.7
+    },
+    {
+      "type": "test-failure",
+      "file": "backend/tests/test_main_lifespan_smoke.py",
+      "line": null,
+      "column": null,
+      "message": "AssertionError: FastAPI app has only 50 routes — likely a router include block raised during import and was swallowed",
+      "rule": null,
+      "rawLog": "FAILED tests/test_main_lifespan_smoke.py::test_app_is_fastapi_with_routes - AssertionError: FastAPI app has only 50 routes — likely a router include block raised during import and was swallowed",
+      "confidence": 0.7
+    },
+    {
+      "type": "test-failure",
+      "file": "backend/tests/test_routes_no_legacy_autotrader.py",
+      "line": null,
+      "column": null,
+      "message": "AttributeError: '_IncludedRouter' object has no attribute 'path'",
+      "rule": null,
+      "rawLog": "FAILED tests/test_routes_no_legacy_autotrader.py::test_legacy_auto_trader_routes_removed - AttributeError: '_IncludedRouter' object has no attribute 'path'",
+      "confidence": 0.7
+    },
+    {
+      "type": "test-failure",
+      "file": "backend/tests/test_trader_orchestrator_worker.py",
+      "line": null,
+      "column": null,
+      "message": "AssertionError: Expected mock to have been awaited once. Awaited 0 times.",
+      "rule": null,
+      "rawLog": "FAILED tests/test_trader_orchestrator_worker.py::test_run_worker_loop_skips_terminal_stale_watchdog_when_globally_disabled - AssertionError: Expected mock to have been awaited once. Awaited 0 times.",
+      "confidence": 0.7
+    },
+    {
+      "type": "test-failure",
+      "file": "backend/tests/test_trader_orchestrator_worker.py",
+      "line": null,
+      "column": null,
+      "message": "AssertionError: assert [] == ['flush', 'reseed']",
+      "rule": null,
+      "rawLog": "FAILED tests/test_trader_orchestrator_worker.py::test_run_worker_loop_releases_session_before_hot_state_maintenance - AssertionError: assert [] == ['flush', 'reseed']",
+      "confidence": 0.7
+    },
+    {
+      "type": "lint",
+      "file": "backend/workers/trader_orchestrator_worker.py",
+      "line": 1647,
+      "column": 5,
+      "message": "Local variable `missing_snapshot_ids` is assigned to but never used",
+      "rule": "F841",
+      "rawLog": "F841 Local variable `missing_snapshot_ids` is assigned to but never used\n    --> workers/trader_orchestrator_worker.py:1647:5",
+      "confidence": 0.95
+    }
+  ],
+  "latestParserUsed": "pytest, ruff",
+  "latestLogPath": ".greencheck/logs/workflow-run-27515514252.log"
+}

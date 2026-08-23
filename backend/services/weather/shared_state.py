@@ -1,0 +1,655 @@
+"""Shared DB state for weather workflow worker/API/orchestrator."""
+
+from __future__ import annotations
+
+import re
+from datetime import date, datetime, timedelta, timezone
+from utils.utcnow import utcnow
+from typing import Any, Optional
+
+from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from config import settings as app_settings
+from models.database import (
+    AppSettings,
+    WeatherControl,
+    WeatherSnapshot,
+    WeatherTradeIntent,
+)
+from models.opportunity import Opportunity
+from services.event_bus import event_bus
+from utils.converters import format_iso_utc_z, parse_iso_datetime
+
+WEATHER_SNAPSHOT_ID = "latest"
+WEATHER_CONTROL_ID = "default"
+MIN_TIME_TO_RESOLUTION = timedelta(minutes=30)
+
+# In-memory cache of enriched intents for strategy consumption within a cycle.
+_enriched_weather_intents: list[dict[str, Any]] = []
+
+def _normalize_weather_edge_title(title: str) -> str:
+    prefix = "weather edge:"
+    return title[len(prefix) :].lstrip() if title.lower().startswith(prefix) else title
+
+
+def _coerce_date(value: Any) -> Optional[date]:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        if value.tzinfo is not None:
+            value = value.astimezone(timezone.utc)
+        return value.date()
+    if isinstance(value, date):
+        return value
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        try:
+            parsed = datetime.fromisoformat(text)
+            if parsed.tzinfo is not None:
+                parsed = parsed.astimezone(timezone.utc)
+            return parsed.date()
+        except Exception:
+            pass
+        try:
+            return date.fromisoformat(text[:10])
+        except Exception:
+            return None
+    return None
+
+
+def _parse_date_from_text(
+    text: str,
+    *,
+    default_year: Optional[int] = None,
+) -> Optional[date]:
+    if not text:
+        return None
+    candidates: list[str] = []
+    for pattern in (
+        r"\bon\s+([A-Za-z]{3,9}\s+\d{1,2}(?:,\s*\d{4})?)",
+        r"\b([A-Za-z]{3,9}\s+\d{1,2},\s*\d{4})\b",
+        r"\b([A-Za-z]{3,9}\s+\d{1,2})\b",
+    ):
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            candidates.append(match.group(1).strip())
+
+    year = default_year or datetime.now(timezone.utc).year
+    for raw in candidates:
+        for fmt in ("%B %d, %Y", "%b %d, %Y", "%B %d", "%b %d"):
+            try:
+                parsed = datetime.strptime(raw, fmt)
+            except ValueError:
+                continue
+            if "%Y" not in fmt:
+                parsed = parsed.replace(year=year)
+            return parsed.date()
+    return None
+
+
+def _opportunity_target_date(opp: Opportunity) -> Optional[date]:
+    for market in opp.markets or []:
+        if not isinstance(market, dict):
+            continue
+        weather = market.get("weather")
+        if not isinstance(weather, dict):
+            continue
+        dt = _coerce_date(weather.get("target_time"))
+        if dt is not None:
+            return dt
+    resolution_date = _coerce_date(opp.resolution_date)
+    if resolution_date is not None:
+        return resolution_date
+
+    default_year = datetime.now(timezone.utc).year
+    for market in opp.markets or []:
+        if not isinstance(market, dict):
+            continue
+        for key in ("question", "group_item_title", "groupItemTitle"):
+            candidate = _parse_date_from_text(
+                str(market.get(key) or ""),
+                default_year=default_year,
+            )
+            if candidate is not None:
+                return candidate
+
+    return _parse_date_from_text(opp.title or "", default_year=default_year)
+
+
+def _default_status() -> dict[str, Any]:
+    return {
+        "running": False,
+        "enabled": True,
+        "interval_seconds": app_settings.WEATHER_WORKFLOW_SCAN_INTERVAL_SECONDS,
+        "last_scan": None,
+        "opportunities_count": 0,
+        "current_activity": "Waiting for weather worker.",
+        "stats": {},
+    }
+
+
+async def write_weather_snapshot(
+    session: AsyncSession,
+    opportunities: list[Opportunity],
+    status: dict[str, Any],
+    stats: Optional[dict[str, Any]] = None,
+) -> None:
+    last_scan = status.get("last_scan")
+    if isinstance(last_scan, str):
+        last_scan = parse_iso_datetime(last_scan, naive=True) or utcnow()
+    elif last_scan is None:
+        last_scan = utcnow()
+
+    payload: list[dict[str, Any]] = []
+    for o in opportunities:
+        if hasattr(o, "model_dump"):
+            payload.append(o.model_dump(mode="json"))
+        else:
+            payload.append(Opportunity.model_validate(o).model_dump(mode="json"))
+
+    result = await session.execute(select(WeatherSnapshot).where(WeatherSnapshot.id == WEATHER_SNAPSHOT_ID))
+    row = result.scalar_one_or_none()
+    if row is None:
+        row = WeatherSnapshot(id=WEATHER_SNAPSHOT_ID)
+        session.add(row)
+
+    row.updated_at = utcnow()
+    row.last_scan_at = last_scan
+    row.opportunities_json = payload
+    row.running = status.get("running", True)
+    row.enabled = status.get("enabled", True)
+    row.current_activity = status.get("current_activity")
+    row.interval_seconds = status.get("interval_seconds", app_settings.WEATHER_WORKFLOW_SCAN_INTERVAL_SECONDS)
+    row.stats_json = stats if stats is not None else status.get("stats", {})
+    await session.commit()
+
+    # Publish weather events so the broadcaster can relay immediately.
+    try:
+        weather_status_data = {
+            "running": status.get("running", True),
+            "enabled": status.get("enabled", True),
+            "interval_seconds": status.get("interval_seconds", app_settings.WEATHER_WORKFLOW_SCAN_INTERVAL_SECONDS),
+            "last_scan": status.get("last_scan"),
+            "opportunities_count": len(opportunities),
+            "current_activity": status.get("current_activity"),
+            "stats": stats if stats is not None else status.get("stats", {}),
+        }
+        await event_bus.publish("weather_status", weather_status_data)
+        await event_bus.publish(
+            "weather_update",
+            {
+                "count": len(opportunities),
+                "status": weather_status_data,
+                "source": "weather_snapshot_write",
+            },
+        )
+    except Exception:
+        pass  # fire-and-forget
+
+
+async def read_weather_snapshot(
+    session: AsyncSession,
+) -> tuple[list[Opportunity], dict[str, Any]]:
+    result = await session.execute(select(WeatherSnapshot).where(WeatherSnapshot.id == WEATHER_SNAPSHOT_ID))
+    row = result.scalar_one_or_none()
+    if row is None:
+        return [], _default_status()
+
+    opportunities: list[Opportunity] = []
+    for d in row.opportunities_json or []:
+        try:
+            opportunities.append(Opportunity.model_validate(d))
+        except Exception:
+            continue
+
+    status = {
+        "running": row.running,
+        "enabled": row.enabled,
+        "interval_seconds": row.interval_seconds,
+        "last_scan": format_iso_utc_z(row.last_scan_at),
+        "opportunities_count": len(opportunities),
+        "current_activity": row.current_activity,
+        "stats": row.stats_json or {},
+    }
+    return opportunities, status
+
+
+async def get_weather_opportunities_from_db(
+    session: AsyncSession,
+    min_edge_percent: Optional[float] = None,
+    direction: Optional[str] = None,
+    max_entry_price: Optional[float] = None,
+    location_query: Optional[str] = None,
+    target_date: Optional[date] = None,
+    exclude_near_resolution: bool = False,
+    include_report_only: bool = True,
+) -> list[Opportunity]:
+    opportunities, _ = await read_weather_snapshot(session)
+    for opp in opportunities:
+        opp.title = _normalize_weather_edge_title(opp.title)
+
+    try:
+        if session.in_transaction():
+            await session.rollback()
+    except Exception:
+        pass
+
+    if opportunities:
+        try:
+            from services.scanner import scanner as market_scanner
+
+            opportunities = await market_scanner.refresh_opportunity_prices(
+                opportunities,
+                drop_stale=False,
+            )
+        except Exception:
+            pass
+
+    if opportunities:
+        history_candidates: list[Opportunity] = []
+        seen_ids: set[str] = set()
+        for opp in opportunities:
+            has_missing_market_history = False
+            for market in opp.markets:
+                history = market.get("price_history")
+                if not isinstance(history, list) or len(history) < 2:
+                    has_missing_market_history = True
+                    break
+            if not has_missing_market_history:
+                continue
+            candidate_id = str(getattr(opp, "stable_id", "") or getattr(opp, "id", "") or "").strip()
+            if candidate_id and candidate_id in seen_ids:
+                continue
+            if candidate_id:
+                seen_ids.add(candidate_id)
+            history_candidates.append(opp)
+
+        if history_candidates:
+            try:
+                from services.scanner import scanner as market_scanner
+
+                await market_scanner.attach_price_history_to_opportunities(
+                    history_candidates,
+                    timeout_seconds=0.0,
+                )
+            except Exception:
+                pass
+
+    if opportunities and exclude_near_resolution:
+        now = datetime.now(timezone.utc)
+        filtered: list[Opportunity] = []
+        for opp in opportunities:
+            if opp.resolution_date is None:
+                filtered.append(opp)
+                continue
+            rd = (
+                opp.resolution_date
+                if opp.resolution_date.tzinfo is not None
+                else opp.resolution_date.replace(tzinfo=timezone.utc)
+            )
+            if rd <= (now + MIN_TIME_TO_RESOLUTION):
+                continue
+            filtered.append(opp)
+        opportunities = filtered
+
+    if min_edge_percent is not None:
+        opportunities = [o for o in opportunities if o.roi_percent >= min_edge_percent]
+
+    if direction:
+        dir_lower = direction.lower()
+        filtered = []
+        for o in opportunities:
+            pos = (o.positions_to_take or [{}])[0]
+            outcome = str(pos.get("outcome", "")).lower()
+            if dir_lower in ("yes", "buy_yes") and outcome == "yes":
+                filtered.append(o)
+            elif dir_lower in ("no", "buy_no") and outcome == "no":
+                filtered.append(o)
+        opportunities = filtered
+
+    if max_entry_price is not None:
+        filtered: list[Opportunity] = []
+        for opp in opportunities:
+            positions = opp.positions_to_take or []
+            # Keep report-only rows (no executable leg) visible in weather UI.
+            if not positions:
+                filtered.append(opp)
+                continue
+            try:
+                price = float(positions[0].get("price", 1.0))
+            except Exception:
+                continue
+            if price <= max_entry_price:
+                filtered.append(opp)
+        opportunities = filtered
+
+    if location_query:
+        q = location_query.lower()
+        opportunities = [
+            o
+            for o in opportunities
+            if any(q in str(m.get("weather", {}).get("location", "")).lower() for m in o.markets)
+            or q in o.title.lower()
+            or q in o.description.lower()
+        ]
+
+    if target_date is not None:
+        opportunities = [o for o in opportunities if _opportunity_target_date(o) == target_date]
+
+    if not include_report_only:
+        opportunities = [o for o in opportunities if (o.max_position_size or 0.0) > 0.0 and bool(o.positions_to_take)]
+
+    return opportunities
+
+
+async def get_weather_target_date_counts_from_db(
+    session: AsyncSession,
+    min_edge_percent: Optional[float] = None,
+    direction: Optional[str] = None,
+    max_entry_price: Optional[float] = None,
+    location_query: Optional[str] = None,
+    exclude_near_resolution: bool = False,
+    include_report_only: bool = True,
+) -> list[dict[str, Any]]:
+    opportunities = await get_weather_opportunities_from_db(
+        session,
+        min_edge_percent=min_edge_percent,
+        direction=direction,
+        max_entry_price=max_entry_price,
+        location_query=location_query,
+        target_date=None,
+        exclude_near_resolution=exclude_near_resolution,
+        include_report_only=include_report_only,
+    )
+
+    counts: dict[date, int] = {}
+    for opp in opportunities:
+        d = _opportunity_target_date(opp)
+        if d is None:
+            continue
+        counts[d] = counts.get(d, 0) + 1
+
+    return [{"date": d.isoformat(), "count": counts[d]} for d in sorted(counts.keys())]
+
+
+async def get_weather_status_from_db(session: AsyncSession) -> dict[str, Any]:
+    _, status = await read_weather_snapshot(session)
+    return status
+
+
+async def ensure_weather_control(session: AsyncSession) -> WeatherControl:
+    result = await session.execute(select(WeatherControl).where(WeatherControl.id == WEATHER_CONTROL_ID))
+    row = result.scalar_one_or_none()
+    if row is None:
+        row = WeatherControl(id=WEATHER_CONTROL_ID)
+        session.add(row)
+        await session.commit()
+        await session.refresh(row)
+    return row
+
+
+async def read_weather_control(session: AsyncSession) -> dict[str, Any]:
+    result = await session.execute(select(WeatherControl).where(WeatherControl.id == WEATHER_CONTROL_ID))
+    row = result.scalar_one_or_none()
+    if row is None:
+        return {
+            "is_enabled": False,  # ships disabled; opt-in via Background Subsystems
+            "is_paused": False,
+            "scan_interval_seconds": app_settings.WEATHER_WORKFLOW_SCAN_INTERVAL_SECONDS,
+            "requested_scan_at": None,
+        }
+    return {
+        "is_enabled": row.is_enabled,
+        "is_paused": row.is_paused,
+        "scan_interval_seconds": row.scan_interval_seconds,
+        "requested_scan_at": row.requested_scan_at,
+    }
+
+
+async def set_weather_paused(session: AsyncSession, paused: bool) -> None:
+    row = await ensure_weather_control(session)
+    row.is_paused = paused
+    row.updated_at = utcnow()
+    await session.commit()
+
+
+async def set_weather_enabled(session: AsyncSession, enabled: bool) -> None:
+    """Operator master switch. Distinct from is_paused (transient): when
+    is_enabled is False the weather worker loop idles across restarts and
+    global resume-all until explicitly re-enabled (see weather_worker gate)."""
+    row = await ensure_weather_control(session)
+    row.is_enabled = bool(enabled)
+    row.updated_at = utcnow()
+    await session.commit()
+
+
+async def set_weather_interval(session: AsyncSession, interval_seconds: int) -> None:
+    row = await ensure_weather_control(session)
+    row.scan_interval_seconds = max(300, min(86400, interval_seconds))
+    row.updated_at = utcnow()
+    await session.commit()
+
+
+async def request_one_weather_scan(session: AsyncSession) -> None:
+    row = await ensure_weather_control(session)
+    row.requested_scan_at = utcnow()
+    row.updated_at = utcnow()
+    await session.commit()
+
+
+async def clear_weather_scan_request(session: AsyncSession) -> None:
+    row = await ensure_weather_control(session)
+    row.requested_scan_at = None
+    row.updated_at = utcnow()
+    await session.commit()
+
+
+async def upsert_weather_intent(session: AsyncSession, intent: dict[str, Any]) -> None:
+    update_values = {
+        key: value
+        for key, value in intent.items()
+        if key != "id"
+    }
+    await session.execute(
+        pg_insert(WeatherTradeIntent)
+        .values(**intent)
+        .on_conflict_do_update(
+            index_elements=[WeatherTradeIntent.id],
+            set_=update_values,
+            where=WeatherTradeIntent.status.in_(("pending", "submitted")),
+        )
+    )
+
+
+async def list_weather_intents(
+    session: AsyncSession,
+    status_filter: Optional[str] = None,
+    limit: int = 100,
+) -> list[WeatherTradeIntent]:
+    query = select(WeatherTradeIntent).order_by(WeatherTradeIntent.created_at.desc())
+    if status_filter:
+        query = query.where(WeatherTradeIntent.status == status_filter)
+    query = query.limit(limit)
+    result = await session.execute(query)
+    return list(result.scalars().all())
+
+
+async def mark_weather_intent(
+    session: AsyncSession,
+    intent_id: str,
+    status: str,
+) -> bool:
+    result = await session.execute(select(WeatherTradeIntent).where(WeatherTradeIntent.id == intent_id))
+    row = result.scalar_one_or_none()
+    if row is None:
+        return False
+    row.status = status
+    row.consumed_at = utcnow()
+    await session.commit()
+    return True
+
+
+def _stable_id_from_opportunity_id(opportunity_id: Optional[str]) -> Optional[str]:
+    if not opportunity_id:
+        return None
+    text = str(opportunity_id).strip()
+    if not text:
+        return None
+    parts = text.rsplit("_", 1)
+    if len(parts) == 2 and parts[1].isdigit():
+        return parts[0]
+    return text
+
+
+async def update_weather_opportunity_ai_analysis_in_snapshot(
+    session: AsyncSession,
+    opportunity_id: str,
+    stable_id: Optional[str],
+    ai_analysis: dict[str, Any],
+) -> bool:
+    """Persist ai_analysis on a weather opportunity inside weather_snapshot."""
+    sid = (stable_id or "").strip() or _stable_id_from_opportunity_id(opportunity_id)
+    oid = (opportunity_id or "").strip()
+    if not oid and not sid:
+        return False
+
+    result = await session.execute(select(WeatherSnapshot).where(WeatherSnapshot.id == WEATHER_SNAPSHOT_ID))
+    row = result.scalar_one_or_none()
+    if row is None or not isinstance(row.opportunities_json, list):
+        return False
+
+    updated = False
+    patched_payload: list[dict[str, Any]] = []
+    for item in row.opportunities_json:
+        if not isinstance(item, dict):
+            patched_payload.append(item)
+            continue
+        item_id = str(item.get("id") or "").strip()
+        item_sid = str(item.get("stable_id") or "").strip()
+        if (oid and item_id == oid) or (sid and item_sid == sid):
+            patched = dict(item)
+            patched["ai_analysis"] = ai_analysis
+            patched_payload.append(patched)
+            updated = True
+        else:
+            patched_payload.append(item)
+
+    if not updated:
+        return False
+
+    row.opportunities_json = patched_payload
+    row.updated_at = utcnow()
+    await session.commit()
+    return True
+
+
+async def _get_or_create_app_settings(session: AsyncSession) -> AppSettings:
+    result = await session.execute(select(AppSettings).where(AppSettings.id == "default"))
+    db = result.scalar_one_or_none()
+    if db is None:
+        db = AppSettings(id="default")
+        session.add(db)
+        await session.commit()
+        await session.refresh(db)
+    return db
+
+
+async def get_weather_settings(session: AsyncSession) -> dict[str, Any]:
+    db = await _get_or_create_app_settings(session)
+
+    def _f(attr: str, default: float) -> float:
+        """Get a float setting, falling back to *default* when the DB value is None."""
+        return float(getattr(db, attr, default) or default)
+
+    def _i(attr: str, default: int) -> int:
+        """Get an int setting, falling back to *default* when the DB value is None."""
+        return int(getattr(db, attr, default) or default)
+
+    raw_temperature_unit = str(getattr(db, "weather_workflow_temperature_unit", "F") or "F").upper()
+    temperature_unit = raw_temperature_unit if raw_temperature_unit in {"F", "C"} else "F"
+
+    return {
+        "enabled": bool(getattr(db, "weather_workflow_enabled", True) or True),
+        "auto_run": bool(getattr(db, "weather_workflow_auto_run", True) or True),
+        "scan_interval_seconds": _i(
+            "weather_workflow_scan_interval_seconds", app_settings.WEATHER_WORKFLOW_SCAN_INTERVAL_SECONDS
+        ),
+        "entry_max_price": _f("weather_workflow_entry_max_price", app_settings.WEATHER_WORKFLOW_ENTRY_MAX_PRICE),
+        "take_profit_price": _f("weather_workflow_take_profit_price", app_settings.WEATHER_WORKFLOW_TAKE_PROFIT_PRICE),
+        "stop_loss_pct": _f("weather_workflow_stop_loss_pct", app_settings.WEATHER_WORKFLOW_STOP_LOSS_PCT),
+        "min_edge_percent": _f("weather_workflow_min_edge_percent", app_settings.WEATHER_WORKFLOW_MIN_EDGE_PERCENT),
+        "min_confidence": _f("weather_workflow_min_confidence", app_settings.WEATHER_WORKFLOW_MIN_CONFIDENCE),
+        "min_model_agreement": _f(
+            "weather_workflow_min_model_agreement", app_settings.WEATHER_WORKFLOW_MIN_MODEL_AGREEMENT
+        ),
+        "min_liquidity": _f("weather_workflow_min_liquidity", app_settings.WEATHER_WORKFLOW_MIN_LIQUIDITY),
+        "max_markets_per_scan": _i(
+            "weather_workflow_max_markets_per_scan", app_settings.WEATHER_WORKFLOW_MAX_MARKETS_PER_SCAN
+        ),
+        "default_size_usd": _f("weather_workflow_default_size_usd", app_settings.WEATHER_WORKFLOW_DEFAULT_SIZE_USD),
+        "max_size_usd": _f("weather_workflow_max_size_usd", app_settings.WEATHER_WORKFLOW_MAX_SIZE_USD),
+        "model": getattr(db, "weather_workflow_model", None),
+        "temperature_unit": temperature_unit,
+    }
+
+
+async def update_weather_settings(
+    session: AsyncSession,
+    updates: dict[str, Any],
+) -> dict[str, Any]:
+    db = await _get_or_create_app_settings(session)
+
+    mapping = {
+        "enabled": "weather_workflow_enabled",
+        "auto_run": "weather_workflow_auto_run",
+        "scan_interval_seconds": "weather_workflow_scan_interval_seconds",
+        "entry_max_price": "weather_workflow_entry_max_price",
+        "take_profit_price": "weather_workflow_take_profit_price",
+        "stop_loss_pct": "weather_workflow_stop_loss_pct",
+        "min_edge_percent": "weather_workflow_min_edge_percent",
+        "min_confidence": "weather_workflow_min_confidence",
+        "min_model_agreement": "weather_workflow_min_model_agreement",
+        "min_liquidity": "weather_workflow_min_liquidity",
+        "max_markets_per_scan": "weather_workflow_max_markets_per_scan",
+        "default_size_usd": "weather_workflow_default_size_usd",
+        "max_size_usd": "weather_workflow_max_size_usd",
+        "model": "weather_workflow_model",
+        "temperature_unit": "weather_workflow_temperature_unit",
+    }
+
+    for key, value in updates.items():
+        if key not in mapping:
+            continue
+        if key == "temperature_unit":
+            normalized = str(value or "").strip().upper()
+            if normalized not in {"F", "C"}:
+                continue
+            value = normalized
+        setattr(db, mapping[key], value)
+
+    db.updated_at = utcnow()
+    await session.commit()
+    return await get_weather_settings(session)
+
+
+async def store_enriched_weather_intents(
+    session: AsyncSession,
+    intents: list[dict[str, Any]],
+) -> None:
+    """Store enriched weather intents for strategy consumption within a cycle.
+
+    Uses module-level cache since these are ephemeral per-cycle data.
+    """
+    global _enriched_weather_intents
+    _enriched_weather_intents = list(intents)
+
+
+def get_enriched_weather_intents() -> list[dict[str, Any]]:
+    """Retrieve the latest enriched weather intents for strategy evaluation."""
+    return list(_enriched_weather_intents)

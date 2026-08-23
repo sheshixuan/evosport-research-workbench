@@ -1,0 +1,3468 @@
+"""
+Wallet Discovery Engine
+=======================
+
+Automated discovery and profiling of ALL active Polymarket wallets.
+This is the core engine that powers the trader leaderboard and
+tracked-trader candidate selection.
+
+Pipeline:
+    1. Fetch active markets from Polymarket Gamma API
+    2. For each market, fetch recent trades to discover wallet addresses
+    3. For each discovered wallet, calculate comprehensive metrics
+    4. Compute risk-adjusted scores (Sharpe, Sortino, Drawdown, etc.)
+    5. Compute rolling window statistics (1d, 7d, 30d, 90d)
+    6. Calculate composite rank scores
+    7. Store/update in DiscoveredWallet table
+    8. Refresh leaderboard positions
+"""
+
+from __future__ import annotations
+
+import asyncio
+import math
+import statistics
+from decimal import Decimal, InvalidOperation
+from datetime import datetime, timedelta
+from utils.utcnow import as_utc_naive, utcnow, utcfromtimestamp
+from typing import Any, Optional
+
+from sqlalchemy import Float, String, asc, case, cast, delete, desc, func, or_, select, text
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.exc import DBAPIError
+from sqlalchemy.orm import load_only
+
+from models.database import AppSettings, DiscoveredWallet, AsyncSessionLocal
+from services.live_pressure import current_backpressure_level, is_db_pressure_active
+from services.polymarket import polymarket_client
+from services.pause_state import global_pause_state
+from utils.converters import coerce_bool as _coerce_bool
+from utils.fifo_pnl import compute_fifo_pnl_multi_market
+from utils.logger import get_logger
+
+logger = get_logger("wallet_discovery")
+
+
+async def _run_with_bounded_workers(
+    items: list[Any],
+    worker_func,
+    *,
+    concurrency: int,
+    on_error=None,
+):
+    """Process ``items`` with a bounded worker pool.
+
+    Unlike ``[task for x in items] + asyncio.gather(*tasks)`` which
+    creates ALL tasks upfront (causing the asyncio task registry to
+    balloon to hundreds of entries and starve the rest of the event
+    loop's coroutines — visible as "Event-loop stall detected" in
+    production logs), this helper guarantees that AT MOST
+    ``concurrency`` tasks ever exist.  Each worker pulls from a queue
+    and processes items sequentially, so a 200-item run with
+    concurrency=10 holds 10 tasks live at any time, not 200.
+
+    Returns a list of results in arbitrary order — preserves item
+    order is not guaranteed.  Failed items are logged via
+    ``on_error`` (if provided) and skipped.
+
+    Bounded-concurrency scheduling for I/O-bound fan-out:
+      * Constant memory footprint regardless of input size
+      * Constant scheduling overhead — the loop only manages N tasks
+      * No semaphore queue starvation (semaphore + gather puts every
+        item in the wait queue at once; this puts them in a real queue)
+      * Yields between items so other coroutines on the same loop
+        (orchestrator, fast trader, Redis pub/sub) get fair time
+    """
+    if not items:
+        return []
+    queue: asyncio.Queue = asyncio.Queue()
+    for item in items:
+        queue.put_nowait(item)
+    results: list[Any] = []
+
+    async def _worker() -> None:
+        while True:
+            try:
+                item = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+            try:
+                result = await worker_func(item)
+                if result is not None:
+                    results.append(result)
+            except Exception as exc:
+                if on_error is not None:
+                    try:
+                        on_error(item, exc)
+                    except Exception:
+                        pass
+            finally:
+                queue.task_done()
+                # Yield so other tasks on the loop (and other workers)
+                # get a chance to run between items.
+                await asyncio.sleep(0)
+
+    workers = [
+        asyncio.create_task(_worker(), name=f"wallet-discovery-worker-{i}")
+        for i in range(max(1, int(concurrency)))
+    ]
+    try:
+        await asyncio.gather(*workers, return_exceptions=True)
+    finally:
+        for w in workers:
+            if not w.done():
+                w.cancel()
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+# Rolling window periods (label -> timedelta)
+ROLLING_WINDOWS = {
+    "1d": timedelta(days=1),
+    "7d": timedelta(days=7),
+    "30d": timedelta(days=30),
+    "90d": timedelta(days=90),
+}
+
+# Minimum data requirements
+MIN_TRADES_FOR_ANALYSIS = 5
+MIN_TRADES_FOR_RISK_METRICS = 3
+
+METRICS_SOURCE_VERSION = "accuracy_v2_closed_positions"
+
+# Discovery behavior defaults (can be overridden at runtime from AppSettings)
+DISCOVERY_DEFAULT_MAX_DISCOVERED_WALLETS = 20_000
+DISCOVERY_DEFAULT_MAINTENANCE_ENABLED = True
+DISCOVERY_DEFAULT_KEEP_RECENT_TRADE_DAYS = 7
+DISCOVERY_DEFAULT_KEEP_NEW_DISCOVERIES_DAYS = 30
+DISCOVERY_DEFAULT_MAINTENANCE_BATCH = 900
+DISCOVERY_MAX_DB_BATCH = 5000
+DISCOVERY_DEFAULT_STALE_ANALYSIS_HOURS = 12
+DISCOVERY_DEFAULT_ANALYSIS_PRIORITY_BATCH_LIMIT = 2500
+DISCOVERY_MAX_ANALYSIS_PRIORITY_BATCH_LIMIT = 5000
+DISCOVERY_DEFAULT_DELAY_BETWEEN_MARKETS = 0.25
+DISCOVERY_DEFAULT_DELAY_BETWEEN_WALLETS = 0.15
+DISCOVERY_DEFAULT_MAX_MARKETS_PER_RUN = 100
+DISCOVERY_DEFAULT_MAX_WALLETS_PER_MARKET = 50
+DISCOVERY_DEFAULT_RECENT_MARKET_LOOKBACK_MINUTES = 180
+DISCOVERY_DEFAULT_MAINTENANCE_REFRESH_BATCH = 500
+DISCOVERY_STEADY_MAX_MARKETS_PER_RUN = 40
+DISCOVERY_STEADY_MAX_WALLETS_PER_MARKET = 20
+DISCOVERY_STEADY_MAX_ANALYSIS_PER_RUN = 120
+DISCOVERY_PRESSURE_MAX_MARKETS_PER_RUN = 10
+DISCOVERY_PRESSURE_MAX_WALLETS_PER_MARKET = 5
+DISCOVERY_PRESSURE_MAX_ANALYSIS_PER_RUN = 25
+DISCOVERY_STEADY_MARKET_CONCURRENCY = 4
+DISCOVERY_STEADY_ANALYSIS_CONCURRENCY = 3
+DISCOVERY_PRESSURE_CONCURRENCY = 1
+DISCOVERY_LEADERBOARD_PAGE_SIZE = 50
+DISCOVERY_LEADERBOARD_MIN_REQUESTS_PER_RUN = 6
+DISCOVERY_LEADERBOARD_MAX_REQUESTS_PER_RUN = 24
+DISCOVERY_LEADERBOARD_TIME_PERIODS = ("DAY", "WEEK", "MONTH", "ALL")
+DISCOVERY_LEADERBOARD_CATEGORIES = (
+    "OVERALL",
+    "POLITICS",
+    "SPORTS",
+    "CRYPTO",
+    "CULTURE",
+    "ECONOMICS",
+    "TECH",
+    "FINANCE",
+    "WEATHER",
+)
+DISCOVERY_LEADERBOARD_SORTS = ("PNL", "VOL")
+
+POOL_FLAG_MANUAL_INCLUDE = "pool_manual_include"
+POOL_FLAG_MANUAL_EXCLUDE = "pool_manual_exclude"
+POOL_FLAG_BLACKLISTED = "pool_blacklisted"
+
+_DB_RETRY_ATTEMPTS = 3
+_DB_RETRY_BASE_DELAY_SECONDS = 0.05
+_DB_RETRY_MAX_DELAY_SECONDS = 0.3
+_PG_INT4_MAX = 2_147_483_647
+_NUMERIC_DEFAULT_ABS_MAX = 1_000_000_000.0
+_JSON_NUMERIC_PATTERN = r"^-?\d+(?:\.\d+)?$"
+_WIN_RATE_PRIOR_POSITIONS = 20.0
+_WIN_RATE_PRIOR_MEAN = 0.5
+_LEADERBOARD_STALE_ANALYSIS_HOURS = 24
+_TRADE_GAP_REANALYSIS_MIN_TOTAL_TRADES = 100
+_TRADE_GAP_REANALYSIS_MAX_RESOLVED_POSITIONS = 20
+_TRADE_GAP_REANALYSIS_MIN_RATIO = 10
+_TRADE_GAP_REANALYSIS_INTERVAL_HOURS = 4
+_DISCOVERY_CLOSED_POSITIONS_MAX = 150
+
+
+def _exception_text(exc: Exception) -> str:
+    text = str(exc).strip()
+    return text if text else repr(exc)
+
+
+def _is_retryable_db_error(exc: Exception) -> bool:
+    message = str(getattr(exc, "orig", exc)).lower()
+    return any(
+        marker in message
+        for marker in (
+            "deadlock detected",
+            "serialization failure",
+            "could not serialize access",
+            "lock not available",
+            "too many clients already",
+            "sorry, too many clients already",
+            "remaining connection slots are reserved",
+            "cannot connect now",
+            "connection is closed",
+            "underlying connection is closed",
+            "connection has been closed",
+            "closed the connection unexpectedly",
+            "terminating connection",
+            "connection reset by peer",
+            "broken pipe",
+            "timeouterror",
+            "timeout",
+        )
+    )
+
+
+def _db_retry_delay(attempt: int) -> float:
+    return min(_DB_RETRY_BASE_DELAY_SECONDS * (2**attempt), _DB_RETRY_MAX_DELAY_SECONDS)
+
+
+class WalletDiscoveryEngine:
+    """
+    Discovers, profiles, and ranks every active Polymarket wallet.
+
+    Combines trade-level data, position snapshots, and closed-position
+    records to build a comprehensive profile for each wallet, then ranks
+    them using a weighted composite score.
+    """
+
+    def __init__(self):
+        self.client = polymarket_client
+        self._running = False
+        self._background_running = False
+        self._last_run_at: Optional[datetime] = None
+        self._wallets_discovered_last_run: int = 0
+        self._wallets_analyzed_last_run: int = 0
+        self._wallets_seeded_last_run: int = 0
+        self._wallets_pruned_last_run: int = 0
+        self._runtime_discovery_settings: dict[str, Any] | None = None
+        self._market_scan_offset: int = 0
+        self._leaderboard_scan_cursor: int = 0
+        self._leaderboard_offsets: dict[str, int] = {}
+        self._discovered_wallet_numeric_bounds: dict[str, float] | None = None
+        self._metrics_backfill_exhausted_version: str | None = None
+
+    @staticmethod
+    def _coerce_int(
+        value: Any,
+        default: int,
+        minimum: Optional[int] = None,
+        maximum: Optional[int] = None,
+    ) -> int:
+        try:
+            value_int = int(value)
+        except (TypeError, ValueError):
+            return default
+        if minimum is not None and value_int < minimum:
+            return minimum
+        if maximum is not None and value_int > maximum:
+            return maximum
+        return value_int
+
+    @staticmethod
+    def _coerce_float(value: Any, default: float, minimum: Optional[float] = None) -> float:
+        try:
+            value_float = float(value)
+        except (TypeError, ValueError):
+            return default
+        if minimum is not None and value_float < minimum:
+            return minimum
+        return value_float
+
+    @staticmethod
+    def _discovery_settings_defaults() -> dict[str, Any]:
+        return {
+            "max_discovered_wallets": DISCOVERY_DEFAULT_MAX_DISCOVERED_WALLETS,
+            "maintenance_enabled": DISCOVERY_DEFAULT_MAINTENANCE_ENABLED,
+            "keep_recent_trade_days": DISCOVERY_DEFAULT_KEEP_RECENT_TRADE_DAYS,
+            "keep_new_discoveries_days": DISCOVERY_DEFAULT_KEEP_NEW_DISCOVERIES_DAYS,
+            "maintenance_batch": DISCOVERY_DEFAULT_MAINTENANCE_BATCH,
+            "stale_analysis_hours": DISCOVERY_DEFAULT_STALE_ANALYSIS_HOURS,
+            "analysis_priority_batch_limit": DISCOVERY_DEFAULT_ANALYSIS_PRIORITY_BATCH_LIMIT,
+            "delay_between_markets": DISCOVERY_DEFAULT_DELAY_BETWEEN_MARKETS,
+            "delay_between_wallets": DISCOVERY_DEFAULT_DELAY_BETWEEN_WALLETS,
+            "max_markets_per_run": DISCOVERY_DEFAULT_MAX_MARKETS_PER_RUN,
+            "max_wallets_per_market": DISCOVERY_DEFAULT_MAX_WALLETS_PER_MARKET,
+        }
+
+    def _discovery_setting(self, key: str, default: Any) -> Any:
+        return (self._runtime_discovery_settings or {}).get(key, self._discovery_settings_defaults().get(key, default))
+
+    async def _load_discovery_settings(self) -> dict[str, Any]:
+        settings = self._discovery_settings_defaults()
+        try:
+            async with AsyncSessionLocal() as session:
+                result = await session.execute(select(AppSettings).where(AppSettings.id == "default"))
+                row = result.scalar_one_or_none()
+                if row is None:
+                    return settings
+
+                settings["max_discovered_wallets"] = self._coerce_int(
+                    row.discovery_max_discovered_wallets,
+                    DISCOVERY_DEFAULT_MAX_DISCOVERED_WALLETS,
+                    minimum=10,
+                )
+                settings["maintenance_enabled"] = _coerce_bool(
+                    row.discovery_maintenance_enabled,
+                    DISCOVERY_DEFAULT_MAINTENANCE_ENABLED,
+                )
+                settings["keep_recent_trade_days"] = self._coerce_int(
+                    row.discovery_keep_recent_trade_days,
+                    DISCOVERY_DEFAULT_KEEP_RECENT_TRADE_DAYS,
+                    minimum=1,
+                )
+                settings["keep_new_discoveries_days"] = self._coerce_int(
+                    row.discovery_keep_new_discoveries_days,
+                    DISCOVERY_DEFAULT_KEEP_NEW_DISCOVERIES_DAYS,
+                    minimum=1,
+                )
+                settings["maintenance_batch"] = self._coerce_int(
+                    row.discovery_maintenance_batch,
+                    DISCOVERY_DEFAULT_MAINTENANCE_BATCH,
+                    minimum=10,
+                    maximum=DISCOVERY_MAX_DB_BATCH,
+                )
+                settings["stale_analysis_hours"] = self._coerce_int(
+                    row.discovery_stale_analysis_hours,
+                    DISCOVERY_DEFAULT_STALE_ANALYSIS_HOURS,
+                    minimum=1,
+                )
+                settings["analysis_priority_batch_limit"] = self._coerce_int(
+                    row.discovery_analysis_priority_batch_limit,
+                    DISCOVERY_DEFAULT_ANALYSIS_PRIORITY_BATCH_LIMIT,
+                    minimum=100,
+                    maximum=DISCOVERY_MAX_ANALYSIS_PRIORITY_BATCH_LIMIT,
+                )
+                settings["delay_between_markets"] = self._coerce_float(
+                    row.discovery_delay_between_markets,
+                    DISCOVERY_DEFAULT_DELAY_BETWEEN_MARKETS,
+                    minimum=0.0,
+                )
+                settings["delay_between_wallets"] = self._coerce_float(
+                    row.discovery_delay_between_wallets,
+                    DISCOVERY_DEFAULT_DELAY_BETWEEN_WALLETS,
+                    minimum=0.0,
+                )
+                settings["max_markets_per_run"] = self._coerce_int(
+                    row.discovery_max_markets_per_run,
+                    DISCOVERY_DEFAULT_MAX_MARKETS_PER_RUN,
+                    minimum=1,
+                )
+                settings["max_wallets_per_market"] = self._coerce_int(
+                    row.discovery_max_wallets_per_market,
+                    DISCOVERY_DEFAULT_MAX_WALLETS_PER_MARKET,
+                    minimum=1,
+                )
+        except Exception:
+            logger.exception("Failed to load discovery settings from DB; using defaults")
+
+        self._runtime_discovery_settings = settings
+        return settings
+
+    # ------------------------------------------------------------------
+    # 1. Trade Statistics (mirrors anomaly_detector pattern)
+    # ------------------------------------------------------------------
+
+    def _calculate_trade_stats(self, trades: list[dict], positions: list[dict] | None = None) -> dict:
+        """
+        Calculate comprehensive trading statistics from raw Polymarket
+        trade data and open positions.
+
+        Returns a dict with all fields needed to populate DiscoveredWallet.
+        """
+        positions = positions or []
+
+        if not trades and not positions:
+            return self._empty_stats()
+
+        # Group trades by market/condition_id to compute per-market PnL
+        market_positions: dict[str, dict] = {}
+        markets: set[str] = set()
+        total_invested = 0.0
+        total_returned = 0.0
+
+        for trade in trades:
+            size = float(trade.get("size", 0) or trade.get("amount", 0) or 0)
+            price = float(trade.get("price", 0) or 0)
+            side = (trade.get("side", "") or "").upper()
+            market_id = trade.get("market", trade.get("condition_id", trade.get("asset", "")))
+            outcome = trade.get("outcome", trade.get("outcome_index", ""))
+
+            if market_id:
+                markets.add(market_id)
+
+            if market_id not in market_positions:
+                market_positions[market_id] = {"buys": [], "sells": []}
+
+            cost = size * price
+
+            if side == "BUY":
+                total_invested += cost
+                market_positions[market_id]["buys"].append(
+                    {
+                        "size": size,
+                        "price": price,
+                        "cost": cost,
+                        "outcome": outcome,
+                        "timestamp": trade.get("timestamp", trade.get("created_at", "")),
+                    }
+                )
+            elif side == "SELL":
+                total_returned += cost
+                market_positions[market_id]["sells"].append(
+                    {
+                        "size": size,
+                        "price": price,
+                        "cost": cost,
+                        "outcome": outcome,
+                        "timestamp": trade.get("timestamp", trade.get("created_at", "")),
+                    }
+                )
+
+        # Realized PnL from completed trades
+        realized_pnl = total_returned - total_invested
+
+        # Unrealized PnL from open positions
+        unrealized_pnl = 0.0
+        for pos in positions:
+            size = float(pos.get("size", 0) or 0)
+            avg_price = float(pos.get("avgPrice", pos.get("avg_price", 0)) or 0)
+            current_price = float(pos.get("currentPrice", pos.get("curPrice", pos.get("price", 0))) or 0)
+            unrealized_pnl += size * (current_price - avg_price)
+
+        total_pnl = realized_pnl + unrealized_pnl
+
+        # Per-market win/loss + ROI series
+        wins = 0
+        losses = 0
+        market_rois: list[float] = []
+        market_pnls: list[float] = []
+
+        for _market_id, pos_data in market_positions.items():
+            buy_cost = sum(b["cost"] for b in pos_data["buys"])
+            sell_revenue = sum(s["cost"] for s in pos_data["sells"])
+
+            if buy_cost > 0 and sell_revenue > 0:
+                m_pnl = sell_revenue - buy_cost
+                m_roi = (m_pnl / buy_cost) * 100 if buy_cost > 0 else 0.0
+                market_rois.append(m_roi)
+                market_pnls.append(m_pnl)
+
+                if m_pnl > 0:
+                    wins += 1
+                elif m_pnl < 0:
+                    losses += 1
+
+        # Fallback estimation when no closed positions are detectable
+        if wins == 0 and losses == 0 and total_invested > 0:
+            if total_returned > total_invested * 1.02:
+                wins = max(1, len(markets) // 2)
+                losses = len(markets) - wins
+            elif total_returned < total_invested * 0.98:
+                losses = max(1, len(markets) // 2)
+                wins = len(markets) - losses
+
+        total_trades = len(trades)
+        closed_markets = wins + losses
+        win_rate = wins / closed_markets if closed_markets > 0 else 0.0
+
+        # Time span
+        days_active = self._compute_days_active(trades)
+
+        # ROI statistics
+        avg_roi = (
+            sum(market_rois) / len(market_rois)
+            if market_rois
+            else (total_pnl / total_invested * 100 if total_invested > 0 else 0.0)
+        )
+        max_roi = max(market_rois) if market_rois else avg_roi
+        min_roi = min(market_rois) if market_rois else avg_roi
+        roi_std = self._std_dev(market_rois) if len(market_rois) > 1 else 0.0
+
+        # Average position size
+        avg_position_size = total_invested / total_trades if total_trades > 0 else 0.0
+
+        return {
+            "total_trades": total_trades,
+            "wins": wins,
+            "losses": losses,
+            "win_rate": win_rate,
+            "total_pnl": total_pnl,
+            "realized_pnl": realized_pnl,
+            "unrealized_pnl": unrealized_pnl,
+            "total_invested": total_invested,
+            "total_returned": total_returned,
+            "avg_roi": avg_roi,
+            "max_roi": max_roi,
+            "min_roi": min_roi,
+            "roi_std": roi_std,
+            "unique_markets": len(markets),
+            "open_positions": len(positions),
+            "days_active": days_active,
+            "avg_hold_time_hours": 0.0,  # Requires position-level timestamps
+            "trades_per_day": total_trades / max(days_active, 1),
+            "avg_position_size": avg_position_size,
+            # Raw series for downstream calculations
+            "_market_rois": market_rois,
+            "_market_pnls": market_pnls,
+        }
+
+    def _empty_stats(self) -> dict:
+        """Return a zeroed-out stats dict."""
+        return {
+            "total_trades": 0,
+            "wins": 0,
+            "losses": 0,
+            "resolved_positions": 0,
+            "win_rate": 0.0,
+            "win_rate_score": 0.5,
+            "win_rate_confidence": 0.0,
+            "total_pnl": 0.0,
+            "realized_pnl": 0.0,
+            "unrealized_pnl": 0.0,
+            "total_invested": 0.0,
+            "total_returned": 0.0,
+            "avg_roi": 0.0,
+            "max_roi": 0.0,
+            "min_roi": 0.0,
+            "roi_std": 0.0,
+            "unique_markets": 0,
+            "open_positions": 0,
+            "days_active": 0,
+            "avg_hold_time_hours": 0.0,
+            "trades_per_day": 0.0,
+            "avg_position_size": 0.0,
+            "_market_rois": [],
+            "_market_pnls": [],
+        }
+
+    def _enrich_stats_with_fifo(self, stats: dict, trades: list[dict]) -> dict:
+        if not trades:
+            return stats
+
+        trades_by_market: dict[str, list[dict]] = {}
+        for t in trades:
+            mid = t.get("market") or t.get("condition_id") or t.get("asset") or ""
+            if not mid:
+                continue
+            trades_by_market.setdefault(mid, []).append(t)
+
+        if not trades_by_market:
+            return stats
+
+        fifo_results = compute_fifo_pnl_multi_market(trades_by_market)
+
+        total_winning = 0
+        total_losing = 0
+        total_realized = 0.0
+        total_hold_seconds = 0.0
+        total_closed_lots = 0
+        fifo_market_pnls: list[float] = []
+        fifo_market_rois: list[float] = []
+
+        for _key, result in fifo_results.items():
+            total_winning += result.winning_lots
+            total_losing += result.losing_lots
+            total_realized += result.total_realized_pnl
+            total_closed_lots += len(result.closed_lots)
+            total_hold_seconds += result.avg_hold_seconds * len(result.closed_lots)
+
+            if result.closed_lots:
+                mpnl = sum(c.realized_pnl for c in result.closed_lots if c.realized_pnl is not None)
+                fifo_market_pnls.append(mpnl)
+                mcost = sum(c.entry_price * c.size for c in result.closed_lots)
+                if mcost > 0:
+                    fifo_market_rois.append((mpnl / mcost) * 100.0)
+
+        if total_closed_lots > 0:
+            stats["wins"] = total_winning
+            stats["losses"] = total_losing
+            closed_total = total_winning + total_losing
+            stats["resolved_positions"] = closed_total
+            stats["win_rate"] = total_winning / closed_total if closed_total > 0 else 0.0
+            stats["avg_hold_time_hours"] = (total_hold_seconds / total_closed_lots) / 3600.0
+            stats["_market_pnls"] = fifo_market_pnls
+            if fifo_market_rois:
+                stats["_market_rois"] = fifo_market_rois
+                stats["avg_roi"] = sum(fifo_market_rois) / len(fifo_market_rois)
+                stats["max_roi"] = max(fifo_market_rois)
+                stats["min_roi"] = min(fifo_market_rois)
+                stats["roi_std"] = self._std_dev(fifo_market_rois) if len(fifo_market_rois) > 1 else 0.0
+
+        stats["fifo_realized_pnl"] = total_realized
+        stats["fifo_closed_lots"] = total_closed_lots
+        stats["fifo_open_lots"] = sum(len(r.open_lots) for r in fifo_results.values())
+        stats["fifo_accuracy"] = total_winning / total_closed_lots if total_closed_lots > 0 else 0.0
+
+        return stats
+
+    @staticmethod
+    def _resolved_positions_count(*, wins: Any, losses: Any) -> int:
+        try:
+            total = int(wins or 0) + int(losses or 0)
+        except Exception:
+            return 0
+        return max(0, total)
+
+    @staticmethod
+    def _win_rate_confidence(resolved_positions: int) -> float:
+        if resolved_positions <= 0:
+            return 0.0
+        return max(0.0, min(float(resolved_positions) / _WIN_RATE_PRIOR_POSITIONS, 1.0))
+
+    @staticmethod
+    def _confidence_adjusted_win_rate(*, wins: Any, losses: Any) -> float:
+        try:
+            wins_value = max(0.0, float(wins or 0))
+        except Exception:
+            wins_value = 0.0
+        try:
+            losses_value = max(0.0, float(losses or 0))
+        except Exception:
+            losses_value = 0.0
+        total = wins_value + losses_value
+        if total <= 0:
+            return _WIN_RATE_PRIOR_MEAN
+        return max(
+            0.0,
+            min(
+                (wins_value + (_WIN_RATE_PRIOR_MEAN * _WIN_RATE_PRIOR_POSITIONS))
+                / (total + _WIN_RATE_PRIOR_POSITIONS),
+                1.0,
+            ),
+        )
+
+    @staticmethod
+    def _to_float(value: Any, default: float = 0.0) -> float:
+        try:
+            return float(value)
+        except Exception:
+            return default
+
+    @staticmethod
+    def _numeric_abs_limit(precision: Any, scale: Any) -> float:
+        try:
+            prec = int(precision)
+        except (TypeError, ValueError):
+            return _NUMERIC_DEFAULT_ABS_MAX
+        try:
+            scl = int(scale or 0)
+        except (TypeError, ValueError):
+            scl = 0
+        integer_digits = max(1, prec - max(0, scl))
+        if integer_digits > 18:
+            return 1_000_000_000_000_000_000.0
+        raw_limit = (Decimal(10) ** integer_digits) - (Decimal(10) ** (-max(0, scl)))
+        if raw_limit >= Decimal("1e6"):
+            raw_limit *= Decimal("0.999999999")
+        return float(raw_limit)
+
+    async def _load_discovered_wallet_numeric_bounds(self, session) -> dict[str, float]:
+        if self._discovered_wallet_numeric_bounds is not None:
+            return self._discovered_wallet_numeric_bounds
+        query = text(
+            """
+            SELECT column_name, numeric_precision, numeric_scale
+            FROM information_schema.columns
+            WHERE table_schema = current_schema()
+              AND table_name = 'discovered_wallets'
+              AND data_type IN ('numeric', 'decimal')
+            """
+        )
+        bounds: dict[str, float] = {}
+        try:
+            result = await session.execute(query)
+            for row in result:
+                mapping = row._mapping
+                column_name = str(mapping.get("column_name") or "").strip()
+                if not column_name:
+                    continue
+                bounds[column_name] = self._numeric_abs_limit(
+                    mapping.get("numeric_precision"),
+                    mapping.get("numeric_scale"),
+                )
+        except Exception:
+            # Don't cache empty result on failure so next call retries.
+            return {}
+        self._discovered_wallet_numeric_bounds = bounds
+        return bounds
+
+    @staticmethod
+    def _clamp_numeric_value(value: Any, abs_limit: float) -> Any:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float, Decimal)):
+            try:
+                numeric = Decimal(str(value))
+            except Exception:
+                return value
+        elif isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return value
+            try:
+                numeric = Decimal(text)
+            except (TypeError, ValueError, InvalidOperation):
+                return value
+        else:
+            return value
+        if not numeric.is_finite():
+            return None
+        try:
+            limit = Decimal(str(abs_limit))
+        except Exception:
+            limit = Decimal(str(_NUMERIC_DEFAULT_ABS_MAX))
+        if numeric > limit:
+            numeric = limit
+        elif numeric < -limit:
+            numeric = -limit
+        return float(numeric)
+
+    def _sanitize_numeric_payload(self, value: Any, abs_limit: float) -> Any:
+        if isinstance(value, dict):
+            return {
+                key: self._sanitize_numeric_payload(item, abs_limit)
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [self._sanitize_numeric_payload(item, abs_limit) for item in value]
+        if isinstance(value, tuple):
+            return [self._sanitize_numeric_payload(item, abs_limit) for item in value]
+
+        clamped = self._clamp_numeric_value(value, abs_limit)
+        if isinstance(clamped, float) and (math.isinf(clamped) or math.isnan(clamped)):
+            return None
+        return clamped
+
+    def _summarize_closed_positions(self, closed_positions: list[dict]) -> dict:
+        wins = 0
+        losses = 0
+        market_ids: set[str] = set()
+        market_pnls: list[float] = []
+        market_rois: list[float] = []
+
+        for pos in closed_positions:
+            if not isinstance(pos, dict):
+                continue
+
+            market_id = (
+                pos.get("market")
+                or pos.get("condition_id")
+                or pos.get("conditionId")
+                or pos.get("asset")
+                or pos.get("token_id")
+                or pos.get("tokenId")
+                or ""
+            )
+            market_key = str(market_id).strip()
+            if market_key:
+                market_ids.add(market_key)
+
+            realized_pnl = self._to_float(pos.get("realizedPnl", 0) or 0)
+            initial_value = self._to_float(pos.get("initialValue", 0) or 0)
+            market_pnls.append(realized_pnl)
+            if initial_value > 0:
+                market_rois.append((realized_pnl / initial_value) * 100.0)
+
+            if realized_pnl > 0:
+                wins += 1
+            elif realized_pnl < 0:
+                losses += 1
+
+        return {
+            "wins": wins,
+            "losses": losses,
+            "market_ids": market_ids,
+            "market_pnls": market_pnls,
+            "market_rois": market_rois,
+        }
+
+    def _build_accuracy_first_stats(
+        self,
+        *,
+        base_stats: dict,
+        pnl_snapshot: dict | None,
+        closed_positions: list[dict],
+    ) -> dict:
+        """Merge legacy trade-derived stats with closed-position/PnL endpoint truth."""
+        stats = dict(base_stats)
+        closed_summary = self._summarize_closed_positions(closed_positions)
+
+        if isinstance(pnl_snapshot, dict):
+            total_trades = self._coerce_int(
+                self._to_float(pnl_snapshot.get("total_trades"), 0),
+                0,
+                minimum=0,
+                maximum=_PG_INT4_MAX,
+            )
+            open_positions = self._coerce_int(
+                self._to_float(pnl_snapshot.get("open_positions"), 0),
+                0,
+                minimum=0,
+                maximum=_PG_INT4_MAX,
+            )
+            total_invested = self._to_float(pnl_snapshot.get("total_invested"), 0.0)
+            total_returned = self._to_float(pnl_snapshot.get("total_returned"), 0.0)
+            realized_pnl = self._to_float(pnl_snapshot.get("realized_pnl"), 0.0)
+            unrealized_pnl = self._to_float(pnl_snapshot.get("unrealized_pnl"), 0.0)
+            total_pnl = self._to_float(
+                pnl_snapshot.get("total_pnl"),
+                realized_pnl + unrealized_pnl,
+            )
+
+            if total_trades > 0:
+                stats["total_trades"] = total_trades
+            stats["open_positions"] = open_positions
+            stats["total_invested"] = total_invested
+            stats["total_returned"] = total_returned
+            stats["realized_pnl"] = realized_pnl
+            stats["unrealized_pnl"] = unrealized_pnl
+            stats["total_pnl"] = total_pnl
+
+        wins = self._coerce_int(closed_summary["wins"], 0, minimum=0, maximum=_PG_INT4_MAX)
+        losses = self._coerce_int(closed_summary["losses"], 0, minimum=0, maximum=_PG_INT4_MAX)
+        closed_total = wins + losses
+        if closed_total > 0:
+            stats["wins"] = wins
+            stats["losses"] = losses
+            stats["win_rate"] = wins / closed_total
+        resolved_positions = self._resolved_positions_count(wins=stats.get("wins"), losses=stats.get("losses"))
+        stats["resolved_positions"] = resolved_positions
+        stats["win_rate_confidence"] = self._win_rate_confidence(resolved_positions)
+        stats["win_rate_score"] = self._confidence_adjusted_win_rate(
+            wins=stats.get("wins", 0),
+            losses=stats.get("losses", 0),
+        )
+
+        market_rois = list(closed_summary["market_rois"])
+        market_pnls = list(closed_summary["market_pnls"])
+        if market_rois:
+            stats["avg_roi"] = sum(market_rois) / len(market_rois)
+            stats["max_roi"] = max(market_rois)
+            stats["min_roi"] = min(market_rois)
+            stats["roi_std"] = self._std_dev(market_rois) if len(market_rois) > 1 else 0.0
+            stats["_market_rois"] = market_rois
+            stats["_market_pnls"] = market_pnls
+        elif market_pnls:
+            stats["_market_pnls"] = market_pnls
+            total_invested = self._to_float(stats.get("total_invested"), 0.0)
+            total_pnl = self._to_float(stats.get("total_pnl"), 0.0)
+            stats["avg_roi"] = (total_pnl / total_invested * 100.0) if total_invested > 0 else 0.0
+            stats["max_roi"] = stats["avg_roi"]
+            stats["min_roi"] = stats["avg_roi"]
+            stats["roi_std"] = 0.0
+
+        if closed_summary["market_ids"]:
+            stats["unique_markets"] = max(
+                int(stats.get("unique_markets", 0) or 0),
+                len(closed_summary["market_ids"]),
+            )
+
+        days_active = self._coerce_int(stats.get("days_active", 0), 1, minimum=1, maximum=_PG_INT4_MAX)
+        total_trades = self._coerce_int(stats.get("total_trades", 0), 0, minimum=0, maximum=_PG_INT4_MAX)
+        total_invested = self._to_float(stats.get("total_invested"), 0.0)
+        stats["trades_per_day"] = total_trades / days_active
+        stats["avg_position_size"] = total_invested / total_trades if total_trades > 0 else 0.0
+
+        for key in (
+            "win_rate",
+            "total_pnl",
+            "realized_pnl",
+            "unrealized_pnl",
+            "total_invested",
+            "total_returned",
+            "avg_roi",
+            "max_roi",
+            "min_roi",
+            "roi_std",
+            "trades_per_day",
+            "avg_position_size",
+        ):
+            value = stats.get(key)
+            if isinstance(value, float) and not math.isfinite(value):
+                stats[key] = 0.0
+
+        return stats
+
+    # ------------------------------------------------------------------
+    # 2. Risk-Adjusted Metrics
+    # ------------------------------------------------------------------
+
+    def _calculate_risk_adjusted_metrics(
+        self,
+        market_rois: list[float],
+        market_pnls: list[float],
+        days_active: int,
+        total_pnl: float = 0.0,
+        total_invested: float = 0.0,
+    ) -> dict:
+        """
+        Calculate risk-adjusted performance metrics.
+
+        Returns dict with:
+            sharpe_ratio, sortino_ratio, max_drawdown, profit_factor, calmar_ratio
+        """
+        result: dict = {
+            "sharpe_ratio": None,
+            "sortino_ratio": None,
+            "max_drawdown": None,
+            "profit_factor": None,
+            "calmar_ratio": None,
+        }
+
+        if len(market_rois) < MIN_TRADES_FOR_RISK_METRICS:
+            return result
+
+        # ---- Sharpe Ratio ----
+        # (mean_return - risk_free_rate) / std_dev_returns
+        # risk_free_rate = 0 (crypto convention)
+        mean_return = sum(market_rois) / len(market_rois)
+        std_return = self._std_dev(market_rois)
+
+        if std_return > 0:
+            result["sharpe_ratio"] = mean_return / std_return
+        else:
+            # Perfect consistency: infinite Sharpe in theory; cap to a large value
+            result["sharpe_ratio"] = float("inf") if mean_return > 0 else 0.0
+
+        # ---- Sortino Ratio ----
+        # (mean_return - risk_free_rate) / downside_deviation
+        negative_returns = [r for r in market_rois if r < 0]
+        if negative_returns:
+            downside_variance = sum(r**2 for r in negative_returns) / len(negative_returns)
+            downside_deviation = math.sqrt(downside_variance)
+            if downside_deviation > 0:
+                result["sortino_ratio"] = mean_return / downside_deviation
+            else:
+                result["sortino_ratio"] = float("inf") if mean_return > 0 else 0.0
+        else:
+            # No negative returns at all
+            result["sortino_ratio"] = float("inf") if mean_return > 0 else 0.0
+
+        # ---- Max Drawdown ----
+        # Largest peak-to-trough decline in cumulative PnL series.
+        # Walk through PnL in chronological order.
+        if market_pnls:
+            cumulative = 0.0
+            peak = 0.0
+            max_dd = 0.0
+
+            for pnl in market_pnls:
+                cumulative += pnl
+                if cumulative > peak:
+                    peak = cumulative
+                drawdown = peak - cumulative
+                if drawdown > max_dd:
+                    max_dd = drawdown
+
+            # Express as positive fraction of peak (0.15 = 15%)
+            if peak > 0:
+                result["max_drawdown"] = max_dd / peak
+            elif max_dd > 0:
+                # Never had a peak but had losses: use total invested as base
+                base = total_invested if total_invested > 0 else abs(sum(market_pnls))
+                result["max_drawdown"] = max_dd / base if base > 0 else 0.0
+            else:
+                result["max_drawdown"] = 0.0
+
+        # ---- Profit Factor ----
+        # gross_profit / abs(gross_loss)
+        gross_profit = sum(p for p in market_pnls if p > 0)
+        gross_loss = sum(p for p in market_pnls if p < 0)
+
+        if gross_loss < 0:
+            result["profit_factor"] = gross_profit / abs(gross_loss)
+        elif gross_profit > 0:
+            result["profit_factor"] = float("inf")
+        else:
+            result["profit_factor"] = 0.0
+
+        # ---- Calmar Ratio ----
+        # annualized_return / max_drawdown
+        days = max(days_active, 1)
+        if total_invested > 0 and days > 0:
+            annualized_return = (total_pnl / total_invested) * (365.0 / days)
+            max_dd = result.get("max_drawdown") or 0.0
+            if max_dd > 0:
+                result["calmar_ratio"] = annualized_return / max_dd
+            else:
+                result["calmar_ratio"] = None  # Undefined with zero drawdown
+        else:
+            result["calmar_ratio"] = None
+
+        return result
+
+    # ------------------------------------------------------------------
+    # 3. Rolling Time Windows
+    # ------------------------------------------------------------------
+
+    def _calculate_rolling_windows(self, trades: list[dict], current_time: datetime) -> dict:
+        """
+        Calculate metrics over rolling time windows.
+
+        Returns dict with keys:
+            rolling_pnl, rolling_roi, rolling_win_rate,
+            rolling_trade_count, rolling_sharpe
+
+        Each is a dict like {"1d": value, "7d": value, "30d": value, "90d": value}.
+        """
+        rolling_pnl: dict[str, float] = {}
+        rolling_roi: dict[str, float] = {}
+        rolling_win_rate: dict[str, float] = {}
+        rolling_trade_count: dict[str, int] = {}
+        rolling_sharpe: dict[str, float | None] = {}
+
+        for label, delta in ROLLING_WINDOWS.items():
+            cutoff = current_time - delta
+            window_trades = self._filter_trades_after(trades, cutoff)
+
+            if not window_trades:
+                rolling_pnl[label] = 0.0
+                rolling_roi[label] = 0.0
+                rolling_win_rate[label] = 0.0
+                rolling_trade_count[label] = 0
+                rolling_sharpe[label] = None
+                continue
+
+            stats = self._calculate_trade_stats(window_trades)
+            rois = stats.get("_market_rois", [])
+
+            rolling_pnl[label] = stats["total_pnl"]
+            rolling_roi[label] = stats["avg_roi"]
+            rolling_win_rate[label] = stats["win_rate"]
+            rolling_trade_count[label] = stats["total_trades"]
+
+            # Window Sharpe
+            if len(rois) >= 2:
+                mean_r = sum(rois) / len(rois)
+                std_r = self._std_dev(rois)
+                rolling_sharpe[label] = (mean_r / std_r) if std_r > 0 else None
+            else:
+                rolling_sharpe[label] = None
+
+        return {
+            "rolling_pnl": rolling_pnl,
+            "rolling_roi": rolling_roi,
+            "rolling_win_rate": rolling_win_rate,
+            "rolling_trade_count": rolling_trade_count,
+            "rolling_sharpe": rolling_sharpe,
+        }
+
+    # ------------------------------------------------------------------
+    # 4. Composite Rank Score
+    # ------------------------------------------------------------------
+
+    def _calculate_rank_score(self, metrics: dict) -> float:
+        sharpe = metrics.get("sharpe_ratio")
+        if sharpe is None or not math.isfinite(sharpe):
+            sharpe_norm = 0.5
+        else:
+            sharpe_norm = max(0.0, min(sharpe / 5.0, 1.0))
+
+        pf = metrics.get("profit_factor")
+        if pf is None or not math.isfinite(pf):
+            pf_norm = 0.5
+        else:
+            pf_norm = max(0.0, min(pf / 10.0, 1.0))
+
+        win_rate = metrics.get("win_rate_score", metrics.get("win_rate", 0.0))
+        wr_norm = max(0.0, min(win_rate, 1.0))
+
+        total_pnl = metrics.get("total_pnl", 0.0)
+        if total_pnl > 0:
+            pnl_norm = max(0.0, min(math.log10(total_pnl + 1) / 5.0, 1.0))
+        else:
+            pnl_norm = 0.0
+
+        max_dd = metrics.get("max_drawdown")
+        if max_dd is not None and math.isfinite(max_dd):
+            consistency_norm = max(0.0, 1.0 - min(max_dd, 1.0))
+        else:
+            consistency_norm = 0.5
+
+        timing_skill = metrics.get("timing_skill_composite", 0.5)
+        timing_norm = max(0.0, min(timing_skill, 1.0))
+
+        execution_quality = metrics.get("execution_quality_score", 0.5)
+        execution_norm = max(0.0, min(execution_quality, 1.0))
+
+        rank_score = (
+            0.195 * sharpe_norm
+            + 0.1625 * pf_norm
+            + 0.13 * wr_norm
+            + 0.0975 * pnl_norm
+            + 0.065 * consistency_norm
+            + 0.20 * timing_norm
+            + 0.15 * execution_norm
+        )
+
+        return max(0.0, min(rank_score, 1.0))
+
+    # ------------------------------------------------------------------
+    # 4b. Timing Skill
+    # ------------------------------------------------------------------
+
+    def _compute_timing_skill(self, positions: list[dict]) -> dict:
+        WINDOWS = [
+            ("timing_5m", 5),
+            ("timing_30m", 30),
+            ("timing_4h", 240),
+            ("timing_24h", 1440),
+        ]
+        WEIGHTS = {"timing_5m": 0.35, "timing_30m": 0.30, "timing_4h": 0.20, "timing_24h": 0.15}
+        DEFAULT = {
+            "timing_5m": 0.5,
+            "timing_30m": 0.5,
+            "timing_4h": 0.5,
+            "timing_24h": 0.5,
+            "timing_skill_composite": 0.5,
+        }
+
+        closed = [p for p in positions if isinstance(p, dict) and self._to_float(p.get("realizedPnl")) != 0.0]
+        if len(closed) < MIN_TRADES_FOR_ANALYSIS:
+            return DEFAULT
+
+        favorable_counts: dict[str, int] = {key: 0 for key, _ in WINDOWS}
+        total_counted: dict[str, int] = {key: 0 for key, _ in WINDOWS}
+
+        for pos in closed:
+            entry_price = self._to_float(pos.get("avgPrice", pos.get("avg_price", 0)))
+            exit_price = self._to_float(pos.get("exitPrice", pos.get("exit_price", 0)))
+            realized_pnl = self._to_float(pos.get("realizedPnl", 0))
+            initial_value = self._to_float(pos.get("initialValue", 0))
+            size = self._to_float(pos.get("size", 0))
+
+            if entry_price <= 0:
+                continue
+
+            if exit_price <= 0 and initial_value > 0 and size > 0:
+                exit_price = (initial_value + realized_pnl) / size
+            if exit_price <= 0:
+                continue
+
+            is_buy = realized_pnl > 0 if exit_price > entry_price else realized_pnl <= 0
+            price_delta = exit_price - entry_price
+
+            hold_minutes = 0.0
+            start_ts = self._parse_timestamp(pos.get("startTimestamp", pos.get("createdAt", pos.get("created_at"))))
+            end_ts = self._parse_timestamp(pos.get("endTimestamp", pos.get("closedAt", pos.get("closed_at"))))
+            if start_ts and end_ts and end_ts > start_ts:
+                hold_minutes = (end_ts - start_ts).total_seconds() / 60.0
+            if hold_minutes <= 0:
+                hold_duration_hours = self._to_float(pos.get("holdDuration", pos.get("hold_duration_hours", 0)))
+                hold_minutes = hold_duration_hours * 60.0
+            if hold_minutes <= 0:
+                hold_minutes = 1440.0
+
+            for key, window_minutes in WINDOWS:
+                if hold_minutes <= 0:
+                    continue
+
+                if hold_minutes <= window_minutes:
+                    interpolated_price = exit_price
+                else:
+                    fraction = window_minutes / hold_minutes
+                    interpolated_price = entry_price + price_delta * fraction
+
+                movement = interpolated_price - entry_price
+                if is_buy:
+                    favorable = movement > 0
+                else:
+                    favorable = movement < 0
+
+                total_counted[key] += 1
+                if favorable:
+                    favorable_counts[key] += 1
+
+        result = {}
+        for key, _ in WINDOWS:
+            if total_counted[key] > 0:
+                result[key] = favorable_counts[key] / total_counted[key]
+            else:
+                result[key] = 0.5
+
+        composite = sum(result[key] * WEIGHTS[key] for key in WEIGHTS)
+        result["timing_skill_composite"] = composite
+        return result
+
+    # ------------------------------------------------------------------
+    # 4c. Execution Quality
+    # ------------------------------------------------------------------
+
+    def _compute_execution_quality(self, positions: list[dict]) -> dict:
+        DEFAULT = {"avg_slippage_bps": 0.0, "median_slippage_bps": 0.0, "execution_quality_score": 0.5}
+
+        slippages: list[float] = []
+        for pos in positions:
+            if not isinstance(pos, dict):
+                continue
+
+            fill_price = self._to_float(pos.get("avgPrice", pos.get("avg_price", 0)))
+            if fill_price <= 0:
+                continue
+
+            mid_price = 0.0
+            yes_price = self._to_float(pos.get("yesPrice", pos.get("yes_price", 0)))
+            no_price = self._to_float(pos.get("noPrice", pos.get("no_price", 0)))
+            if yes_price > 0 and no_price > 0:
+                outcome = str(pos.get("outcome", pos.get("outcome_index", ""))).strip().upper()
+                if outcome in ("NO", "1"):
+                    mid_price = no_price
+                else:
+                    mid_price = yes_price
+            elif yes_price > 0:
+                mid_price = yes_price
+            elif no_price > 0:
+                mid_price = no_price
+
+            if mid_price <= 0:
+                bid = self._to_float(pos.get("bestBid", pos.get("bid", 0)))
+                ask = self._to_float(pos.get("bestAsk", pos.get("ask", 0)))
+                if bid > 0 and ask > 0:
+                    mid_price = (bid + ask) / 2.0
+                elif bid > 0:
+                    mid_price = bid
+                elif ask > 0:
+                    mid_price = ask
+
+            if mid_price <= 0:
+                initial_value = self._to_float(pos.get("initialValue", 0))
+                size = self._to_float(pos.get("size", 0))
+                if initial_value > 0 and size > 0:
+                    mid_price = initial_value / size
+
+            if mid_price <= 0:
+                continue
+
+            slippage_bps = abs(fill_price - mid_price) / mid_price * 10000.0
+            slippages.append(slippage_bps)
+
+        if len(slippages) < MIN_TRADES_FOR_ANALYSIS:
+            return DEFAULT
+
+        avg_slippage = sum(slippages) / len(slippages)
+        median_slippage = statistics.median(slippages)
+        execution_quality_score = 1.0 - min(1.0, avg_slippage / 100.0)
+
+        return {
+            "avg_slippage_bps": avg_slippage,
+            "median_slippage_bps": median_slippage,
+            "execution_quality_score": max(0.0, min(1.0, execution_quality_score)),
+        }
+
+    # ------------------------------------------------------------------
+    # 5. Strategy & Classification Helpers
+    # ------------------------------------------------------------------
+
+    def _detect_strategies(self, trades: list[dict]) -> list[str]:
+        """Detect which trading strategies a wallet is using."""
+        strategies: set[str] = set()
+
+        market_groups: dict[str, list[dict]] = {}
+        for trade in trades:
+            market_id = trade.get("market", trade.get("condition_id", ""))
+            if market_id:
+                market_groups.setdefault(market_id, []).append(trade)
+
+        # Multi-market date sweep (NegRisk)
+        for _mid, mtrades in market_groups.items():
+            if len(mtrades) >= 3:
+                strategies.add("negrisk_date_sweep")
+
+        # Basic arbitrage (same market, opposite outcomes)
+        for mtrades in market_groups.values():
+            sides = set(t.get("outcome", t.get("side", "")) for t in mtrades)
+            if "Yes" in sides and "No" in sides:
+                strategies.add("basic_arbitrage")
+            if "YES" in sides and "NO" in sides:
+                strategies.add("basic_arbitrage")
+
+        # Automated / high-frequency
+        if len(trades) > 100:
+            strategies.add("automated_trading")
+
+        # Scalping (many trades per market)
+        for mtrades in market_groups.values():
+            if len(mtrades) >= 6:
+                strategies.add("scalping")
+                break
+
+        return list(strategies)
+
+    def _classify_wallet(self, stats: dict, risk_metrics: dict) -> dict:
+        """
+        Classify a wallet and generate recommendation/tags.
+
+        Returns dict with: anomaly_score, is_bot, is_profitable,
+                           recommendation, tags
+        """
+        tags: list[str] = []
+        anomaly_score = 0.0
+
+        win_rate = stats.get("win_rate", 0.0)
+        resolved_positions = self._coerce_int(
+            stats.get("resolved_positions", self._resolved_positions_count(wins=stats.get("wins"), losses=stats.get("losses"))),
+            0,
+            minimum=0,
+            maximum=_PG_INT4_MAX,
+        )
+        adjusted_win_rate = self._confidence_adjusted_win_rate(
+            wins=stats.get("wins", 0),
+            losses=stats.get("losses", 0),
+        )
+        total_pnl = stats.get("total_pnl", 0.0)
+        total_trades = stats.get("total_trades", 0)
+        trades_per_day = stats.get("trades_per_day", 0.0)
+        sharpe = risk_metrics.get("sharpe_ratio")
+        profit_factor = risk_metrics.get("profit_factor")
+
+        # -- Bot detection --
+        is_bot = False
+        if trades_per_day > 20:
+            is_bot = True
+            tags.append("bot")
+        if total_trades > 500:
+            is_bot = True
+            if "bot" not in tags:
+                tags.append("bot")
+
+        # -- Profitability --
+        is_profitable = total_pnl > 0 and win_rate > 0.5
+
+        # -- Performance tags --
+        if adjusted_win_rate >= 0.7 and resolved_positions >= 20:
+            tags.append("high_win_rate")
+        if total_pnl >= 10000:
+            tags.append("whale")
+        elif total_pnl >= 1000:
+            tags.append("profitable")
+        if sharpe is not None and math.isfinite(sharpe) and sharpe >= 2.0:
+            tags.append("risk_adjusted_alpha")
+        if profit_factor is not None and math.isfinite(profit_factor) and profit_factor >= 3.0:
+            tags.append("strong_edge")
+        if adjusted_win_rate >= 0.55 and total_pnl > 0 and resolved_positions >= 50:
+            tags.append("consistent")
+
+        # -- Anomaly score (light version) --
+        if adjusted_win_rate >= 0.95 and resolved_positions >= 20:
+            anomaly_score = max(anomaly_score, 0.8)
+            tags.append("suspicious_win_rate")
+        if adjusted_win_rate >= 0.85 and resolved_positions >= 50:
+            anomaly_score = max(anomaly_score, 0.5)
+
+        # -- Recommendation --
+        if anomaly_score >= 0.7:
+            recommendation = "avoid"
+        elif is_profitable and adjusted_win_rate >= 0.6 and resolved_positions >= 20:
+            recommendation = "copy_candidate"
+        elif is_profitable and resolved_positions >= 10:
+            recommendation = "monitor"
+        elif total_trades < MIN_TRADES_FOR_ANALYSIS:
+            recommendation = "unanalyzed"
+        else:
+            recommendation = "monitor"
+
+        return {
+            "anomaly_score": anomaly_score,
+            "is_bot": is_bot,
+            "is_profitable": is_profitable,
+            "recommendation": recommendation,
+            "tags": tags,
+        }
+
+    # ------------------------------------------------------------------
+    # 6. Full Wallet Analysis
+    # ------------------------------------------------------------------
+
+    async def analyze_wallet(self, address: str) -> dict | None:
+        """
+        Run full analysis pipeline for a single wallet.
+
+        Returns a dict of all fields ready to be stored in DiscoveredWallet,
+        or None if there is insufficient data.
+        """
+        address = address.lower()
+
+        fetch_results = await asyncio.gather(
+            self.client.get_wallet_trades(address, limit=1500),
+            self.client.get_wallet_positions(address),
+            self.client.get_user_profile(address),
+            self.client.get_wallet_pnl(address, time_period="ALL"),
+            self.client.get_closed_positions_paginated(
+                address,
+                max_positions=_DISCOVERY_CLOSED_POSITIONS_MAX,
+            ),
+            return_exceptions=True,
+        )
+
+        trades_result, positions_result, profile_result, pnl_snapshot_result, closed_positions_result = fetch_results
+        fetch_failures: dict[str, str] = {}
+
+        if isinstance(trades_result, Exception):
+            fetch_failures["trades"] = _exception_text(trades_result)
+            trades: list[dict] = []
+        else:
+            trades = list(trades_result or [])
+
+        if isinstance(positions_result, Exception):
+            fetch_failures["positions"] = _exception_text(positions_result)
+            positions: list[dict] = []
+        else:
+            positions = list(positions_result or [])
+
+        if isinstance(profile_result, Exception):
+            fetch_failures["profile"] = _exception_text(profile_result)
+            profile: dict[str, Any] = {}
+        else:
+            profile = dict(profile_result or {})
+
+        if isinstance(pnl_snapshot_result, Exception):
+            fetch_failures["pnl"] = _exception_text(pnl_snapshot_result)
+            pnl_snapshot: dict[str, Any] = {}
+        else:
+            pnl_snapshot = dict(pnl_snapshot_result or {})
+
+        if isinstance(closed_positions_result, Exception):
+            fetch_failures["closed_positions"] = _exception_text(closed_positions_result)
+            closed_positions: list[dict] = []
+        else:
+            closed_positions = list(closed_positions_result or [])
+
+        if fetch_failures and not (trades or positions or closed_positions):
+            logger.error(
+                "Failed to fetch wallet analysis inputs",
+                address=address,
+                failures=fetch_failures,
+            )
+            return None
+
+        if fetch_failures:
+            logger.warning(
+                "Wallet analysis continuing with partial upstream data",
+                address=address,
+                failures=fetch_failures,
+            )
+
+        if len(trades) < MIN_TRADES_FOR_ANALYSIS and not positions and len(closed_positions) < MIN_TRADES_FOR_ANALYSIS:
+            return None
+
+        # All statistical computations are CPU-bound. Run them in the
+        # thread pool so the async event loop stays free for API requests.
+        def _compute_profile(
+            engine,
+            trade_list,
+            position_list,
+            pnl_snapshot_payload,
+            closed_position_payload,
+        ):
+            stats = engine._calculate_trade_stats(trade_list, position_list)
+            stats = engine._enrich_stats_with_fifo(stats, trade_list)
+            stats = engine._build_accuracy_first_stats(
+                base_stats=stats,
+                pnl_snapshot=pnl_snapshot_payload,
+                closed_positions=closed_position_payload,
+            )
+            risk_metrics = engine._calculate_risk_adjusted_metrics(
+                market_rois=stats["_market_rois"],
+                market_pnls=stats["_market_pnls"],
+                days_active=stats["days_active"],
+                total_pnl=stats["total_pnl"],
+                total_invested=stats["total_invested"],
+            )
+            now_inner = utcnow()
+            rolling = engine._calculate_rolling_windows(trade_list, now_inner)
+            strategies = engine._detect_strategies(trade_list)
+            classification = engine._classify_wallet(stats, risk_metrics)
+            timing_skill = engine._compute_timing_skill(closed_position_payload)
+            execution_quality = engine._compute_execution_quality(closed_position_payload)
+            rank_input = {
+                "sharpe_ratio": risk_metrics["sharpe_ratio"],
+                "profit_factor": risk_metrics["profit_factor"],
+                "win_rate": stats["win_rate"],
+                "win_rate_score": stats["win_rate_score"],
+                "total_pnl": stats["total_pnl"],
+                "max_drawdown": risk_metrics["max_drawdown"],
+                "timing_skill_composite": timing_skill["timing_skill_composite"],
+                "execution_quality_score": execution_quality["execution_quality_score"],
+            }
+            rank_score = engine._calculate_rank_score(rank_input)
+            return (
+                stats,
+                risk_metrics,
+                rolling,
+                strategies,
+                classification,
+                rank_score,
+                now_inner,
+                timing_skill,
+                execution_quality,
+            )
+
+        (
+            stats,
+            risk_metrics,
+            rolling,
+            strategies,
+            classification,
+            rank_score,
+            now,
+            timing_skill,
+            execution_quality,
+        ) = await asyncio.to_thread(
+            _compute_profile,
+            self,
+            trades,
+            positions,
+            pnl_snapshot,
+            closed_positions,
+        )
+
+        # If a custom discovery profile is active, delegate scoring to it.
+        try:
+            from services.discovery_profile_loader import discovery_profile_loader
+
+            active_profile = discovery_profile_loader.get_active_instance()
+            if active_profile is not None:
+                wallet_dict = {
+                    "address": address,
+                    "total_trades": stats["total_trades"],
+                    "wins": stats["wins"],
+                    "losses": stats["losses"],
+                    "win_rate": stats["win_rate"],
+                    "total_pnl": stats["total_pnl"],
+                    "avg_roi": stats["avg_roi"],
+                    "sharpe_ratio": risk_metrics.get("sharpe_ratio"),
+                    "sortino_ratio": risk_metrics.get("sortino_ratio"),
+                    "max_drawdown": risk_metrics.get("max_drawdown"),
+                    "profit_factor": risk_metrics.get("profit_factor"),
+                    "calmar_ratio": risk_metrics.get("calmar_ratio"),
+                    "anomaly_score": classification.get("anomaly_score", 0.0),
+                    "is_bot": classification.get("is_bot", False),
+                    "trades_per_day": stats.get("trades_per_day", 0.0),
+                    "days_active": stats.get("days_active", 0),
+                    "timing_skill_composite": timing_skill.get("timing_skill_composite", 0.5),
+                    "execution_quality_score": execution_quality.get("execution_quality_score", 0.5),
+                    "roi_std": stats.get("roi_std", 0.0),
+                    "cluster_id": None,
+                }
+                rolling_dict = {
+                    "rolling_pnl": rolling.get("rolling_pnl", {}),
+                    "rolling_roi": rolling.get("rolling_roi", {}),
+                    "rolling_win_rate": rolling.get("rolling_win_rate", {}),
+                    "rolling_trade_count": rolling.get("rolling_trade_count", {}),
+                }
+                profile_result = active_profile.score_wallet(wallet_dict, trades, rolling_dict)
+                if isinstance(profile_result, dict):
+                    if "rank_score" in profile_result:
+                        rank_score = float(profile_result["rank_score"])
+                    if "tags" in profile_result and isinstance(profile_result["tags"], list):
+                        classification["tags"] = profile_result["tags"]
+                    if "recommendation" in profile_result:
+                        classification["recommendation"] = str(profile_result["recommendation"])
+        except Exception as exc:
+            logger.debug("Discovery profile scoring skipped: %s", exc)
+
+        username = profile.get("username") if profile else None
+
+        return {
+            "address": address,
+            "username": username,
+            "last_analyzed_at": now,
+            "discovery_source": "scan",
+            "metrics_source_version": METRICS_SOURCE_VERSION,
+            # Basic stats
+            "total_trades": stats["total_trades"],
+            "wins": stats["wins"],
+            "losses": stats["losses"],
+            "resolved_positions": stats["resolved_positions"],
+            "win_rate": stats["win_rate"],
+            "total_pnl": stats["total_pnl"],
+            "realized_pnl": stats["realized_pnl"],
+            "unrealized_pnl": stats["unrealized_pnl"],
+            "total_invested": stats["total_invested"],
+            "total_returned": stats["total_returned"],
+            "avg_roi": stats["avg_roi"],
+            "max_roi": stats["max_roi"],
+            "min_roi": stats["min_roi"],
+            "roi_std": stats["roi_std"],
+            "unique_markets": stats["unique_markets"],
+            "open_positions": stats["open_positions"],
+            "days_active": stats["days_active"],
+            "avg_hold_time_hours": stats["avg_hold_time_hours"],
+            "trades_per_day": stats["trades_per_day"],
+            "avg_position_size": stats["avg_position_size"],
+            # Risk-adjusted
+            "sharpe_ratio": risk_metrics["sharpe_ratio"],
+            "sortino_ratio": risk_metrics["sortino_ratio"],
+            "max_drawdown": risk_metrics["max_drawdown"],
+            "profit_factor": risk_metrics["profit_factor"],
+            "calmar_ratio": risk_metrics["calmar_ratio"],
+            # Rolling windows
+            "rolling_pnl": rolling["rolling_pnl"],
+            "rolling_roi": rolling["rolling_roi"],
+            "rolling_win_rate": rolling["rolling_win_rate"],
+            "rolling_trade_count": rolling["rolling_trade_count"],
+            "rolling_sharpe": rolling["rolling_sharpe"],
+            # Classification
+            "anomaly_score": classification["anomaly_score"],
+            "is_bot": classification["is_bot"],
+            "is_profitable": classification["is_profitable"],
+            "recommendation": classification["recommendation"],
+            "strategies_detected": strategies,
+            "tags": classification["tags"],
+            # Ranking
+            "rank_score": rank_score,
+            # Extended metrics
+            "metrics_json": {
+                "timing_skill": timing_skill,
+                "execution_quality": execution_quality,
+                "fifo": {
+                    "realized_pnl": stats.get("fifo_realized_pnl", 0.0),
+                    "closed_lots": stats.get("fifo_closed_lots", 0),
+                    "open_lots": stats.get("fifo_open_lots", 0),
+                    "accuracy": stats.get("fifo_accuracy", 0.0),
+                },
+                "confidence": {
+                    "win_rate_score": stats.get("win_rate_score", 0.5),
+                    "win_rate_confidence": stats.get("win_rate_confidence", 0.0),
+                    "resolved_positions": stats.get("resolved_positions", 0),
+                },
+            },
+        }
+
+    # ------------------------------------------------------------------
+    # 7. Wallet Discovery from Market Trades
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _normalize_wallet_address(value: Any) -> str:
+        addr = str(value or "").strip().lower()
+        if len(addr) < 10:
+            return ""
+        return addr
+
+    @staticmethod
+    def _leaderboard_combo_key(*, order_by: str, time_period: str, category: str) -> str:
+        return f"{order_by.upper()}:{time_period.upper()}:{category.upper()}"
+
+    @staticmethod
+    def _leaderboard_discovery_combinations() -> list[tuple[str, str, str]]:
+        combos: list[tuple[str, str, str]] = []
+        for time_period in DISCOVERY_LEADERBOARD_TIME_PERIODS:
+            for category in DISCOVERY_LEADERBOARD_CATEGORIES:
+                for order_by in DISCOVERY_LEADERBOARD_SORTS:
+                    combos.append((order_by, time_period, category))
+        return combos
+
+    @staticmethod
+    def _market_identity(market: object) -> str:
+        for attr in ("condition_id", "id", "slug"):
+            value = getattr(market, attr, None)
+            normalized = str(value or "").strip().lower()
+            if normalized:
+                return normalized
+        return ""
+
+    def _merge_market_sets(
+        self,
+        *groups: list[object],
+        limit: int,
+    ) -> list[object]:
+        merged: list[object] = []
+        seen: set[str] = set()
+        for group in groups:
+            for market in group:
+                identity = self._market_identity(market)
+                if identity and identity in seen:
+                    continue
+                if identity:
+                    seen.add(identity)
+                merged.append(market)
+                if len(merged) >= limit:
+                    return merged
+        return merged
+
+    async def _fetch_active_market_slice(
+        self,
+        *,
+        offset: int,
+        limit: int,
+        delay_between_requests: float,
+    ) -> list[object]:
+        if limit <= 0:
+            return []
+        out: list[object] = []
+        remaining = int(max(0, limit))
+        cursor = int(max(0, offset))
+        while remaining > 0:
+            page_limit = min(100, remaining)
+            page = await self.client.get_markets(active=True, limit=page_limit, offset=cursor)
+            if not page:
+                break
+            out.extend(page)
+            fetched = len(page)
+            remaining -= fetched
+            cursor += fetched
+            if fetched < page_limit:
+                break
+            if delay_between_requests > 0:
+                await asyncio.sleep(delay_between_requests)
+        return out
+
+    async def _select_markets_for_discovery(
+        self,
+        *,
+        max_markets: int,
+        delay_between_requests: float,
+    ) -> tuple[list[object], dict[str, int]]:
+        start_offset = int(max(0, self._market_scan_offset))
+        primary = await self._fetch_active_market_slice(
+            offset=start_offset,
+            limit=max_markets,
+            delay_between_requests=delay_between_requests,
+        )
+        wrapped: list[object] = []
+        if start_offset > 0 and len(primary) < max_markets:
+            wrapped = await self._fetch_active_market_slice(
+                offset=0,
+                limit=max_markets - len(primary),
+                delay_between_requests=delay_between_requests,
+            )
+
+        # Advance cursor for the next run.
+        if wrapped:
+            self._market_scan_offset = len(wrapped)
+        elif len(primary) < max_markets:
+            self._market_scan_offset = 0
+        else:
+            self._market_scan_offset = start_offset + len(primary)
+
+        recent_markets: list[object] = []
+        try:
+            recent_markets = await self.client.get_recent_markets(
+                since_minutes=DISCOVERY_DEFAULT_RECENT_MARKET_LOOKBACK_MINUTES,
+                active=True,
+            )
+        except Exception as e:
+            logger.warning("Recent market fetch failed during discovery: %s", e)
+
+        recent_cap = max(10, min(80, max_markets // 3))
+        selected_recent = recent_markets[:recent_cap]
+        merged = self._merge_market_sets(
+            selected_recent,
+            primary,
+            wrapped,
+            limit=max_markets,
+        )
+        stats = {
+            "market_scan_offset_start": start_offset,
+            "market_scan_offset_next": int(self._market_scan_offset),
+            "markets_primary": len(primary),
+            "markets_wrapped": len(wrapped),
+            "markets_recent": len(selected_recent),
+            "markets_selected": len(merged),
+        }
+        return merged, stats
+
+    async def _discover_wallets_from_market(self, market: object, max_wallets: int = 50) -> set[str]:
+        """
+        Fetch recent trades for a single market and extract unique wallet
+        addresses. ``market`` is a Market model instance from the Gamma API.
+        """
+        discovered: set[str] = set()
+
+        try:
+            condition_id = getattr(market, "condition_id", None)
+            if not condition_id:
+                return discovered
+
+            per_page_limit = max(50, min(500, max_wallets * 2))
+            offset = 0
+            pages_fetched = 0
+            while len(discovered) < max_wallets and pages_fetched < 4:
+                trades = await self.client.get_market_trades(
+                    condition_id,
+                    limit=per_page_limit,
+                    offset=offset,
+                )
+                pages_fetched += 1
+                if not trades:
+                    break
+                # The data API may return one of these fields depending on endpoint shape.
+                for trade in trades:
+                    for field in (
+                        "user",
+                        "taker",
+                        "maker",
+                        "proxyWallet",
+                        "wallet",
+                        "wallet_address",
+                    ):
+                        addr = self._normalize_wallet_address(trade.get(field, ""))
+                        if addr:
+                            discovered.add(addr)
+                    if len(discovered) >= max_wallets:
+                        break
+
+                offset += len(trades)
+                if offset >= 2000:
+                    break
+                # Some endpoints return short pages even when more rows exist.
+                # Allow a couple follow-up probes, then stop if pages remain short.
+                if len(trades) < per_page_limit and pages_fetched >= 2:
+                    break
+
+        except Exception as e:
+            market_label = str(getattr(market, "question", "?") or "?")[:60]
+            logger.warning("Failed to fetch trades for market '%s': %s", market_label, e)
+
+        return discovered
+
+    async def _discover_wallets_from_leaderboard(self, scan_count: int = 200) -> set[str]:
+        """
+        Supplement market-based discovery with wallets from rotating
+        leaderboard slices (time periods, categories, and sort modes).
+        """
+        discovered: set[str] = set()
+        combos = self._leaderboard_discovery_combinations()
+        if not combos:
+            return discovered
+
+        requests_budget = int(
+            max(
+                DISCOVERY_LEADERBOARD_MIN_REQUESTS_PER_RUN,
+                min(
+                    DISCOVERY_LEADERBOARD_MAX_REQUESTS_PER_RUN,
+                    math.ceil(max(scan_count, DISCOVERY_LEADERBOARD_PAGE_SIZE) / 20),
+                ),
+            )
+        )
+        start_cursor = int(self._leaderboard_scan_cursor % len(combos))
+
+        for i in range(requests_budget):
+            order_by, time_period, category = combos[(start_cursor + i) % len(combos)]
+            combo_key = self._leaderboard_combo_key(
+                order_by=order_by,
+                time_period=time_period,
+                category=category,
+            )
+            offset = int(max(0, self._leaderboard_offsets.get(combo_key, 0)))
+
+            try:
+                entries = await self.client.get_leaderboard(
+                    limit=DISCOVERY_LEADERBOARD_PAGE_SIZE,
+                    time_period=time_period,
+                    order_by=order_by,
+                    category=category,
+                    offset=offset,
+                )
+                if not entries and offset > 0:
+                    offset = 0
+                    entries = await self.client.get_leaderboard(
+                        limit=DISCOVERY_LEADERBOARD_PAGE_SIZE,
+                        time_period=time_period,
+                        order_by=order_by,
+                        category=category,
+                        offset=offset,
+                    )
+            except Exception as e:
+                logger.warning(
+                    "Leaderboard scan failed (order_by=%s, time_period=%s, category=%s): %s",
+                    order_by,
+                    time_period,
+                    category,
+                    e,
+                )
+                self._leaderboard_offsets[combo_key] = 0
+                continue
+
+            if not entries:
+                self._leaderboard_offsets[combo_key] = 0
+                continue
+
+            for entry in entries:
+                addr = self._normalize_wallet_address(
+                    entry.get("proxyWallet") or entry.get("wallet") or entry.get("address")
+                )
+                if addr:
+                    discovered.add(addr)
+
+            next_offset = offset + len(entries)
+            if len(entries) < DISCOVERY_LEADERBOARD_PAGE_SIZE:
+                next_offset = 0
+            self._leaderboard_offsets[combo_key] = next_offset
+
+        self._leaderboard_scan_cursor = (start_cursor + requests_budget) % len(combos)
+
+        return discovered
+
+    # ------------------------------------------------------------------
+    # 8. Database Persistence
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _coerce_source_flags(raw_flags: Any) -> dict[str, Any]:
+        if isinstance(raw_flags, dict):
+            return raw_flags
+        return {}
+
+    @staticmethod
+    def _is_pool_protected(flags: dict[str, Any]) -> bool:
+        return bool(
+            flags.get(POOL_FLAG_MANUAL_INCLUDE)
+            or flags.get(POOL_FLAG_MANUAL_EXCLUDE)
+            or flags.get(POOL_FLAG_BLACKLISTED)
+        )
+
+    def _is_wallet_discovery_protected(self, wallet: DiscoveredWallet) -> bool:
+        if wallet.in_top_pool:
+            return True
+
+        source = str(wallet.discovery_source or "").strip().lower()
+        if source in {"manual", "manual_pool", "referral"}:
+            return True
+
+        flags = self._coerce_source_flags(wallet.source_flags)
+        return self._is_pool_protected(flags)
+
+    def _discovery_curation_score(self, wallet: DiscoveredWallet, now: datetime) -> float:
+        score = float(wallet.rank_score or 0.0)
+        score += min(float(wallet.total_trades or 0), 2500) / 2500.0
+        if wallet.last_analyzed_at is not None:
+            score += max(
+                0.0,
+                1.0 - (now - wallet.last_analyzed_at).total_seconds() / 2_592_000.0,
+            )
+        if wallet.total_pnl and wallet.total_pnl > 0:
+            score += 0.3
+        if str(wallet.recommendation or "").strip().lower() == "copy_candidate":
+            score += 0.5
+        if bool(wallet.is_profitable):
+            score += 0.2
+        return score
+
+    @staticmethod
+    def _chunked(addresses: list[str], size: int) -> list[list[str]]:
+        if size <= 0:
+            return [addresses]
+        return [addresses[i : i + size] for i in range(0, len(addresses), size)]
+
+    async def _discovered_wallet_catalog_exceeds_cap(self, session, *, cap: int) -> bool:
+        probe_limit = max(1, int(cap) + 1)
+        probe_result = await session.execute(
+            text(
+                """
+                SELECT count(*) AS probe_count
+                FROM (
+                    SELECT 1
+                    FROM discovered_wallets
+                    LIMIT :probe_limit
+                ) AS probe
+                """
+            ),
+            {"probe_limit": probe_limit},
+        )
+        return int(probe_result.scalar() or 0) > int(cap)
+
+    async def _approximate_discovered_wallet_count(self, session) -> int:
+        result = await session.execute(
+            text(
+                """
+                SELECT GREATEST(
+                    COALESCE(
+                        (
+                            SELECT floor(reltuples)::bigint
+                            FROM pg_class
+                            WHERE oid = 'discovered_wallets'::regclass
+                        ),
+                        0
+                    ),
+                    COALESCE(
+                        (
+                            SELECT n_live_tup::bigint
+                            FROM pg_stat_user_tables
+                            WHERE relname = 'discovered_wallets'
+                        ),
+                        0
+                    )
+                ) AS approx_total
+                """
+            )
+        )
+        return max(0, int(result.scalar() or 0))
+
+    async def _select_wallet_cleanup_candidates(
+        self,
+        session,
+        *,
+        now: datetime,
+        cutoff_trade: datetime,
+        cutoff_discovered: datetime,
+        limit: int,
+        stale_only: bool,
+        exclude_addresses: list[str] | None = None,
+    ) -> list[str]:
+        if limit <= 0:
+            return []
+        exclude_addresses = [str(address).strip().lower() for address in (exclude_addresses or []) if str(address).strip()]
+        stale_clause = ""
+        if stale_only:
+            stale_clause = """
+              AND (last_trade_at IS NULL OR last_trade_at < :cutoff_trade)
+              AND (discovered_at IS NULL OR discovered_at < :cutoff_discovered)
+            """
+        result = await session.execute(
+            text(
+                f"""
+                SELECT address
+                FROM discovered_wallets
+                WHERE NOT COALESCE(in_top_pool, FALSE)
+                  AND lower(COALESCE(discovery_source, '')) NOT IN ('manual', 'manual_pool', 'referral')
+                  AND NOT (CAST(COALESCE(source_flags, '{{}}'::json) AS jsonb) ? :manual_include)
+                  AND NOT (CAST(COALESCE(source_flags, '{{}}'::json) AS jsonb) ? :manual_exclude)
+                  AND NOT (CAST(COALESCE(source_flags, '{{}}'::json) AS jsonb) ? :blacklisted)
+                  AND (:exclude_empty OR address <> ALL(CAST(:exclude_addresses AS text[])))
+                  {stale_clause}
+                ORDER BY
+                  (
+                    COALESCE(rank_score, 0.0)
+                    + LEAST(COALESCE(total_trades, 0), 2500)::double precision / 2500.0
+                    + CASE
+                        WHEN last_analyzed_at IS NOT NULL THEN GREATEST(
+                            0.0,
+                            1.0 - EXTRACT(EPOCH FROM (:now_ts - last_analyzed_at)) / 2592000.0
+                        )
+                        ELSE 0.0
+                      END
+                    + CASE WHEN COALESCE(total_pnl, 0.0) > 0.0 THEN 0.3 ELSE 0.0 END
+                    + CASE WHEN lower(COALESCE(recommendation, '')) = 'copy_candidate' THEN 0.5 ELSE 0.0 END
+                    + CASE WHEN COALESCE(is_profitable, FALSE) THEN 0.2 ELSE 0.0 END
+                  ) ASC,
+                  address ASC
+                LIMIT :limit
+                """
+            ),
+            {
+                "manual_include": POOL_FLAG_MANUAL_INCLUDE,
+                "manual_exclude": POOL_FLAG_MANUAL_EXCLUDE,
+                "blacklisted": POOL_FLAG_BLACKLISTED,
+                "exclude_empty": not exclude_addresses,
+                "exclude_addresses": exclude_addresses,
+                "cutoff_trade": as_utc_naive(cutoff_trade),
+                "cutoff_discovered": as_utc_naive(cutoff_discovered),
+                "now_ts": as_utc_naive(now),
+                "limit": int(limit),
+            },
+        )
+        return [str(address).strip().lower() for address in result.scalars().all() if str(address or "").strip()]
+
+    async def _upsert_discovered_placeholders(
+        self,
+        addresses: set[str],
+        discovery_source: str = "scan",
+    ) -> int:
+        """Insert discovered addresses as seed rows even before full analysis."""
+        normalized = {
+            str(address).strip().lower() for address in addresses if isinstance(address, str) and str(address).strip()
+        }
+        if not normalized:
+            return 0
+
+        now = utcnow()
+        normalized_list = sorted(normalized)
+        maintenance_batch = self._coerce_int(
+            self._discovery_setting("maintenance_batch", 900),
+            DISCOVERY_DEFAULT_MAINTENANCE_BATCH,
+            minimum=10,
+            maximum=DISCOVERY_MAX_DB_BATCH,
+        )
+
+        created = 0
+        async with AsyncSessionLocal() as session:
+            for chunk in self._chunked(normalized_list, maintenance_batch):
+                result = await session.execute(
+                    text(
+                        """
+                        INSERT INTO discovered_wallets (
+                            address,
+                            discovered_at,
+                            discovery_source
+                        )
+                        SELECT
+                            discovered.address,
+                            :discovered_at,
+                            :discovery_source
+                        FROM unnest(CAST(:addresses AS text[])) AS discovered(address)
+                        ON CONFLICT (address) DO NOTHING
+                        RETURNING address
+                        """
+                    ),
+                    {
+                        "addresses": chunk,
+                        "discovered_at": as_utc_naive(now),
+                        "discovery_source": discovery_source,
+                    },
+                )
+                await session.commit()
+                created += len(result.scalars().all())
+        return created
+
+    async def _cleanup_discovered_wallet_catalog(self, now: datetime | None = None) -> int:
+        """
+        Keep the discovered-wallet catalog bounded by removing weak non-critical rows.
+        """
+        max_discovered_wallets = self._coerce_int(
+            self._discovery_setting("max_discovered_wallets", 20000),
+            DISCOVERY_DEFAULT_MAX_DISCOVERED_WALLETS,
+            minimum=10,
+        )
+        maintenance_enabled = _coerce_bool(
+            self._discovery_setting("maintenance_enabled", True),
+            DISCOVERY_DEFAULT_MAINTENANCE_ENABLED,
+        )
+        if not maintenance_enabled:
+            return 0
+
+        now = now or utcnow()
+        maintenance_batch = self._coerce_int(
+            self._discovery_setting("maintenance_batch", 900),
+            DISCOVERY_DEFAULT_MAINTENANCE_BATCH,
+            minimum=10,
+            maximum=DISCOVERY_MAX_DB_BATCH,
+        )
+        cutoff_trade = now - timedelta(
+            days=max(
+                1,
+                self._coerce_int(
+                    self._discovery_setting("keep_recent_trade_days", 7),
+                    DISCOVERY_DEFAULT_KEEP_RECENT_TRADE_DAYS,
+                    minimum=1,
+                ),
+            )
+        )
+        cutoff_discovered = now - timedelta(
+            days=max(
+                1,
+                self._coerce_int(
+                    self._discovery_setting("keep_new_discoveries_days", 30),
+                    DISCOVERY_DEFAULT_KEEP_NEW_DISCOVERIES_DAYS,
+                    minimum=1,
+                ),
+            )
+        )
+        async with AsyncSessionLocal() as session:
+            if not await self._discovered_wallet_catalog_exceeds_cap(session, cap=max_discovered_wallets):
+                return 0
+            approx_total = await self._approximate_discovered_wallet_count(session)
+
+        estimated_excess = max(1, approx_total - max_discovered_wallets)
+        remove_target = min(
+            DISCOVERY_MAX_DB_BATCH,
+            max(maintenance_batch, estimated_excess),
+        )
+
+        to_remove: list[str] = []
+        async with AsyncSessionLocal() as session:
+            to_remove = await self._select_wallet_cleanup_candidates(
+                session,
+                now=now,
+                cutoff_trade=cutoff_trade,
+                cutoff_discovered=cutoff_discovered,
+                limit=remove_target,
+                stale_only=True,
+            )
+            if len(to_remove) < remove_target:
+                to_remove.extend(
+                    await self._select_wallet_cleanup_candidates(
+                        session,
+                        now=now,
+                        cutoff_trade=cutoff_trade,
+                        cutoff_discovered=cutoff_discovered,
+                        limit=remove_target - len(to_remove),
+                        stale_only=False,
+                        exclude_addresses=to_remove,
+                    )
+                )
+        if not to_remove:
+            return 0
+
+        removed = 0
+        for chunk in self._chunked(to_remove, maintenance_batch):
+            async with AsyncSessionLocal() as session:
+                result = await session.execute(delete(DiscoveredWallet).where(DiscoveredWallet.address.in_(chunk)))
+                removed += int(result.rowcount or 0)
+                await session.commit()
+        return removed
+
+    async def _upsert_wallet(self, data: dict):
+        """Insert or update a DiscoveredWallet record."""
+        address = data["address"]
+        int_fields = {
+            "total_trades",
+            "wins",
+            "losses",
+            "unique_markets",
+            "open_positions",
+            "days_active",
+            "rank_position",
+            "trades_1h",
+            "trades_24h",
+            "unique_markets_24h",
+            "insider_sample_size",
+        }
+        str_fields = {
+            "username",
+            "discovery_source",
+            "recommendation",
+            "metrics_source_version",
+            "pool_tier",
+            "pool_membership_reason",
+            "cluster_id",
+        }
+
+        for attempt in range(_DB_RETRY_ATTEMPTS):
+            async with AsyncSessionLocal() as session:
+                try:
+                    numeric_bounds = await self._load_discovered_wallet_numeric_bounds(session)
+                    payload: dict[str, Any] = {
+                        "address": address,
+                        "discovered_at": utcnow(),
+                    }
+
+                    for key, value in data.items():
+                        if key == "address":
+                            continue
+                        if key in int_fields and value is not None:
+                            value = self._coerce_int(
+                                value,
+                                0,
+                                minimum=0,
+                                maximum=_PG_INT4_MAX,
+                            )
+                        elif key in str_fields:
+                            if value is not None:
+                                value = str(value)
+                        elif key in numeric_bounds and value is not None:
+                            value = self._clamp_numeric_value(value, numeric_bounds[key])
+                        else:
+                            value = self._sanitize_numeric_payload(value, _NUMERIC_DEFAULT_ABS_MAX)
+                        if isinstance(value, float) and (math.isinf(value) or math.isnan(value)):
+                            value = None
+                        if hasattr(DiscoveredWallet, key):
+                            payload[key] = value
+
+                    update_values = {
+                        key: value
+                        for key, value in payload.items()
+                        if key not in {"address", "discovered_at"}
+                    }
+
+                    await session.execute(
+                        pg_insert(DiscoveredWallet)
+                        .values(**payload)
+                        .on_conflict_do_update(
+                            index_elements=[DiscoveredWallet.address],
+                            set_=update_values,
+                        )
+                    )
+
+                    await session.commit()
+                    return
+                except DBAPIError as exc:
+                    await session.rollback()
+                    if not _is_retryable_db_error(exc) or attempt >= _DB_RETRY_ATTEMPTS - 1:
+                        raise
+                    await asyncio.sleep(_db_retry_delay(attempt))
+
+    async def _is_stale(self, address: str) -> bool:
+        """Check if a wallet's analysis is stale or missing."""
+        async with AsyncSessionLocal() as session:
+            wallet = await session.get(DiscoveredWallet, address)
+            if wallet is None:
+                return True
+            if wallet.last_analyzed_at is None:
+                return True
+            age = utcnow() - wallet.last_analyzed_at
+            stale_analysis_hours = self._coerce_int(
+                self._discovery_setting("stale_analysis_hours", 12),
+                DISCOVERY_DEFAULT_STALE_ANALYSIS_HOURS,
+                minimum=1,
+            )
+            return age.total_seconds() > stale_analysis_hours * 3600
+
+    # ------------------------------------------------------------------
+    # 9. Leaderboard Refresh
+    # ------------------------------------------------------------------
+
+    async def refresh_leaderboard(self):
+        """
+        Recalculate rank_position for all discovered wallets based
+        on rank_score descending.  Uses batched updates to avoid
+        holding row locks across the entire table in a single
+        statement (which causes deadlocks with recompute_pool and
+        exceeds statement_timeout on large catalogs).
+        """
+        BATCH_SIZE = 500
+
+        # Phase 1: Read addresses + current rank_position (lightweight query).
+        async with AsyncSessionLocal() as session:
+            rows = (
+                await session.execute(
+                    select(
+                        DiscoveredWallet.address,
+                        DiscoveredWallet.rank_score,
+                        DiscoveredWallet.rank_position,
+                    ).order_by(
+                        DiscoveredWallet.rank_score.desc().nullslast(),
+                        DiscoveredWallet.address.asc(),
+                    )
+                )
+            ).all()
+
+        # Phase 2: Compute new ranks in Python (no DB connection held).
+        dirty: list[tuple[str, int]] = []
+        for new_rank, (address, _score, old_rank) in enumerate(rows, start=1):
+            if old_rank != new_rank:
+                dirty.append((address, new_rank))
+
+        # Phase 3: Write changed ranks in small batches.
+        updated = 0
+        for i in range(0, len(dirty), BATCH_SIZE):
+            batch = dirty[i : i + BATCH_SIZE]
+            async with AsyncSessionLocal() as session:
+                await session.execute(
+                    text(
+                        """
+                        UPDATE discovered_wallets AS d
+                        SET rank_position = v.new_rank
+                        FROM (SELECT unnest(CAST(:addrs AS text[])) AS address,
+                                     unnest(CAST(:ranks AS integer[])) AS new_rank) AS v
+                        WHERE d.address = v.address
+                        """
+                    ),
+                    {
+                        "addrs": [addr for addr, _ in batch],
+                        "ranks": [rank for _, rank in batch],
+                    },
+                )
+                await session.commit()
+                updated += len(batch)
+
+        logger.info(
+            "Leaderboard refreshed",
+            total_wallets=len(rows),
+            updated=updated,
+        )
+
+    @staticmethod
+    def _merge_unique_addresses(*groups: list[str]) -> list[str]:
+        merged: list[str] = []
+        seen: set[str] = set()
+        for group in groups:
+            for raw in group:
+                addr = str(raw or "").strip().lower()
+                if not addr or addr in seen:
+                    continue
+                seen.add(addr)
+                merged.append(addr)
+        return merged
+
+    async def _maintenance_refresh_queue(
+        self,
+        *,
+        stale_cutoff: datetime,
+        limit: int | None = None,
+    ) -> list[str]:
+        """Select oldest stale/unanalyzed wallets to keep the catalog healthy."""
+        priority_default = self._coerce_int(
+            self._discovery_setting("analysis_priority_batch_limit", 2500),
+            DISCOVERY_DEFAULT_ANALYSIS_PRIORITY_BATCH_LIMIT,
+            minimum=100,
+            maximum=DISCOVERY_MAX_ANALYSIS_PRIORITY_BATCH_LIMIT,
+        )
+        default_limit = max(
+            100,
+            min(
+                priority_default,
+                DISCOVERY_DEFAULT_MAINTENANCE_REFRESH_BATCH,
+            ),
+        )
+        refresh_limit = max(50, min(limit or default_limit, priority_default))
+        async with AsyncSessionLocal() as session:
+            rows = await session.execute(
+                select(DiscoveredWallet.address)
+                .where(
+                    or_(
+                        DiscoveredWallet.last_analyzed_at.is_(None),
+                        DiscoveredWallet.last_analyzed_at < stale_cutoff,
+                    )
+                )
+                .order_by(
+                    desc(func.coalesce(DiscoveredWallet.trades_24h, 0)),
+                    desc(func.coalesce(DiscoveredWallet.trades_1h, 0)),
+                    asc(DiscoveredWallet.last_analyzed_at),
+                    desc(DiscoveredWallet.last_trade_at),
+                    asc(DiscoveredWallet.discovered_at),
+                )
+                .limit(refresh_limit)
+            )
+        return [str(row.address).lower() for row in rows.all() if row.address]
+
+    async def _priority_analysis_queue(
+        self,
+        limit: int | None = None,
+    ) -> tuple[list[str], dict[str, int]]:
+        """Build priority addresses: in-pool unanalyzed, smart-pool unanalyzed, metrics backfill."""
+        default_limit = self._coerce_int(
+            self._discovery_setting("analysis_priority_batch_limit", 2500),
+            DISCOVERY_DEFAULT_ANALYSIS_PRIORITY_BATCH_LIMIT,
+            minimum=100,
+            maximum=DISCOVERY_MAX_ANALYSIS_PRIORITY_BATCH_LIMIT,
+        )
+        priority_limit = max(50, min(limit or default_limit, default_limit))
+        backfill_limit = max(100, min(priority_limit, default_limit))
+
+        resolved_positions_expr = func.coalesce(DiscoveredWallet.wins, 0) + func.coalesce(DiscoveredWallet.losses, 0)
+        gap_reanalysis_cutoff = utcnow() - timedelta(hours=_TRADE_GAP_REANALYSIS_INTERVAL_HOURS)
+
+        async with AsyncSessionLocal() as session:
+            top_pool_rows = await session.execute(
+                select(DiscoveredWallet.address)
+                .where(
+                    DiscoveredWallet.in_top_pool == True,  # noqa: E712
+                    DiscoveredWallet.last_analyzed_at.is_(None),
+                )
+                .order_by(
+                    desc(func.coalesce(DiscoveredWallet.trades_24h, 0)),
+                    desc(func.coalesce(DiscoveredWallet.trades_1h, 0)),
+                    desc(DiscoveredWallet.last_trade_at),
+                    desc(DiscoveredWallet.discovered_at),
+                )
+                .limit(priority_limit)
+            )
+            top_pool = [str(row.address).lower() for row in top_pool_rows.all() if row.address]
+
+        async with AsyncSessionLocal() as session:
+            smart_pool_query = (
+                select(DiscoveredWallet.address)
+                .where(
+                    DiscoveredWallet.discovery_source == "smart_pool",
+                    DiscoveredWallet.last_analyzed_at.is_(None),
+                    or_(
+                        DiscoveredWallet.in_top_pool.is_(None),
+                        DiscoveredWallet.in_top_pool == False,  # noqa: E712
+                    ),
+                )
+                .order_by(
+                    desc(func.coalesce(DiscoveredWallet.trades_24h, 0)),
+                    desc(func.coalesce(DiscoveredWallet.trades_1h, 0)),
+                    desc(DiscoveredWallet.last_trade_at),
+                    desc(DiscoveredWallet.discovered_at),
+                )
+                .limit(priority_limit)
+            )
+            smart_pool_rows = await session.execute(smart_pool_query)
+            smart_pool = [str(row.address).lower() for row in smart_pool_rows.all() if row.address]
+
+        async with AsyncSessionLocal() as session:
+            gap_refresh_rows = await session.execute(
+                select(DiscoveredWallet.address)
+                .where(
+                    DiscoveredWallet.last_analyzed_at.is_not(None),
+                    DiscoveredWallet.last_analyzed_at < gap_reanalysis_cutoff,
+                    DiscoveredWallet.total_trades >= _TRADE_GAP_REANALYSIS_MIN_TOTAL_TRADES,
+                    resolved_positions_expr <= _TRADE_GAP_REANALYSIS_MAX_RESOLVED_POSITIONS,
+                    resolved_positions_expr * _TRADE_GAP_REANALYSIS_MIN_RATIO < DiscoveredWallet.total_trades,
+                )
+                .order_by(
+                    desc(func.coalesce(DiscoveredWallet.trades_24h, 0)),
+                    desc(func.coalesce(DiscoveredWallet.trades_1h, 0)),
+                    asc(DiscoveredWallet.last_analyzed_at),
+                    desc(DiscoveredWallet.total_trades),
+                    desc(DiscoveredWallet.last_trade_at),
+                )
+                .limit(priority_limit)
+            )
+            gap_refresh = [str(row.address).lower() for row in gap_refresh_rows.all() if row.address]
+
+        backfill: list[str] = []
+        if self._metrics_backfill_exhausted_version != METRICS_SOURCE_VERSION:
+            async with AsyncSessionLocal() as session:
+                version_rows = await session.execute(
+                    select(DiscoveredWallet.metrics_source_version)
+                    .where(DiscoveredWallet.last_analyzed_at.is_not(None))
+                    .group_by(DiscoveredWallet.metrics_source_version)
+                )
+                include_null_version = False
+                legacy_versions: set[str] = set()
+                for (raw_version,) in version_rows.all():
+                    if raw_version is None:
+                        include_null_version = True
+                        continue
+                    normalized_version = str(raw_version).strip()
+                    if normalized_version and normalized_version != METRICS_SOURCE_VERSION:
+                        legacy_versions.add(normalized_version)
+
+                if not include_null_version and not legacy_versions:
+                    self._metrics_backfill_exhausted_version = METRICS_SOURCE_VERSION
+                else:
+                    if include_null_version and legacy_versions:
+                        backfill_filter = or_(
+                            DiscoveredWallet.metrics_source_version.is_(None),
+                            DiscoveredWallet.metrics_source_version.in_(sorted(legacy_versions)),
+                        )
+                    elif include_null_version:
+                        backfill_filter = DiscoveredWallet.metrics_source_version.is_(None)
+                    else:
+                        backfill_filter = DiscoveredWallet.metrics_source_version.in_(sorted(legacy_versions))
+
+                    backfill_rows = await session.execute(
+                        select(DiscoveredWallet.address)
+                        .where(
+                            DiscoveredWallet.last_analyzed_at.is_not(None),
+                            backfill_filter,
+                        )
+                        .order_by(
+                            desc(func.coalesce(DiscoveredWallet.in_top_pool, False)),
+                            desc(
+                                DiscoveredWallet.recommendation.in_(["copy_candidate", "monitor"]),
+                            ),
+                            desc(func.coalesce(DiscoveredWallet.is_profitable, False)),
+                            desc(func.coalesce(DiscoveredWallet.trades_24h, 0)),
+                            DiscoveredWallet.last_analyzed_at.asc(),
+                        )
+                        .limit(backfill_limit)
+                    )
+                    backfill = [str(row.address).lower() for row in backfill_rows.all() if row.address]
+                    if not backfill:
+                        self._metrics_backfill_exhausted_version = METRICS_SOURCE_VERSION
+
+        ordered = self._merge_unique_addresses(top_pool, smart_pool, gap_refresh, backfill)
+        counts = {
+            "top_pool_unanalyzed": len(top_pool),
+            "smart_pool_unanalyzed": len(smart_pool),
+            "trade_gap_reanalysis": len(gap_refresh),
+            "metrics_backfill": len(backfill),
+            "priority_total": len(ordered),
+        }
+        return ordered, counts
+
+    async def get_priority_backlog_count(self) -> int:
+        """Count high-priority wallets waiting for initial analysis."""
+        async with AsyncSessionLocal() as session:
+            top_pool_unanalyzed = (
+                await session.execute(
+                    select(func.count(DiscoveredWallet.address)).where(
+                        DiscoveredWallet.in_top_pool == True,  # noqa: E712
+                        DiscoveredWallet.last_analyzed_at.is_(None),
+                    )
+                )
+            ).scalar() or 0
+            smart_pool_unanalyzed = (
+                await session.execute(
+                    select(func.count(DiscoveredWallet.address)).where(
+                        DiscoveredWallet.discovery_source == "smart_pool",
+                        DiscoveredWallet.last_analyzed_at.is_(None),
+                        or_(
+                            DiscoveredWallet.in_top_pool.is_(None),
+                            DiscoveredWallet.in_top_pool == False,  # noqa: E712
+                        ),
+                    )
+                )
+            ).scalar() or 0
+        return int(top_pool_unanalyzed + smart_pool_unanalyzed)
+
+    # ------------------------------------------------------------------
+    # 10. Full Discovery Run
+    # ------------------------------------------------------------------
+
+    async def run_discovery(
+        self,
+        max_markets: int | None = None,
+        max_wallets_per_market: int | None = None,
+    ):
+        """
+        Full discovery pipeline:
+            1. Fetch recent/active markets from Polymarket
+            2. For each market, fetch recent trades to discover wallets
+            3. Supplement with leaderboard wallets
+            4. Deduplicate
+            5. For each new/stale wallet, run full analysis
+            6. Store/update in DB
+            7. Refresh leaderboard
+        """
+        if self._running:
+            logger.warning("Discovery already running, skipping")
+            return
+
+        self._running = True
+        self._runtime_discovery_settings = None
+        run_start = utcnow()
+        try:
+            runtime_settings = await self._load_discovery_settings()
+            max_markets = self._coerce_int(
+                max_markets,
+                runtime_settings["max_markets_per_run"],
+                minimum=1,
+            )
+            max_wallets_per_market = self._coerce_int(
+                max_wallets_per_market,
+                runtime_settings["max_wallets_per_market"],
+                minimum=1,
+            )
+            delay_between_markets = self._coerce_float(
+                runtime_settings["delay_between_markets"],
+                DISCOVERY_DEFAULT_DELAY_BETWEEN_MARKETS,
+                minimum=0.0,
+            )
+            delay_between_wallets = self._coerce_float(
+                runtime_settings["delay_between_wallets"],
+                DISCOVERY_DEFAULT_DELAY_BETWEEN_WALLETS,
+                minimum=0.0,
+            )
+        except Exception:
+            max_markets = self._coerce_int(max_markets, DISCOVERY_DEFAULT_MAX_MARKETS_PER_RUN, minimum=1)
+            max_wallets_per_market = self._coerce_int(
+                max_wallets_per_market,
+                DISCOVERY_DEFAULT_MAX_WALLETS_PER_MARKET,
+                minimum=1,
+            )
+            delay_between_markets = DISCOVERY_DEFAULT_DELAY_BETWEEN_MARKETS
+            delay_between_wallets = DISCOVERY_DEFAULT_DELAY_BETWEEN_WALLETS
+
+        pressure_level = current_backpressure_level()
+        pressure_active = is_db_pressure_active() or pressure_level >= 0.5
+        if pressure_active:
+            max_markets = min(max_markets, DISCOVERY_PRESSURE_MAX_MARKETS_PER_RUN)
+            max_wallets_per_market = min(max_wallets_per_market, DISCOVERY_PRESSURE_MAX_WALLETS_PER_MARKET)
+            market_concurrency = DISCOVERY_PRESSURE_CONCURRENCY
+            analysis_concurrency = DISCOVERY_PRESSURE_CONCURRENCY
+            analysis_run_cap = DISCOVERY_PRESSURE_MAX_ANALYSIS_PER_RUN
+        else:
+            max_markets = min(max_markets, DISCOVERY_STEADY_MAX_MARKETS_PER_RUN)
+            max_wallets_per_market = min(max_wallets_per_market, DISCOVERY_STEADY_MAX_WALLETS_PER_MARKET)
+            market_concurrency = DISCOVERY_STEADY_MARKET_CONCURRENCY
+            analysis_concurrency = DISCOVERY_STEADY_ANALYSIS_CONCURRENCY
+            analysis_run_cap = DISCOVERY_STEADY_MAX_ANALYSIS_PER_RUN
+
+        logger.info(
+            "Starting discovery run",
+            max_markets=max_markets,
+            max_wallets_per_market=max_wallets_per_market,
+            market_concurrency=market_concurrency,
+            analysis_concurrency=analysis_concurrency,
+            analysis_run_cap=analysis_run_cap,
+            pressure_active=pressure_active,
+            pressure_level=round(pressure_level, 3),
+        )
+
+        try:
+            # --- Step 1: Fetch active markets ---
+            try:
+                markets, market_scan_stats = await self._select_markets_for_discovery(
+                    max_markets=max_markets,
+                    delay_between_requests=delay_between_markets,
+                )
+            except Exception as e:
+                logger.error("Failed to fetch markets", error=str(e))
+                markets = []
+                market_scan_stats = {
+                    "market_scan_offset_start": self._market_scan_offset,
+                    "market_scan_offset_next": self._market_scan_offset,
+                    "markets_primary": 0,
+                    "markets_wrapped": 0,
+                    "markets_recent": 0,
+                    "markets_selected": 0,
+                }
+
+            logger.info("Fetched markets", count=len(markets), **market_scan_stats)
+
+            # --- Step 2 & 3: Discover wallet addresses ---
+            all_addresses: set[str] = set()
+
+            # Discover wallet addresses from market trades using a
+            # bounded worker pool.  HTTP-bound work — Polymarket Data
+            # API has plenty of capacity, the throughput limit is the
+            # asyncio scheduler.  Concurrency=15 gives 3x faster
+            # market sweeps than the previous semaphore=5 design while
+            # capping live tasks at exactly 15 (vs the previous 200+
+            # which starved the orchestrator and fast trader).
+            async def _discover_one_market(market):
+                addrs = await self._discover_wallets_from_market(
+                    market, max_wallets=max_wallets_per_market,
+                )
+                if delay_between_markets > 0:
+                    await asyncio.sleep(delay_between_markets)
+                return addrs
+
+            def _on_market_error(market, exc):
+                logger.debug(
+                    "Wallet discovery from market failed",
+                    market=getattr(market, "id", None),
+                    exc_info=exc,
+                )
+
+            market_results = await _run_with_bounded_workers(
+                list(markets),
+                _discover_one_market,
+                concurrency=market_concurrency,
+                on_error=_on_market_error,
+            )
+            for result in market_results:
+                if isinstance(result, set):
+                    all_addresses.update(result)
+
+            # From leaderboard
+            leaderboard_scan_count = int(max(200, min(800, max_markets * 3)))
+            leaderboard_addrs = await self._discover_wallets_from_leaderboard(scan_count=leaderboard_scan_count)
+            all_addresses.update(leaderboard_addrs)
+
+            seeded = await self._upsert_discovered_placeholders(
+                all_addresses,
+                discovery_source="scan",
+            )
+            self._wallets_seeded_last_run = seeded
+
+            self._wallets_discovered_last_run = len(all_addresses)
+            logger.info(
+                "Wallet addresses discovered",
+                total=len(all_addresses),
+                from_markets=len(all_addresses) - len(leaderboard_addrs),
+                from_leaderboard=len(leaderboard_addrs),
+                leaderboard_scan_count=leaderboard_scan_count,
+            )
+
+            # --- Step 4: Filter to new/stale wallets ---
+            # Batch the staleness check into a single DB query instead of
+            # one query per wallet, which was blocking the event loop for
+            # hundreds/thousands of sequential DB round-trips.
+            stale_addresses: list[str] = []
+            stale_cutoff = utcnow() - timedelta(
+                hours=self._coerce_int(
+                    self._discovery_setting("stale_analysis_hours", 12),
+                    DISCOVERY_DEFAULT_STALE_ANALYSIS_HOURS,
+                    minimum=1,
+                )
+            )
+            async with AsyncSessionLocal() as session:
+                existing = {}
+                address_list = sorted(all_addresses)
+                maintenance_batch = self._coerce_int(
+                    self._discovery_setting("maintenance_batch", 900),
+                    DISCOVERY_DEFAULT_MAINTENANCE_BATCH,
+                    minimum=10,
+                    maximum=DISCOVERY_MAX_DB_BATCH,
+                )
+                for chunk in self._chunked(address_list, maintenance_batch):
+                    result = await session.execute(
+                        select(
+                            DiscoveredWallet.address,
+                            DiscoveredWallet.last_analyzed_at,
+                        ).where(DiscoveredWallet.address.in_(chunk))
+                    )
+                    existing.update({row.address: row.last_analyzed_at for row in result.all() if row.address})
+
+            for addr in all_addresses:
+                last_analyzed = existing.get(addr)
+                if last_analyzed is None or last_analyzed < stale_cutoff:
+                    stale_addresses.append(addr)
+
+            priority_addresses, priority_counts = await self._priority_analysis_queue()
+            maintenance_addresses = await self._maintenance_refresh_queue(
+                stale_cutoff=stale_cutoff,
+            )
+            addresses_to_analyze = self._merge_unique_addresses(
+                priority_addresses,
+                stale_addresses,
+                maintenance_addresses,
+            )
+            if len(addresses_to_analyze) > analysis_run_cap:
+                addresses_to_analyze = addresses_to_analyze[:analysis_run_cap]
+
+            logger.info(
+                "Wallets requiring analysis",
+                total=len(addresses_to_analyze),
+                analysis_run_cap=analysis_run_cap,
+                priority_total=priority_counts.get("priority_total", 0),
+                priority_top_pool_unanalyzed=priority_counts.get("top_pool_unanalyzed", 0),
+                priority_smart_pool_unanalyzed=priority_counts.get("smart_pool_unanalyzed", 0),
+                priority_trade_gap_reanalysis=priority_counts.get("trade_gap_reanalysis", 0),
+                priority_metrics_backfill=priority_counts.get("metrics_backfill", 0),
+                stale_discovered=len(stale_addresses),
+                maintenance_refresh=len(maintenance_addresses),
+                skipped_fresh=max(len(all_addresses) - len(stale_addresses), 0),
+            )
+
+            # --- Step 5 & 6: Analyze and store ---
+            #
+            # Uses the bounded worker pool (live task count = N
+            # workers, vs the old semaphore-in-batch pattern that
+            # could hold 50+ tasks waiting at once).  Each worker
+            # task runs ``analyze_wallet`` + ``_upsert_wallet``
+            # sequentially and the engine's CPU-bound stat
+            # computation runs in a thread (``asyncio.to_thread``
+            # inside ``analyze_wallet``) so the loop stays free.
+            #
+            # Concurrency=12 is the sweet spot:
+            #   * Each wallet does 5 concurrent HTTP fan-out fetches,
+            #     so 12 workers = 60 in-flight HTTP requests
+            #   * Polymarket Data API serves this comfortably
+            #   * Loop never holds more than ~12 wallet-analysis
+            #     tasks (plus the 5 inner HTTP futures each), well
+            #     within healthy event-loop budget on the trading
+            #     plane that also runs the orchestrator
+            #   * Throughput: ~12 wallets/cycle × ~2s/wallet ≈ 6
+            #     wallets/second sustained, vs ~2.5/sec previously
+            analyzed_count = 0
+            analyzed_count_lock = asyncio.Lock()
+
+            async def _analyze_one(addr: str):
+                nonlocal analyzed_count
+                profile = await self.analyze_wallet(addr)
+                if profile is not None:
+                    await self._upsert_wallet(profile)
+                    async with analyzed_count_lock:
+                        analyzed_count += 1
+                if delay_between_wallets > 0:
+                    await asyncio.sleep(delay_between_wallets)
+                return None
+
+            def _on_analysis_error(addr, exc):
+                logger.warning(
+                    "Wallet analysis failed for %s: %s (error_type=%s, retryable_db=%s)",
+                    addr,
+                    exc,
+                    type(exc).__name__,
+                    _is_retryable_db_error(exc),
+                )
+
+            await _run_with_bounded_workers(
+                list(addresses_to_analyze),
+                _analyze_one,
+                concurrency=analysis_concurrency,
+                on_error=_on_analysis_error,
+            )
+            logger.info(
+                "Wallet analysis sweep complete",
+                total=len(addresses_to_analyze),
+                analyzed=analyzed_count,
+            )
+
+            # --- Step 7: Refresh leaderboard ---
+            await self.refresh_leaderboard()
+
+            wallets_pruned = await self._cleanup_discovered_wallet_catalog()
+            self._wallets_pruned_last_run = wallets_pruned
+
+            # --- Record run metadata ---
+            self._last_run_at = utcnow()
+            self._wallets_analyzed_last_run = analyzed_count
+            duration = (self._last_run_at - run_start).total_seconds()
+
+            logger.info(
+                "Discovery run complete",
+                wallets_discovered=self._wallets_discovered_last_run,
+                wallets_analyzed=analyzed_count,
+                wallets_seeded=seeded,
+                wallets_pruned=wallets_pruned,
+                duration_seconds=round(duration, 1),
+            )
+        finally:
+            self._running = False
+            self._runtime_discovery_settings = None
+
+    # ------------------------------------------------------------------
+    # 11. Background Scheduler
+    # ------------------------------------------------------------------
+
+    async def start_background_discovery(self, interval_minutes: int = 60):
+        """Run discovery on a recurring schedule. First run after 60s so API can serve requests at startup."""
+        if self._background_running:
+            logger.info("Background discovery already running")
+            return
+        self._background_running = True
+        logger.info(
+            "Background discovery started",
+            interval_minutes=interval_minutes,
+        )
+
+        # Defer first run so /opportunities, /scanner/status, etc. don't timeout at startup
+        await asyncio.sleep(60)
+
+        while self._background_running:
+            if not global_pause_state.is_paused:
+                try:
+                    await self.run_discovery()
+                except Exception as e:
+                    logger.error("Discovery run failed", error=str(e))
+
+            await asyncio.sleep(interval_minutes * 60)
+
+    def stop(self):
+        """Stop the background discovery loop."""
+        self._background_running = False
+        logger.info("Background discovery stopped")
+
+    # ------------------------------------------------------------------
+    # 12. Query Methods
+    # ------------------------------------------------------------------
+
+    # Maps sort_by field names to their rolling window JSON column equivalents
+    SORT_FIELD_TO_ROLLING_COLUMN = {
+        "total_pnl": "rolling_pnl",
+        "win_rate": "rolling_win_rate",
+        "sharpe_ratio": "rolling_sharpe",
+        "total_trades": "rolling_trade_count",
+        "avg_roi": "rolling_roi",
+    }
+
+    async def get_leaderboard(
+        self,
+        limit: int = 100,
+        offset: int = 0,
+        min_trades: int = 0,
+        min_resolved_positions: int = 0,
+        min_pnl: float | None = None,
+        insider_only: bool = False,
+        min_insider_score: float | None = None,
+        sort_by: str = "rank_score",
+        sort_dir: str = "desc",
+        tags: list[str] | None = None,
+        recommendation: str | None = None,
+        window_key: str | None = None,
+        active_within_hours: int | None = None,
+        min_activity_score: float | None = None,
+        pool_only: bool = False,
+        tier: str | None = None,
+        search_text: str | None = None,
+        unique_entities_only: bool = False,
+        market_category: str | None = None,
+    ) -> dict:
+        """
+        Get the wallet leaderboard with filtering and sorting.
+
+        Args:
+            limit: Max results to return.
+            offset: Pagination offset.
+            min_trades: Minimum trade count filter.
+            min_resolved_positions: Minimum resolved-position count filter.
+            min_pnl: Minimum total PnL filter.
+            sort_by: Column to sort by (rank_score, total_pnl, win_rate, sharpe_ratio, etc.).
+            sort_dir: "asc" or "desc".
+            tags: If provided, only return wallets that have ALL of these tags.
+            recommendation: If provided, filter to this recommendation level.
+            window_key: Rolling window key ("1d", "7d", "30d", "90d").
+                        When set, sorts/filters use rolling window metrics for that period.
+            search_text: Optional free-text filter against address/username/tags/strategies.
+            unique_entities_only: If true, collapse clustered wallets to one row per cluster.
+            market_category: Optional market-focus category filter.
+
+        Returns:
+            Dict with 'wallets' list, 'total' count, and 'window_key' if set.
+        """
+        async with AsyncSessionLocal() as session:
+            resolved_positions_expr = func.coalesce(DiscoveredWallet.wins, 0) + func.coalesce(DiscoveredWallet.losses, 0)
+            leaderboard_load_columns = [
+                DiscoveredWallet.address,
+                DiscoveredWallet.username,
+                DiscoveredWallet.last_analyzed_at,
+                DiscoveredWallet.total_trades,
+                DiscoveredWallet.wins,
+                DiscoveredWallet.losses,
+                DiscoveredWallet.win_rate,
+                DiscoveredWallet.total_pnl,
+                DiscoveredWallet.avg_roi,
+                DiscoveredWallet.unique_markets,
+                DiscoveredWallet.days_active,
+                DiscoveredWallet.trades_per_day,
+                DiscoveredWallet.sharpe_ratio,
+                DiscoveredWallet.sortino_ratio,
+                DiscoveredWallet.max_drawdown,
+                DiscoveredWallet.profit_factor,
+                DiscoveredWallet.calmar_ratio,
+                DiscoveredWallet.anomaly_score,
+                DiscoveredWallet.is_bot,
+                DiscoveredWallet.is_profitable,
+                DiscoveredWallet.recommendation,
+                DiscoveredWallet.strategies_detected,
+                DiscoveredWallet.tags,
+                DiscoveredWallet.rank_score,
+                DiscoveredWallet.rank_position,
+                DiscoveredWallet.quality_score,
+                DiscoveredWallet.activity_score,
+                DiscoveredWallet.stability_score,
+                DiscoveredWallet.composite_score,
+                DiscoveredWallet.last_trade_at,
+                DiscoveredWallet.trades_1h,
+                DiscoveredWallet.trades_24h,
+                DiscoveredWallet.unique_markets_24h,
+                DiscoveredWallet.in_top_pool,
+                DiscoveredWallet.pool_tier,
+                DiscoveredWallet.pool_membership_reason,
+                DiscoveredWallet.source_flags,
+                DiscoveredWallet.cluster_id,
+                DiscoveredWallet.insider_score,
+                DiscoveredWallet.insider_confidence,
+                DiscoveredWallet.insider_sample_size,
+            ]
+            if window_key:
+                leaderboard_load_columns.extend(
+                    [
+                        DiscoveredWallet.rolling_pnl,
+                        DiscoveredWallet.rolling_roi,
+                        DiscoveredWallet.rolling_win_rate,
+                        DiscoveredWallet.rolling_trade_count,
+                        DiscoveredWallet.rolling_sharpe,
+                    ]
+                )
+            normalized_tags = [t.strip().lower() for t in (tags or []) if isinstance(t, str) and t.strip()]
+            base_filter = [
+                DiscoveredWallet.total_trades >= min_trades,
+            ]
+            effective_min_resolved_positions = int(max(0, min_resolved_positions))
+            if not window_key and sort_by == "win_rate" and effective_min_resolved_positions <= 0 and min_trades > 0:
+                effective_min_resolved_positions = int(max(0, min_trades))
+            if effective_min_resolved_positions > 0:
+                base_filter.append(resolved_positions_expr >= effective_min_resolved_positions)
+            if min_pnl is not None:
+                base_filter.append(DiscoveredWallet.total_pnl >= min_pnl)
+            if insider_only:
+                base_filter.append(DiscoveredWallet.insider_score >= 0.60)
+                base_filter.append(DiscoveredWallet.insider_confidence >= 0.50)
+                base_filter.append(DiscoveredWallet.insider_sample_size >= 15)
+            if min_insider_score is not None:
+                base_filter.append(DiscoveredWallet.insider_score >= min_insider_score)
+            if recommendation:
+                base_filter.append(DiscoveredWallet.recommendation == recommendation)
+            if active_within_hours is not None:
+                cutoff = utcnow() - timedelta(hours=active_within_hours)
+                base_filter.append(DiscoveredWallet.last_trade_at >= cutoff)
+            if min_activity_score is not None:
+                base_filter.append(DiscoveredWallet.activity_score >= min_activity_score)
+            if pool_only:
+                base_filter.append(DiscoveredWallet.in_top_pool == True)  # noqa: E712
+            if tier:
+                base_filter.append(DiscoveredWallet.pool_tier == tier.lower())
+            if normalized_tags:
+                for tag in normalized_tags:
+                    base_filter.append(func.lower(cast(DiscoveredWallet.tags, String)).like(f'%"{tag}"%'))
+            if search_text:
+                q = f"%{search_text.strip().lower()}%"
+                if q != "%%":
+                    base_filter.append(
+                        or_(
+                            func.lower(DiscoveredWallet.address).like(q),
+                            func.lower(func.coalesce(DiscoveredWallet.username, "")).like(q),
+                            func.lower(cast(DiscoveredWallet.tags, String)).like(q),
+                            func.lower(cast(DiscoveredWallet.strategies_detected, String)).like(q),
+                            func.lower(cast(DiscoveredWallet.source_flags, String)).like(q),
+                        )
+                    )
+            if market_category:
+                normalized_category = market_category.strip().lower()
+                if normalized_category not in {"", "all", "overall"}:
+                    category_flag = f'%"leaderboard_category_{normalized_category}": true%'
+                    category_tag = f'%"market_{normalized_category}"%'
+                    base_filter.append(
+                        or_(
+                            func.lower(cast(DiscoveredWallet.source_flags, String)).like(category_flag),
+                            func.lower(cast(DiscoveredWallet.tags, String)).like(category_tag),
+                        )
+                    )
+
+            # When a rolling window is active, filter to wallets with trades in that window
+            if window_key:
+                trade_count_text = func.coalesce(
+                    DiscoveredWallet.rolling_trade_count[window_key].as_string(),
+                    "",
+                )
+                trade_count_expr = case(
+                    (
+                        trade_count_text.op("~")(_JSON_NUMERIC_PATTERN),
+                        cast(trade_count_text, Float),
+                    ),
+                    else_=0.0,
+                )
+                base_filter.append(trade_count_expr > 0)
+
+            # Build main query
+            query = select(DiscoveredWallet).options(load_only(*leaderboard_load_columns)).where(*base_filter)
+
+            # Determine sort expression
+            if window_key and sort_by in self.SORT_FIELD_TO_ROLLING_COLUMN:
+                # Sort using the rolling window JSON value for this period
+                rolling_col_name = self.SORT_FIELD_TO_ROLLING_COLUMN[sort_by]
+                rolling_col = getattr(DiscoveredWallet, rolling_col_name, None)
+                if rolling_col is not None:
+                    if sort_by == "total_trades":
+                        rolling_trade_count_text = func.coalesce(rolling_col[window_key].as_string(), "")
+                        sort_expr = case(
+                            (
+                                rolling_trade_count_text.op("~")(_JSON_NUMERIC_PATTERN),
+                                cast(rolling_trade_count_text, Float),
+                            ),
+                            else_=0.0,
+                        )
+                    else:
+                        sort_expr = func.coalesce(rolling_col[window_key].as_float(), 0.0)
+                else:
+                    sort_expr = DiscoveredWallet.rank_score
+            else:
+                # All-time: sort by the regular column
+                sort_expr = getattr(DiscoveredWallet, sort_by, None)
+                if sort_expr is None:
+                    sort_expr = DiscoveredWallet.rank_score
+
+            sort_is_asc = sort_dir.lower() == "asc"
+            if sort_is_asc:
+                query = query.order_by(asc(sort_expr))
+            else:
+                query = query.order_by(desc(sort_expr))
+
+            if not window_key and sort_by == "win_rate":
+                query = query.order_by(
+                    desc(resolved_positions_expr),
+                    desc(DiscoveredWallet.total_pnl),
+                    desc(DiscoveredWallet.last_analyzed_at),
+                )
+
+            if unique_entities_only:
+                result = await session.execute(query)
+                ordered_wallets = list(result.scalars().all())
+                deduped_wallets: list[DiscoveredWallet] = []
+                seen_entities: set[str] = set()
+                for wallet in ordered_wallets:
+                    entity_key = f"cluster:{wallet.cluster_id}" if wallet.cluster_id else f"wallet:{wallet.address}"
+                    if entity_key in seen_entities:
+                        continue
+                    seen_entities.add(entity_key)
+                    deduped_wallets.append(wallet)
+
+                total_count = len(deduped_wallets)
+                wallets = deduped_wallets[offset : offset + limit]
+            else:
+                # Get total count for pagination
+                count_query = select(func.count(DiscoveredWallet.address)).where(*base_filter)
+                count_result = await session.execute(count_query)
+                total_count = count_result.scalar() or 0
+
+                query = query.offset(offset).limit(limit)
+                result = await session.execute(query)
+                wallets = result.scalars().all()
+
+            rows = []
+            for w in wallets:
+                row = self._wallet_to_leaderboard_dict(w)
+
+                # Inject period-specific metrics when a rolling window is active
+                if window_key:
+                    row["period_pnl"] = (w.rolling_pnl or {}).get(window_key, 0.0)
+                    row["period_roi"] = (w.rolling_roi or {}).get(window_key, 0.0)
+                    row["period_win_rate"] = (w.rolling_win_rate or {}).get(window_key, 0.0)
+                    row["period_trades"] = (w.rolling_trade_count or {}).get(window_key, 0)
+                    row["period_sharpe"] = (w.rolling_sharpe or {}).get(window_key)
+
+                rows.append(row)
+
+            resp = {"wallets": rows, "total": total_count}
+            if window_key:
+                resp["window_key"] = window_key
+            return resp
+
+    async def get_wallet_profile(self, address: str) -> dict | None:
+        """
+        Get comprehensive wallet profile with all metrics.
+
+        Returns None if wallet has not been discovered yet.
+        """
+        address = address.lower()
+
+        async with AsyncSessionLocal() as session:
+            wallet = await session.get(DiscoveredWallet, address)
+            if wallet is None:
+                return None
+            return self._wallet_to_dict(wallet)
+
+    async def get_discovery_stats(self) -> dict:
+        """
+        Get aggregate statistics about the discovery engine's state.
+
+        Returns dict with total_wallets, last_run_at, avg_rank_score, etc.
+        Uses a single query with scalar subqueries to avoid 5 round-trips.
+        """
+        async with AsyncSessionLocal() as session:
+            # Single query with 5 scalar subqueries - one round-trip instead of 5
+            stats_query = select(
+                select(func.count(DiscoveredWallet.address)).scalar_subquery().label("total"),
+                select(func.count(DiscoveredWallet.address))
+                .where(DiscoveredWallet.is_profitable == True)  # noqa: E712
+                .scalar_subquery()
+                .label("profitable"),
+                select(func.count(DiscoveredWallet.address))
+                .where(DiscoveredWallet.recommendation == "copy_candidate")
+                .scalar_subquery()
+                .label("copy_candidates"),
+                select(func.avg(DiscoveredWallet.rank_score)).scalar_subquery().label("avg_score"),
+                select(func.avg(DiscoveredWallet.win_rate))
+                .where(DiscoveredWallet.total_trades >= 10)
+                .scalar_subquery()
+                .label("avg_win_rate"),
+            )
+            row = (await session.execute(stats_query)).one()
+
+        total_wallets = row.total or 0
+        profitable_count = row.profitable or 0
+        copy_candidates = row.copy_candidates or 0
+        avg_rank_score = row.avg_score or 0.0
+        avg_win_rate = row.avg_win_rate or 0.0
+
+        return {
+            "total_discovered": total_wallets,
+            "total_profitable": profitable_count,
+            "total_copy_candidates": copy_candidates,
+            "avg_rank_score": round(avg_rank_score, 4),
+            "avg_win_rate": round(avg_win_rate, 4),
+            "last_run_at": self._last_run_at.isoformat() if self._last_run_at else None,
+            "wallets_discovered_last_run": self._wallets_discovered_last_run,
+            "wallets_analyzed_last_run": self._wallets_analyzed_last_run,
+            "wallets_seeded_last_run": self._wallets_seeded_last_run,
+            "wallets_pruned_last_run": self._wallets_pruned_last_run,
+            "is_running": self._running,
+        }
+
+    # ------------------------------------------------------------------
+    # Internal Utilities
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _wallet_to_dict(w: DiscoveredWallet) -> dict:
+        """Serialize a DiscoveredWallet ORM object to a plain dict."""
+        source_flags = w.source_flags or {}
+        if not isinstance(source_flags, dict):
+            source_flags = {}
+        market_categories = [
+            key.replace("leaderboard_category_", "")
+            for key, enabled in source_flags.items()
+            if key.startswith("leaderboard_category_") and bool(enabled)
+        ]
+
+        return {
+            "address": w.address,
+            "username": w.username,
+            "discovered_at": w.discovered_at.isoformat() if w.discovered_at else None,
+            "last_analyzed_at": w.last_analyzed_at.isoformat() if w.last_analyzed_at else None,
+            "discovery_source": w.discovery_source,
+            "metrics_source_version": w.metrics_source_version,
+            # Basic stats
+            "total_trades": w.total_trades,
+            "wins": w.wins,
+            "losses": w.losses,
+            "resolved_positions": WalletDiscoveryEngine._resolved_positions_count(wins=w.wins, losses=w.losses),
+            "win_rate": w.win_rate,
+            "win_rate_score": WalletDiscoveryEngine._confidence_adjusted_win_rate(wins=w.wins, losses=w.losses),
+            "win_rate_confidence": WalletDiscoveryEngine._win_rate_confidence(
+                WalletDiscoveryEngine._resolved_positions_count(wins=w.wins, losses=w.losses)
+            ),
+            "total_pnl": w.total_pnl,
+            "realized_pnl": w.realized_pnl,
+            "unrealized_pnl": w.unrealized_pnl,
+            "total_invested": w.total_invested,
+            "total_returned": w.total_returned,
+            "avg_roi": w.avg_roi,
+            "max_roi": w.max_roi,
+            "min_roi": w.min_roi,
+            "roi_std": w.roi_std,
+            "unique_markets": w.unique_markets,
+            "open_positions": w.open_positions,
+            "days_active": w.days_active,
+            "avg_hold_time_hours": w.avg_hold_time_hours,
+            "trades_per_day": w.trades_per_day,
+            "avg_position_size": w.avg_position_size,
+            # Risk-adjusted
+            "sharpe_ratio": w.sharpe_ratio,
+            "sortino_ratio": w.sortino_ratio,
+            "max_drawdown": w.max_drawdown,
+            "profit_factor": w.profit_factor,
+            "calmar_ratio": w.calmar_ratio,
+            # Rolling
+            "rolling_pnl": w.rolling_pnl,
+            "rolling_roi": w.rolling_roi,
+            "rolling_win_rate": w.rolling_win_rate,
+            "rolling_trade_count": w.rolling_trade_count,
+            "rolling_sharpe": w.rolling_sharpe,
+            # Classification
+            "anomaly_score": w.anomaly_score,
+            "is_bot": w.is_bot,
+            "is_profitable": w.is_profitable,
+            "recommendation": w.recommendation,
+            "strategies_detected": w.strategies_detected,
+            "tags": w.tags,
+            # Ranking
+            "rank_score": w.rank_score,
+            "rank_position": w.rank_position,
+            "quality_score": w.quality_score,
+            "activity_score": w.activity_score,
+            "stability_score": w.stability_score,
+            "composite_score": w.composite_score,
+            "last_trade_at": w.last_trade_at.isoformat() if w.last_trade_at else None,
+            "trades_1h": w.trades_1h,
+            "trades_24h": w.trades_24h,
+            "unique_markets_24h": w.unique_markets_24h,
+            "in_top_pool": w.in_top_pool,
+            "pool_tier": w.pool_tier,
+            "pool_membership_reason": w.pool_membership_reason,
+            "source_flags": source_flags,
+            "market_categories": sorted(set(market_categories)),
+            # Clustering
+            "cluster_id": w.cluster_id,
+            # Insider detection
+            "insider_score": w.insider_score or 0.0,
+            "insider_confidence": w.insider_confidence or 0.0,
+            "insider_sample_size": w.insider_sample_size or 0,
+            "insider_last_scored_at": (w.insider_last_scored_at.isoformat() if w.insider_last_scored_at else None),
+            "insider_metrics": w.insider_metrics_json,
+            "insider_reasons": w.insider_reasons_json or [],
+            # Extended metrics
+            "metrics": w.metrics_json,
+        }
+
+    @staticmethod
+    def _wallet_to_leaderboard_dict(w: DiscoveredWallet) -> dict:
+        source_flags = w.source_flags or {}
+        if not isinstance(source_flags, dict):
+            source_flags = {}
+        market_categories = [
+            key.replace("leaderboard_category_", "")
+            for key, enabled in source_flags.items()
+            if key.startswith("leaderboard_category_") and bool(enabled)
+        ]
+
+        return {
+            "address": w.address,
+            "username": w.username,
+            "last_analyzed_at": w.last_analyzed_at.isoformat() if w.last_analyzed_at else None,
+            "total_trades": w.total_trades,
+            "wins": w.wins,
+            "losses": w.losses,
+            "resolved_positions": WalletDiscoveryEngine._resolved_positions_count(wins=w.wins, losses=w.losses),
+            "win_rate": w.win_rate,
+            "win_rate_score": WalletDiscoveryEngine._confidence_adjusted_win_rate(wins=w.wins, losses=w.losses),
+            "win_rate_confidence": WalletDiscoveryEngine._win_rate_confidence(
+                WalletDiscoveryEngine._resolved_positions_count(wins=w.wins, losses=w.losses)
+            ),
+            "total_pnl": w.total_pnl,
+            "avg_roi": w.avg_roi,
+            "unique_markets": w.unique_markets,
+            "days_active": w.days_active,
+            "trades_per_day": w.trades_per_day,
+            "sharpe_ratio": w.sharpe_ratio,
+            "sortino_ratio": w.sortino_ratio,
+            "max_drawdown": w.max_drawdown,
+            "profit_factor": w.profit_factor,
+            "calmar_ratio": w.calmar_ratio,
+            "anomaly_score": w.anomaly_score,
+            "is_bot": w.is_bot,
+            "is_profitable": w.is_profitable,
+            "recommendation": w.recommendation,
+            "strategies_detected": w.strategies_detected or [],
+            "tags": w.tags or [],
+            "rank_score": w.rank_score,
+            "rank_position": w.rank_position,
+            "quality_score": w.quality_score,
+            "activity_score": w.activity_score,
+            "stability_score": w.stability_score,
+            "composite_score": w.composite_score,
+            "last_trade_at": w.last_trade_at.isoformat() if w.last_trade_at else None,
+            "trades_1h": w.trades_1h,
+            "trades_24h": w.trades_24h,
+            "unique_markets_24h": w.unique_markets_24h,
+            "in_top_pool": w.in_top_pool,
+            "pool_tier": w.pool_tier,
+            "pool_membership_reason": w.pool_membership_reason,
+            "source_flags": source_flags,
+            "market_categories": sorted(set(market_categories)),
+            "cluster_id": w.cluster_id,
+            "insider_score": w.insider_score or 0.0,
+            "insider_confidence": w.insider_confidence or 0.0,
+            "insider_sample_size": w.insider_sample_size or 0,
+        }
+
+    @staticmethod
+    def _std_dev(values: list[float]) -> float:
+        """Calculate sample standard deviation."""
+        if len(values) < 2:
+            return 0.0
+        mean = sum(values) / len(values)
+        variance = sum((x - mean) ** 2 for x in values) / (len(values) - 1)
+        return math.sqrt(variance)
+
+    @staticmethod
+    def _parse_timestamp(raw) -> datetime | None:
+        """Parse a raw timestamp value into a datetime."""
+        if raw is None:
+            return None
+        if isinstance(raw, datetime):
+            return raw
+        if isinstance(raw, (int, float)):
+            try:
+                return utcfromtimestamp(raw)
+            except (ValueError, OSError):
+                return None
+        if isinstance(raw, str):
+            try:
+                return datetime.fromisoformat(raw.replace("Z", "+00:00")).replace(tzinfo=None)
+            except (ValueError, TypeError):
+                return None
+        return None
+
+    def _compute_days_active(self, trades: list[dict]) -> int:
+        """Compute the number of days between the first and last trade."""
+        if not trades:
+            return 0
+
+        first_raw = trades[-1].get("timestamp", trades[-1].get("created_at"))
+        last_raw = trades[0].get("timestamp", trades[0].get("created_at"))
+
+        first = self._parse_timestamp(first_raw)
+        last = self._parse_timestamp(last_raw)
+
+        if first and last:
+            return max((last - first).days, 1)
+        return 30  # Default fallback
+
+    def _filter_trades_after(self, trades: list[dict], cutoff: datetime) -> list[dict]:
+        """Return only trades whose timestamp is after ``cutoff``."""
+        filtered: list[dict] = []
+        for trade in trades:
+            raw = trade.get(
+                "timestamp",
+                trade.get("created_at", trade.get("createdAt")),
+            )
+            ts = self._parse_timestamp(raw)
+            if ts is None:
+                # Keep trades we cannot parse (conservative)
+                filtered.append(trade)
+                continue
+            if ts >= cutoff:
+                filtered.append(trade)
+        return filtered
+
+
+# ---------------------------------------------------------------------------
+# Singleton
+# ---------------------------------------------------------------------------
+
+wallet_discovery = WalletDiscoveryEngine()

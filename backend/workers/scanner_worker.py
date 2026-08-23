@@ -1,0 +1,888 @@
+"""
+Scanner worker: detection-only plane.
+
+Runs fast/heavy scanner lanes, consumes DB market catalog + live WS prices,
+and bridges opportunities directly into the runtime signal queue.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import math
+import os
+import time
+import uuid
+from datetime import datetime, timezone
+from typing import Optional
+
+# Native numerical libs (OpenMP/BLAS/FAISS) can segfault under high thread
+# contention in long-running workers on macOS; pin conservative defaults.
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+os.environ.setdefault("NEWS_FAISS_THREADS", "1")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+os.environ.setdefault("EMBEDDING_DEVICE", "cpu")
+os.environ.setdefault("TQDM_DISABLE", "1")
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+
+from sqlalchemy.exc import DBAPIError
+
+from config import apply_runtime_settings_overrides, settings
+from models.database import AsyncSessionLocal
+from services.quality_filter import quality_filter
+from services.live_pressure import db_pressure_snapshot, is_db_pressure_active, maybe_mark_db_pressure
+from services.scanner import scanner
+from services.shared_state import (
+    clear_scanner_heavy_lane_degrade_if_expired,
+    clear_scan_request,
+    pop_targeted_condition_ids,
+    read_scanner_control,
+    read_scanner_snapshot,
+    write_scanner_snapshot,
+)
+from services.strategy_signal_bridge import bridge_opportunities_to_signals
+from services.strategy_loader import strategy_loader
+from services.strategy_runtime import refresh_strategy_runtime_if_needed
+from services.worker_state import write_worker_snapshot
+from utils.logger import get_logger
+from utils.retry import is_retryable_db_error, db_retry_delay, DB_RETRY_ATTEMPTS
+from utils.utcnow import utcnow
+
+logger = get_logger("scanner_worker")
+_CANCEL_GRACE_SECONDS = 5.0
+_abandoned_tasks: set[asyncio.Task] = set()
+_inflight_timed_tasks: dict[str, asyncio.Task] = {}
+_last_pressure_snapshot_skip_log_at = 0.0
+_last_pressure_heavy_skip_log_at = 0.0
+
+# Only the scan's OWN DB write path failing (snapshot persist / detection
+# enqueue) is a real reason to shed the heavy scan — genuine scan-path
+# contention, with a self-correcting loop (the heavy scan's own writes
+# re-trip pressure if the DB is truly overloaded, backing it off within a
+# cycle).  Peripheral pressure must NOT halt scanning: universe re-hydrate
+# has a cached fallback, heartbeat/clear are liveness/control, and
+# topic_catalog bookkeeping is cross-plane recording contention.  Halting
+# the scan on those starves the whole live pipeline of trade_signals
+# (no scan -> no signals -> no orchestrator decisions -> no terminal
+# updates) — the exact regression the A.1/A.2 plane split surfaced.
+_SCAN_PATH_PRESSURE_COMPONENTS = frozenset({"scanner_snapshot", "scanner_enqueue"})
+
+
+def _scan_path_under_pressure() -> bool:
+    """True only when the scan's own DB write path is the pressure source."""
+    if not is_db_pressure_active():
+        return False
+    component = str(db_pressure_snapshot().get("component") or "").strip()
+    return component in _SCAN_PATH_PRESSURE_COMPONENTS
+
+
+class _TimedTaskStillRunningError(RuntimeError):
+    pass
+
+
+def _discard_abandoned(task: asyncio.Task) -> None:
+    _abandoned_tasks.discard(task)
+
+
+def _clear_inflight_timed_task(label: str, task: asyncio.Task) -> None:
+    if _inflight_timed_tasks.get(label) is task:
+        _inflight_timed_tasks.pop(label, None)
+
+
+def _is_upstream_resolution_error(exc: Exception) -> bool:
+    """Classify DNS/name-resolution upstream failures from HTTP client errors."""
+    text = str(exc).lower()
+    markers = (
+        "nodename nor servname provided",
+        "name or service not known",
+        "temporary failure in name resolution",
+    )
+    return any(marker in text for marker in markers)
+
+
+def _parse_iso_utc(value: Optional[str]) -> Optional[datetime]:
+    """Parse an ISO timestamp into a UTC-aware datetime."""
+    if not value:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(text)
+    except Exception:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+async def _run_with_timeout_budget(coro, *, timeout_seconds: float, label: str):
+    timeout_budget = max(0.01, float(timeout_seconds))
+    existing = _inflight_timed_tasks.get(label)
+    if existing is not None and not existing.done():
+        close = getattr(coro, "close", None)
+        if callable(close):
+            close()
+        raise _TimedTaskStillRunningError(label)
+
+    task = asyncio.create_task(coro, name=f"scanner-{label}")
+    _inflight_timed_tasks[label] = task
+    task.add_done_callback(lambda done_task, step_label=label: _clear_inflight_timed_task(step_label, done_task))
+
+    try:
+        done, _ = await asyncio.wait({task}, timeout=timeout_budget)
+        if done:
+            return task.result()
+
+        task.cancel()
+        done_after, _ = await asyncio.wait({task}, timeout=_CANCEL_GRACE_SECONDS)
+        if done_after:
+            try:
+                task.result()
+            except (asyncio.CancelledError, Exception):
+                pass
+        else:
+            _abandoned_tasks.add(task)
+            task.add_done_callback(_discard_abandoned)
+            logger.warning(
+                "%s: task did not finish within %ss cancel grace; holding reference until completion",
+                label,
+                _CANCEL_GRACE_SECONDS,
+            )
+        raise asyncio.TimeoutError(f"{label} exceeded timeout budget ({timeout_budget:.3f}s)")
+    except asyncio.CancelledError:
+        if not task.done():
+            task.cancel()
+            try:
+                await asyncio.shield(asyncio.wait({task}, timeout=_CANCEL_GRACE_SECONDS))
+            except (asyncio.CancelledError, Exception):
+                pass
+            if not task.done():
+                _abandoned_tasks.add(task)
+                task.add_done_callback(_discard_abandoned)
+        raise
+
+
+async def _hydrate_scanner_pool_from_snapshot() -> int:
+    """Restore scanner in-memory pool from DB snapshot on worker startup."""
+    try:
+        async with AsyncSessionLocal() as session:
+            existing_opps, existing_status = await read_scanner_snapshot(session)
+    except Exception as exc:
+        logger.warning("Scanner startup hydration skipped (snapshot read failed): %s", exc)
+        return 0
+
+    now = datetime.now(timezone.utc)
+    restored = []
+    dropped_expired = 0
+    for opp in existing_opps:
+        resolution_date = opp.resolution_date
+        if resolution_date is not None:
+            if resolution_date.tzinfo is None:
+                resolution_date = resolution_date.replace(tzinfo=timezone.utc)
+            else:
+                resolution_date = resolution_date.astimezone(timezone.utc)
+            if resolution_date <= now:
+                dropped_expired += 1
+                continue
+        restored.append(opp)
+
+    scanner._opportunities = restored
+    scanner._market_price_history = {}
+    scanner._remember_market_tokens_from_opportunities(restored)
+    now_ms = int(now.timestamp() * 1000)
+    restored_history_markets = 0
+    for opp in restored:
+        for market in opp.markets:
+            history = market.get("price_history")
+            if not isinstance(history, list) or not history:
+                continue
+            for market_id in (
+                str(market.get("id", "") or "").strip(),
+                str(market.get("condition_id") or market.get("conditionId") or "").strip(),
+            ):
+                if not market_id:
+                    continue
+                merged_len = scanner._merge_market_history_points(market_id, history, now_ms)
+                if merged_len >= 2:
+                    restored_history_markets += 1
+
+    if isinstance(existing_status, dict):
+        parsed_last_scan = _parse_iso_utc(existing_status.get("last_scan"))
+        if parsed_last_scan is not None:
+            scanner._last_scan = parsed_last_scan
+        parsed_last_fast = _parse_iso_utc(existing_status.get("last_fast_scan"))
+        if parsed_last_fast is not None:
+            scanner._last_fast_scan = parsed_last_fast
+        parsed_last_heavy = _parse_iso_utc(existing_status.get("last_heavy_scan"))
+        if parsed_last_heavy is not None:
+            scanner._last_full_snapshot_strategy_scan = parsed_last_heavy
+        tiered = existing_status.get("tiered_scanning")
+        if isinstance(tiered, dict):
+            parsed_tier_fast = _parse_iso_utc(tiered.get("last_fast_scan"))
+            if parsed_tier_fast is not None:
+                scanner._last_fast_scan = parsed_tier_fast
+            parsed_tier_heavy = _parse_iso_utc(
+                tiered.get("last_heavy_scan") or tiered.get("last_full_snapshot_strategy_scan")
+            )
+            if parsed_tier_heavy is not None:
+                scanner._last_full_snapshot_strategy_scan = parsed_tier_heavy
+
+    if restored or dropped_expired:
+        logger.info(
+            "Hydrated scanner pool from DB snapshot: restored=%d dropped_expired=%d history_markets=%d",
+            len(restored),
+            dropped_expired,
+            restored_history_markets,
+        )
+    return len(restored)
+
+
+async def _enqueue_detection_batch(
+    opportunities: list,
+    status: dict,
+    *,
+    batch_kind: str,
+    quality_reports: Optional[dict] = None,
+) -> tuple[str | None, int, int]:
+    """Persist scanner truth and emit runtime signals directly."""
+    global _last_pressure_snapshot_skip_log_at
+
+    batch_id = utcnow().strftime("%Y%m%d%H%M%S%f")
+    effective_quality_reports: dict = dict(quality_reports or {})
+    for opportunity in opportunities:
+        stable_id = str(getattr(opportunity, "stable_id", None) or getattr(opportunity, "id", "") or "").strip()
+        if stable_id and stable_id not in effective_quality_reports:
+            strategy_instance = strategy_loader.get_instance(getattr(opportunity, "strategy", None))
+            overrides = getattr(strategy_instance, "quality_filter_overrides", None) if strategy_instance else None
+            effective_quality_reports[stable_id] = quality_filter.evaluate_opportunity(opportunity, overrides=overrides)
+
+    await bridge_opportunities_to_signals(
+        opportunities,
+        source="scanner",
+        quality_reports=effective_quality_reports,
+        sweep_missing=True,
+        refresh_prices=False,
+    )
+
+    if is_db_pressure_active():
+        now_mono = time.monotonic()
+        if now_mono - _last_pressure_snapshot_skip_log_at >= 60.0:
+            logger.warning(
+                "Skipping scanner snapshot persist under DB pressure after runtime publish",
+                db_pressure=db_pressure_snapshot(),
+            )
+            _last_pressure_snapshot_skip_log_at = now_mono
+    else:
+        try:
+            async with AsyncSessionLocal() as session:
+                await write_scanner_snapshot(
+                    session,
+                    opportunities,
+                    {**status, "batch_kind": str(batch_kind or "scan_cycle")},
+                )
+        except Exception as exc:
+            maybe_mark_db_pressure(exc, component="scanner_snapshot", ttl_seconds=45.0)
+            logger.warning("Scanner snapshot persist failed after runtime publish", exc_info=exc)
+
+    try:
+        async with AsyncSessionLocal() as session:
+            await clear_scan_request(session)
+    except Exception as exc:
+        maybe_mark_db_pressure(exc, component="scanner_clear_request", ttl_seconds=30.0)
+        logger.warning("Scanner scan-request clear failed after runtime publish", exc_info=exc)
+
+    return batch_id, 0, 0
+
+
+async def _run_scan_loop() -> None:
+    """Load scanner then run detection loop and enqueue aggregation batches."""
+    global _last_pressure_heavy_skip_log_at
+
+    await scanner.load_settings()
+    await scanner.load_plugins(source_keys=["scanner"])
+    restored_count = await _hydrate_scanner_pool_from_snapshot()
+    scanner._running = True
+    scanner._enabled = True
+
+    logger.info("Scanner worker initialized in detection-only mode")
+
+    try:
+        from services.opportunity_recorder import opportunity_recorder
+
+        await opportunity_recorder.start()
+        logger.info("Opportunity recorder started")
+    except Exception as exc:
+        logger.warning("Opportunity recorder start failed (non-critical): %s", exc)
+
+    catalog_count = await scanner._hydrate_catalog_from_db()
+    if catalog_count:
+        logger.info("Hydrated market catalog from DB: %d markets", catalog_count)
+
+    heartbeat_state: dict[str, object] = {
+        "enabled": True,
+        "interval_seconds": 60,
+        "last_error": None,
+        "last_run_at": None,
+        "run_id": None,
+        "phase": "idle",
+        "progress": 0.0,
+        "queue_pending": 0,
+        "dropped_batches": 0,
+        "last_batch_id": None,
+        "heavy_lane_forced_degraded": False,
+        "heavy_lane_degraded_reason": None,
+    }
+    heartbeat_interval_seconds = max(
+        2.0,
+        float(getattr(settings, "SCANNER_HEARTBEAT_INTERVAL_SECONDS", 5.0) or 5.0),
+    )
+    heartbeat_stop_event = asyncio.Event()
+
+    async def _heartbeat_loop() -> None:
+        import random as _rnd
+        await asyncio.sleep(_rnd.uniform(0, heartbeat_interval_seconds))
+        _mem_warn_threshold_mb = 1500
+        while not heartbeat_stop_event.is_set():
+            try:
+                status = scanner.get_status()
+                tiered = status.get("tiered_scanning") or {}
+                lane_watchdogs = status.get("lane_watchdogs") or {}
+                mem_stats = scanner.get_memory_stats()
+                async with AsyncSessionLocal() as session:
+                    await write_worker_snapshot(
+                        session,
+                        "scanner",
+                        running=True,
+                        enabled=bool(heartbeat_state.get("enabled", True)),
+                        current_activity=str(status.get("current_activity") or "Idle"),
+                        interval_seconds=int(heartbeat_state.get("interval_seconds") or 60),
+                        last_run_at=heartbeat_state.get("last_run_at"),
+                        last_error=(
+                            str(heartbeat_state["last_error"])
+                            if heartbeat_state.get("last_error") is not None
+                            else None
+                        ),
+                        stats={
+                            "run_id": heartbeat_state.get("run_id"),
+                            "phase": heartbeat_state.get("phase"),
+                            "progress": float(heartbeat_state.get("progress", 0.0) or 0.0),
+                            "opportunities_count": int(status.get("opportunities_count", 0) or 0),
+                            "signals_emitted_last_run": 0,
+                            "full_snapshot_running": bool(tiered.get("full_snapshot_strategy_running", False)),
+                            "fast_inflight": bool(tiered.get("fast_inflight", False)),
+                            "heavy_inflight": bool(tiered.get("heavy_inflight", False)),
+                            "lane_watchdogs": lane_watchdogs,
+                            "queue_pending": int(heartbeat_state.get("queue_pending", 0) or 0),
+                            "dropped_batches": int(heartbeat_state.get("dropped_batches", 0) or 0),
+                            "last_batch_id": heartbeat_state.get("last_batch_id"),
+                            "heavy_lane_forced_degraded": bool(
+                                heartbeat_state.get("heavy_lane_forced_degraded", False)
+                            ),
+                            "heavy_lane_degraded_reason": heartbeat_state.get("heavy_lane_degraded_reason"),
+                            "scanner_memory": mem_stats,
+                        },
+                        publish_event=False,
+                    )
+
+                # Process memory + scanner data structure monitoring
+                try:
+                    import resource as _resource
+                    rss_mb = _resource.getrusage(_resource.RUSAGE_SELF).ru_maxrss / 1024
+                except Exception:
+                    try:
+                        import ctypes
+                        import ctypes.wintypes
+                        _k32 = ctypes.windll.kernel32
+                        class _PMC(ctypes.Structure):
+                            _fields_ = [
+                                ("cb", ctypes.wintypes.DWORD),
+                                ("PageFaultCount", ctypes.wintypes.DWORD),
+                                ("PeakWorkingSetSize", ctypes.c_size_t),
+                                ("WorkingSetSize", ctypes.c_size_t),
+                                ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                                ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                                ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                                ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                                ("PagefileUsage", ctypes.c_size_t),
+                                ("PeakPagefileUsage", ctypes.c_size_t),
+                            ]
+                        _psapi = ctypes.windll.psapi
+                        pmc = _PMC()
+                        pmc.cb = ctypes.sizeof(_PMC)
+                        handle = _k32.GetCurrentProcess()
+                        if _psapi.GetProcessMemoryInfo(handle, ctypes.byref(pmc), pmc.cb):
+                            rss_mb = pmc.WorkingSetSize / (1024 * 1024)
+                        else:
+                            rss_mb = 0
+                    except Exception:
+                        rss_mb = 0
+
+                if rss_mb > _mem_warn_threshold_mb:
+                    logger.warning(
+                        "Scanner process memory high",
+                        rss_mb=round(rss_mb),
+                        price_history_markets=mem_stats["price_history_markets"],
+                        price_history_points=mem_stats["price_history_points"],
+                        cached_markets=mem_stats["cached_markets"],
+                        cached_prices=mem_stats["cached_prices"],
+                        opportunity_market_ids=mem_stats["opportunity_market_ids"],
+                    )
+                else:
+                    logger.debug(
+                        "Scanner memory stats",
+                        rss_mb=round(rss_mb),
+                        price_history_markets=mem_stats["price_history_markets"],
+                        price_history_points=mem_stats["price_history_points"],
+                    )
+            except Exception as exc:
+                maybe_mark_db_pressure(exc, component="scanner_heartbeat", ttl_seconds=30.0)
+                heartbeat_state["last_error"] = str(exc)
+                logger.warning("Scanner heartbeat snapshot write failed: %s", exc)
+            try:
+                await asyncio.wait_for(heartbeat_stop_event.wait(), timeout=heartbeat_interval_seconds)
+            except asyncio.TimeoutError:
+                continue
+
+    heartbeat_task = asyncio.create_task(_heartbeat_loop(), name="scanner-heartbeat-loop")
+
+    async def _run_full_snapshot_cycle(
+        *,
+        reason: str,
+        targeted_ids: list[str] | None,
+        force: bool,
+        watchdog_seconds: int,
+    ) -> None:
+        try:
+            await _run_with_timeout_budget(
+                scanner.scan_full_snapshot_strategies(
+                    reason=reason,
+                    targeted_condition_ids=targeted_ids,
+                    force=force,
+                ),
+                timeout_seconds=float(watchdog_seconds),
+                label="scanner_full_snapshot",
+            )
+        except _TimedTaskStillRunningError:
+            logger.warning("Full-snapshot scan skipped because prior run is still finishing")
+        except asyncio.TimeoutError:
+            scanner.note_heavy_lane_watchdog_timeout(watchdog_seconds)
+            logger.warning("Full-snapshot scan timed out after %ss", watchdog_seconds)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Full-snapshot scan cycle failed")
+
+    heavy_scan_task: asyncio.Task | None = None
+    pending_heavy_targeted_ids: list[str] | None = None
+    stale_scan_streak = 0
+    last_forced_degrade_log: tuple[str, str] | None = None
+    # Periodic housekeeping deadlines. Wall-clock-bound (monotonic) so
+    # the schedule survives DB latency spikes and scan-cycle stalls.
+    next_market_tag_prune_at: float = 0.0
+
+    # Publish startup status through the aggregation plane.
+    try:
+        startup_status = scanner.get_status()
+        startup_status["running"] = True
+        startup_status["enabled"] = True
+        startup_status["interval_seconds"] = int(startup_status.get("interval_seconds") or 60)
+        startup_status["current_activity"] = (
+            f"Scanner resumed with {restored_count} restored opportunities; next scan pending."
+            if restored_count > 0
+            else "Scanner started; first scan pending."
+        )
+        startup_status["opportunities_count"] = len(scanner.get_opportunities())
+        batch_id, pending, dropped = await _enqueue_detection_batch(
+            scanner.get_opportunities(),
+            startup_status,
+            batch_kind="startup",
+            quality_reports=getattr(scanner, "quality_reports", {}) or {},
+        )
+        heartbeat_state["queue_pending"] = pending
+        heartbeat_state["dropped_batches"] = int(heartbeat_state.get("dropped_batches", 0) or 0) + dropped
+        heartbeat_state["last_batch_id"] = batch_id
+    except Exception as exc:
+        logger.warning("Failed to enqueue startup scanner batch: %s", exc)
+
+    try:
+        while True:
+            async with AsyncSessionLocal() as session:
+                try:
+                    await clear_scanner_heavy_lane_degrade_if_expired(session)
+                except Exception as exc:
+                    if is_retryable_db_error(exc):
+                        logger.debug("Scanner heavy-lane degrade expiry check deferred due to transient DB contention")
+                    else:
+                        logger.warning("Scanner heavy-lane degrade expiry check failed: %s", exc)
+                control = await read_scanner_control(session)
+
+            try:
+                await apply_runtime_settings_overrides()
+            except Exception as exc:
+                logger.warning("Failed to refresh scanner runtime settings from DB: %s", exc)
+
+            try:
+                await refresh_strategy_runtime_if_needed(
+                    source_keys=["scanner"],
+                )
+            except Exception as exc:
+                logger.warning("Scanner strategy refresh check failed: %s", exc)
+
+            interval = max(10, min(3600, int(control.get("scan_interval_seconds") or 60)))
+            paused = bool(control.get("is_paused", False))
+            # Operator master switch: scanner ships enabled; honour an explicit
+            # disable (ScannerControl.is_enabled=False) the same way pause idles
+            # the loop. Default True keeps existing behaviour unchanged.
+            enabled = bool(control.get("is_enabled", True))
+            requested = control.get("requested_scan_at")
+            scanner._enabled = enabled and not paused
+            heartbeat_state["enabled"] = enabled and not paused
+            heartbeat_state["interval_seconds"] = interval
+            heartbeat_state["heavy_lane_forced_degraded"] = bool(control.get("heavy_lane_forced_degraded", False))
+            heartbeat_state["heavy_lane_degraded_reason"] = control.get("heavy_lane_degraded_reason")
+
+            scan_watchdog_seconds = max(
+                30,
+                int(settings.SCAN_WATCHDOG_SECONDS),
+                int(settings.FAST_SCAN_INTERVAL_SECONDS) * 3,
+            )
+            full_snapshot_watchdog_seconds = max(
+                30,
+                int(getattr(settings, "SCANNER_FULL_SNAPSHOT_WATCHDOG_SECONDS", 180) or 180),
+            )
+
+            if (paused or not enabled) and not requested:
+                heartbeat_state["phase"] = "idle"
+                heartbeat_state["progress"] = 0.0
+                if heavy_scan_task is not None and not heavy_scan_task.done():
+                    heavy_scan_task.cancel()
+                    try:
+                        await heavy_scan_task
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception:
+                        pass
+                    heavy_scan_task = None
+                pending_heavy_targeted_ids = None
+                await asyncio.sleep(min(5, interval))
+                continue
+
+            # Pull latest universe snapshot written by market_universe worker.
+            try:
+                hydrated_market_count = await scanner._hydrate_catalog_from_db(only_if_newer=True)
+                if hydrated_market_count > 0 and pending_heavy_targeted_ids is None:
+                    pending_heavy_targeted_ids = []
+            except Exception as exc:
+                maybe_mark_db_pressure(exc, component="scanner_catalog_sync", ttl_seconds=45.0)
+                logger.warning("Scanner catalog sync from DB failed: %s", exc)
+
+            targeted_ids = pop_targeted_condition_ids() if requested else []
+            if requested:
+                pending_heavy_targeted_ids = list(targeted_ids)
+
+            scan_error: Exception | None = None
+            heartbeat_state["run_id"] = uuid.uuid4().hex[:16]
+            heartbeat_state["phase"] = "fast_scan"
+            heartbeat_state["progress"] = 0.25
+            try:
+                reactive_tokens = await scanner.consume_reactive_tokens()
+                await _run_with_timeout_budget(
+                    scanner.scan_fast(
+                        reactive_token_ids=reactive_tokens,
+                        targeted_condition_ids=targeted_ids or None,
+                    ),
+                    timeout_seconds=float(scan_watchdog_seconds),
+                    label="scanner_fast_lane",
+                )
+                stale_scan_streak = 0
+            except _TimedTaskStillRunningError as exc:
+                stale_scan_streak += 1
+                logger.warning("Scanner fast lane skipped because prior run is still finishing")
+                scan_error = exc
+            except asyncio.CancelledError:
+                raise
+            except asyncio.TimeoutError as exc:
+                scanner.note_fast_lane_watchdog_timeout(scan_watchdog_seconds)
+                stale_scan_streak += 1
+                logger.warning(
+                    "Scanner scan cycle timed out after %ss (streak=%d)",
+                    scan_watchdog_seconds,
+                    stale_scan_streak,
+                )
+                scan_error = exc
+            except Exception as exc:
+                stale_scan_streak = 0
+                scan_error = exc
+
+            if scan_error is not None:
+                heartbeat_state["last_error"] = str(scan_error)
+                timed_task_cleanup = isinstance(scan_error, _TimedTaskStillRunningError)
+                timeout_error = isinstance(scan_error, asyncio.TimeoutError)
+                network_resolution_error = _is_upstream_resolution_error(scan_error)
+                if timed_task_cleanup:
+                    logger.warning(
+                        "Scanner fast lane skipped because prior timed-out run is still cleaning up",
+                    )
+                elif timeout_error:
+                    logger.warning("Scanner scan timeout handling after %.1fs: %s", scan_watchdog_seconds, scan_error)
+                elif network_resolution_error:
+                    logger.warning(
+                        "Scanner upstream DNS/network resolution failed; retaining previous snapshot where possible: %s",
+                        scan_error,
+                    )
+                else:
+                    logger.exception("Scan failed: %s", scan_error)
+            else:
+                heartbeat_state["last_error"] = None
+
+            force_heavy_scan = pending_heavy_targeted_ids is not None
+            targeted_for_heavy = list(pending_heavy_targeted_ids or [])
+            if heavy_scan_task is None or heavy_scan_task.done():
+                if heavy_scan_task is not None and heavy_scan_task.done():
+                    try:
+                        await heavy_scan_task
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception:
+                        pass
+                    heavy_scan_task = None
+                run_heavy_now = force_heavy_scan or scanner._full_snapshot_strategy_due(datetime.now(timezone.utc))
+                forced_degrade_enabled = bool(control.get("heavy_lane_forced_degraded", False))
+                if run_heavy_now and forced_degrade_enabled:
+                    run_heavy_now = False
+                    heartbeat_state["phase"] = "degraded"
+                    heartbeat_state["progress"] = 0.6
+                    reason = str(control.get("heavy_lane_degraded_reason") or "control_forced_degrade")
+                    degraded_until = control.get("heavy_lane_degraded_until")
+                    until_text = degraded_until.isoformat() if isinstance(degraded_until, datetime) else ""
+                    until_suffix = (
+                        f" until {until_text}"
+                        if until_text
+                        else ""
+                    )
+                    current_degrade_key = (reason, until_text)
+                    if last_forced_degrade_log != current_degrade_key:
+                        logger.warning("Skipping heavy scan due forced degrade: %s%s", reason, until_suffix)
+                        last_forced_degrade_log = current_degrade_key
+                    scanner._current_activity = f"Heavy lane degraded: {reason}{until_suffix}"
+                if not forced_degrade_enabled:
+                    last_forced_degrade_log = None
+                if run_heavy_now and _scan_path_under_pressure():
+                    run_heavy_now = False
+                    heartbeat_state["phase"] = "degraded"
+                    heartbeat_state["progress"] = 0.6
+                    pressure = db_pressure_snapshot()
+                    now_mono = time.monotonic()
+                    if now_mono - _last_pressure_heavy_skip_log_at >= 60.0:
+                        logger.warning(
+                            "Skipping heavy scan under DB pressure",
+                            db_pressure=pressure,
+                        )
+                        _last_pressure_heavy_skip_log_at = now_mono
+                    scanner._current_activity = (
+                        f"Heavy lane degraded: DB pressure ({pressure.get('component') or pressure.get('reason')})."
+                    )
+                if run_heavy_now:
+                    pending_heavy_targeted_ids = None
+                    heavy_scan_task = asyncio.create_task(
+                        _run_full_snapshot_cycle(
+                            reason="manual_request" if force_heavy_scan else "scheduled",
+                            targeted_ids=targeted_for_heavy if targeted_for_heavy else None,
+                            force=force_heavy_scan,
+                            watchdog_seconds=full_snapshot_watchdog_seconds,
+                        ),
+                        name="scanner-full-snapshot-lane",
+                    )
+
+            try:
+                scanner._opportunities = await scanner.refresh_opportunity_prices(
+                    scanner.get_opportunities(),
+                    now=datetime.now(timezone.utc),
+                    drop_stale=True,
+                )
+                detected_age_threshold_seconds = scanner._opportunity_last_detected_retention_seconds(
+                    datetime.now(timezone.utc)
+                )
+                scanner.remove_old_opportunities(
+                    max_age_minutes=max(1, int(math.ceil(detected_age_threshold_seconds / 60.0))),
+                )
+            except Exception as exc:
+                logger.warning("Scanner stale-opportunity cleanup failed", exc_info=exc)
+
+            # Daily prune of the market_tags_seen retention window. The
+            # aggregator itself is incremental and cheap; this purely
+            # bounds chooser cardinality. Failure is non-fatal — if the
+            # delete raises, we just retry on the next cycle.
+            now_mono = time.monotonic()
+            if now_mono >= next_market_tag_prune_at:
+                prune_interval = max(
+                    300,
+                    int(getattr(settings, "MARKET_TAG_PRUNE_INTERVAL_SECONDS", 86_400) or 0),
+                )
+                try:
+                    from services.market_tag_aggregator import prune_stale_tags
+
+                    async with AsyncSessionLocal() as session:
+                        await prune_stale_tags(session)
+                except Exception as exc:
+                    logger.warning(
+                        "market_tag_aggregator periodic prune failed (non-fatal)",
+                        exc_info=exc,
+                    )
+                next_market_tag_prune_at = now_mono + prune_interval
+
+            try:
+                opportunities = scanner.get_opportunities()
+            except Exception as exc:
+                logger.exception("Failed to fetch opportunities after scan: %s", exc)
+                opportunities = []
+
+            if scan_error is not None and not opportunities:
+                try:
+                    async with AsyncSessionLocal() as session:
+                        previous_opps, _ = await read_scanner_snapshot(session)
+                    opportunities = previous_opps
+                except Exception:
+                    opportunities = []
+
+            if opportunities and any(getattr(opp, "ai_analysis", None) is None for opp in opportunities):
+                try:
+                    await asyncio.wait_for(scanner._attach_ai_judgments(opportunities), timeout=6)
+                except asyncio.TimeoutError:
+                    logger.debug("Timed out reattaching AI judgments in scanner worker loop")
+                except Exception as exc:
+                    logger.debug("AI judgment reattach skipped: %s", exc)
+
+            try:
+                status = scanner.get_status()
+            except Exception as exc:
+                logger.exception("Failed to build scanner status after scan: %s", exc)
+                status = {
+                    "running": True,
+                    "enabled": not paused,
+                    "interval_seconds": interval,
+                    "current_activity": getattr(scanner, "_current_activity", None),
+                    "strategies": [],
+                }
+
+            status["running"] = True
+            status["enabled"] = not paused
+            status["interval_seconds"] = interval
+
+            if scan_error is not None:
+                if isinstance(scan_error, asyncio.TimeoutError):
+                    activity = "Scanner cycle timeout; retaining last known opportunities."
+                elif _is_upstream_resolution_error(scan_error):
+                    activity = "Upstream market API DNS/network error; retaining last known opportunities."
+                else:
+                    activity = f"Last scan error: {scan_error}"
+                status["current_activity"] = activity
+
+            batch_kind = "scan_error" if scan_error is not None else "scan_cycle"
+            for enqueue_attempt in range(DB_RETRY_ATTEMPTS):
+                try:
+                    heartbeat_state["phase"] = "enqueue_batch"
+                    heartbeat_state["progress"] = 0.85
+                    batch_id, pending, dropped = await _enqueue_detection_batch(
+                        opportunities,
+                        status,
+                        batch_kind=batch_kind,
+                        quality_reports=getattr(scanner, "quality_reports", {}) or {},
+                    )
+                    heartbeat_state["queue_pending"] = pending
+                    heartbeat_state["dropped_batches"] = (
+                        int(heartbeat_state.get("dropped_batches", 0) or 0) + dropped
+                    )
+                    heartbeat_state["last_batch_id"] = batch_id
+                    heartbeat_state["last_run_at"] = utcnow()
+                    if dropped > 0:
+                        logger.warning("Scanner enqueued batch after dropping %d stale pending batches", dropped)
+                    heartbeat_state["phase"] = "idle"
+                    heartbeat_state["progress"] = 1.0
+                    break
+                except (DBAPIError, asyncio.TimeoutError) as exc:
+                    maybe_mark_db_pressure(exc, component="scanner_enqueue", ttl_seconds=45.0)
+                    if enqueue_attempt < DB_RETRY_ATTEMPTS - 1 and (
+                        isinstance(exc, asyncio.TimeoutError) or is_retryable_db_error(exc)
+                    ):
+                        delay = db_retry_delay(enqueue_attempt)
+                        logger.warning(
+                            "Retrying scanner batch enqueue",
+                            attempt=enqueue_attempt + 1,
+                            delay=round(delay, 3),
+                        )
+                        await asyncio.sleep(delay)
+                        continue
+                    heartbeat_state["last_error"] = str(exc)
+                    heartbeat_state["phase"] = "error"
+                    heartbeat_state["progress"] = 1.0
+                    logger.exception("Failed enqueueing scanner detection batch: %s", exc)
+                    break
+                except Exception as exc:
+                    heartbeat_state["last_error"] = str(exc)
+                    heartbeat_state["phase"] = "error"
+                    heartbeat_state["progress"] = 1.0
+                    logger.exception("Failed enqueueing scanner detection batch: %s", exc)
+                    break
+
+            sleep_seconds = (
+                settings.FAST_SCAN_INTERVAL_SECONDS if settings.TIERED_SCANNING_ENABLED and not requested else interval
+            )
+            sleep_seconds = max(3, int(sleep_seconds))
+            min_loop_seconds = 3
+
+            if settings.TIERED_SCANNING_ENABLED and not requested:
+                try:
+                    scanner._register_reactive_scanning()
+                    scanner._reactive_trigger.clear()
+                    await asyncio.wait_for(
+                        scanner._reactive_trigger.wait(),
+                        timeout=sleep_seconds,
+                    )
+                    # Reactive trigger fired early — enforce minimum sleep floor
+                    # to prevent tight-looping when the WS price feed fires continuously.
+                    await asyncio.sleep(min_loop_seconds)
+                except asyncio.TimeoutError:
+                    pass
+                except Exception:
+                    await asyncio.sleep(sleep_seconds)
+            else:
+                await asyncio.sleep(sleep_seconds)
+    finally:
+        heartbeat_stop_event.set()
+        heartbeat_task.cancel()
+        try:
+            await heartbeat_task
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            logger.warning("Scanner heartbeat task shutdown encountered an error: %s", exc)
+
+        if heavy_scan_task is not None and not heavy_scan_task.done():
+            heavy_scan_task.cancel()
+            try:
+                await heavy_scan_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+
+
+async def start_loop() -> None:
+    """Run scanner detection worker."""
+    try:
+        await apply_runtime_settings_overrides()
+    except Exception as exc:
+        logger.warning("Initial scanner runtime settings refresh failed: %s", exc)
+    try:
+        await _run_scan_loop()
+    except asyncio.CancelledError:
+        logger.info("Scanner worker shutting down")
+    finally:
+        scanner._running = False

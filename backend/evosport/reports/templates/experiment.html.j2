@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>EvoSport {{ run_id }}</title></head>
+<body>
+  <h1>{{ decision.decision }}</h1>
+  <p>{{ decision.reason }}</p>
+  <dl>
+    <dt>Run</dt><dd>{{ run_id }}</dd>
+    <dt>Fingerprint</dt><dd>{{ fingerprint }}</dd>
+    <dt>Dataset</dt><dd>{{ manifest.manifest_id }} · {{ manifest.start }} – {{ manifest.end }}</dd>
+    <dt>Homerun run</dt><dd>{{ homerun_run_id }}</dd>
+    <dt>Trades</dt><dd>{{ execution.get('trade_count', 0) }}</dd>
+    <dt>Total return</dt><dd>{{ execution.get('total_return_pct', 0) }}</dd>
+  </dl>
+  <h2>Data coverage</h2><pre>{{ result.get('data_coverage', {}) }}</pre>
+  <h2>Validation warnings</h2><pre>{{ execution.get('validation_warnings', []) }}</pre>
+  <strong>Statistical promotion is unavailable in P0-P2.</strong>
+</body>
+</html>

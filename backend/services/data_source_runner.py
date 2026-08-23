@@ -1,0 +1,1061 @@
+"""Execution runner for DB-defined data sources."""
+
+from __future__ import annotations
+
+import asyncio
+import inspect
+import time
+import uuid
+from datetime import datetime, timedelta, timezone
+from types import MethodType
+from time import mktime
+from typing import Any
+
+from sqlalchemy import delete, desc, func, select, tuple_
+from sqlalchemy.exc import DBAPIError, InterfaceError, OperationalError
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from models.database import AsyncSessionLocal, DataSource, DataSourceRecord, DataSourceRun, async_engine, recover_pool, release_conn
+from services.data_source_catalog import default_data_source_retention_policy
+from services.data_source_loader import DataSourceValidationError, data_source_loader
+from utils.logger import get_logger
+
+logger = get_logger(__name__)
+
+_RETENTION_BOUNDS: dict[str, tuple[int, int]] = {
+    "max_records": (1, 250_000),
+    "max_age_days": (1, 3650),
+}
+_DB_DISCONNECT_RETRY_BASE_DELAY_SECONDS = 0.2
+_DB_DISCONNECT_POOL_RECOVERY_COOLDOWN_SECONDS = 2.0
+_RETENTION_MIN_INTERVAL_SECONDS = 600.0
+_db_recovery_lock: asyncio.Lock | None = None
+_db_last_recovery_at_monotonic = 0.0
+_retention_last_applied_mono: dict[str, float] = {}
+
+
+def _get_db_recovery_lock() -> asyncio.Lock:
+    global _db_recovery_lock
+    if _db_recovery_lock is None:
+        _db_recovery_lock = asyncio.Lock()
+    return _db_recovery_lock
+
+
+def _is_retryable_db_disconnect_error(exc: Exception) -> bool:
+    # DBAPIError is the base for InterfaceError and OperationalError, but also
+    # wraps ConnectionDoesNotExistError which comes up as a plain DBAPIError.
+    # asyncpg.InternalClientError ("cannot switch to state N; another operation
+    # is in progress") surfaces as a raw asyncpg exception (not wrapped by
+    # SQLAlchemy) when the connection is dead/corrupted — treat it the same way.
+    _disconnect_markers = (
+        "connection is closed",
+        "underlying connection is closed",
+        "connection has been closed",
+        "closed the connection unexpectedly",
+        "terminating connection",
+        "connection reset by peer",
+        "broken pipe",
+        "connection was closed",
+        "connectiondoesnotexist",
+        "closed in the middle of operation",
+        "another operation",  # asyncpg InternalClientError state confusion
+        "cannot switch to state",  # asyncpg InternalClientError
+    )
+    # Raw asyncpg exceptions (InternalClientError, etc.) are not SQLAlchemy
+    # subclasses — check them by module name.
+    exc_module = type(exc).__module__ or ""
+    is_db_exc = isinstance(exc, (DBAPIError, OperationalError, InterfaceError)) or exc_module.startswith("asyncpg")
+    if not is_db_exc:
+        return False
+    # Check orig first (direct asyncpg errors), then the full stringified
+    # exception which captures autoflush-wrapped variants.
+    orig_msg = str(getattr(exc, "orig", "") or "").lower()
+    full_msg = str(exc).lower()
+    return any(marker in orig_msg or marker in full_msg for marker in _disconnect_markers)
+
+
+def _db_disconnect_retry_delay(attempt: int) -> float:
+    return min(_DB_DISCONNECT_RETRY_BASE_DELAY_SECONDS * (2**attempt), 1.5)
+
+
+async def _recover_pool_after_disconnect(source_slug: str) -> None:
+    global _db_last_recovery_at_monotonic
+
+    now = time.monotonic()
+    if now - _db_last_recovery_at_monotonic < _DB_DISCONNECT_POOL_RECOVERY_COOLDOWN_SECONDS:
+        return
+
+    lock = _get_db_recovery_lock()
+    async with lock:
+        now = time.monotonic()
+        if now - _db_last_recovery_at_monotonic < _DB_DISCONNECT_POOL_RECOVERY_COOLDOWN_SECONDS:
+            return
+        pool = getattr(async_engine.sync_engine, "pool", None)
+        checked_out = 0
+        if pool is not None and hasattr(pool, "checkedout"):
+            try:
+                checked_out = int(pool.checkedout())
+            except Exception:
+                checked_out = 0
+        if checked_out > 0:
+            logger.warning(
+                "Skipping DB pool recovery while connections are checked out",
+                source_slug=source_slug,
+                checked_out=checked_out,
+            )
+            return
+        try:
+            await recover_pool()
+            _db_last_recovery_at_monotonic = time.monotonic()
+            logger.warning(
+                "Recovered DB connection pool after disconnect",
+                source_slug=source_slug,
+            )
+        except Exception as exc:
+            logger.warning(
+                "DB pool recovery failed",
+                source_slug=source_slug,
+                error=str(exc),
+            )
+
+
+def _utcnow_naive() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def _as_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _as_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    if out != out:
+        return None
+    return out
+
+
+def _as_bool(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"true", "1", "yes", "on"}:
+            return True
+        if lowered in {"false", "0", "no", "off"}:
+            return False
+    return bool(value)
+
+
+def _as_tags(value: Any) -> list[str]:
+    if isinstance(value, list):
+        out: list[str] = []
+        seen: set[str] = set()
+        for raw in value:
+            item = str(raw or "").strip()
+            if not item:
+                continue
+            key = item.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(item)
+        return out
+    if isinstance(value, str):
+        item = value.strip()
+        return [item] if item else []
+    return []
+
+
+def _parse_datetime(value: Any) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        if value.tzinfo is not None:
+            return value.astimezone(timezone.utc).replace(tzinfo=None)
+        return value
+    if isinstance(value, tuple) and len(value) >= 6:
+        try:
+            return datetime.fromtimestamp(mktime(value), tz=timezone.utc).replace(tzinfo=None)
+        except Exception:
+            return None
+
+    text = str(value).strip()
+    if not text:
+        return None
+    if text.isdigit():
+        try:
+            ts = int(text)
+            if ts > 10_000_000_000:
+                ts = ts / 1000.0
+            return datetime.fromtimestamp(ts, tz=timezone.utc).replace(tzinfo=None)
+        except Exception:
+            return None
+    if text.endswith("Z"):
+        text = f"{text[:-1]}+00:00"
+
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        for fmt in ("%Y%m%dT%H%M%SZ", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+            try:
+                return datetime.strptime(text, fmt)
+            except ValueError:
+                continue
+        return None
+
+    if parsed.tzinfo is not None:
+        return parsed.astimezone(timezone.utc).replace(tzinfo=None)
+    return parsed
+
+
+class _ComparableAwareDateTime(datetime):
+    @classmethod
+    def from_datetime(cls, value: datetime) -> "_ComparableAwareDateTime":
+        aware = value.astimezone(timezone.utc) if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+        return cls(
+            aware.year,
+            aware.month,
+            aware.day,
+            aware.hour,
+            aware.minute,
+            aware.second,
+            aware.microsecond,
+            tzinfo=timezone.utc,
+            fold=aware.fold,
+        )
+
+    def _coerce_other(self, other: Any) -> Any:
+        if isinstance(other, datetime) and other.tzinfo is None:
+            return other.replace(tzinfo=timezone.utc)
+        return other
+
+    def __lt__(self, other: Any) -> bool:
+        return super().__lt__(self._coerce_other(other))
+
+    def __le__(self, other: Any) -> bool:
+        return super().__le__(self._coerce_other(other))
+
+    def __gt__(self, other: Any) -> bool:
+        return super().__gt__(self._coerce_other(other))
+
+    def __ge__(self, other: Any) -> bool:
+        return super().__ge__(self._coerce_other(other))
+
+
+def _source_parse_datetime_aware(_self: Any, value: Any) -> datetime | None:
+    parsed = _parse_datetime(value)
+    if parsed is None:
+        return None
+    return _ComparableAwareDateTime.from_datetime(parsed)
+
+
+def _source_parse_datetime_naive(_self: Any, value: Any) -> datetime | None:
+    return _parse_datetime(value)
+
+
+def _install_source_datetime_parser(instance: Any, *, aware: bool = True) -> None:
+    parser = _source_parse_datetime_aware if aware else _source_parse_datetime_naive
+    instance._parse_datetime = MethodType(parser, instance)
+
+
+def _is_naive_aware_datetime_compare_error(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return "offset-naive" in text and "offset-aware" in text
+
+
+def _json_safe(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, datetime):
+        if value.tzinfo is not None:
+            return value.astimezone(timezone.utc).isoformat()
+        return value.replace(tzinfo=timezone.utc).isoformat()
+    if isinstance(value, dict):
+        out: dict[str, Any] = {}
+        for key, nested in value.items():
+            out[str(key)] = _json_safe(nested)
+        return out
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe(item) for item in value]
+    return str(value)
+
+
+def _normalize_country_iso3(value: Any) -> str | None:
+    text = str(value or "").strip().upper()
+    if len(text) == 3 and text.isalpha():
+        return text
+    return None
+
+
+def _normalize_retention_policy(retention: Any) -> dict[str, int]:
+    if not isinstance(retention, dict):
+        return {}
+
+    normalized: dict[str, int] = {}
+    for key, bounds in _RETENTION_BOUNDS.items():
+        raw_value = retention.get(key)
+        if raw_value in (None, ""):
+            continue
+        low, high = bounds
+        try:
+            parsed = int(float(raw_value))
+        except (TypeError, ValueError):
+            continue
+        if parsed < low or parsed > high:
+            continue
+        normalized[key] = parsed
+    return normalized
+
+
+def _resolve_retention_policy(
+    retention: Any,
+    *,
+    slug: str | None,
+    source_key: str | None,
+    source_kind: str | None,
+) -> dict[str, int]:
+    defaults = default_data_source_retention_policy(
+        slug=slug,
+        source_key=source_key,
+        source_kind=source_kind,
+    )
+    normalized = _normalize_retention_policy(retention)
+    if not normalized:
+        return defaults
+    out = dict(defaults)
+    out.update(normalized)
+    return out
+
+
+def _retention_due(source_id: str) -> bool:
+    if not source_id:
+        return False
+    last_applied = _retention_last_applied_mono.get(source_id)
+    if last_applied is None:
+        return True
+    return time.monotonic() - last_applied >= _RETENTION_MIN_INTERVAL_SECONDS
+
+
+async def _apply_retention_policy(
+    session: AsyncSession,
+    source: DataSource,
+    *,
+    retention_policy: dict[str, int],
+) -> dict[str, int]:
+    source_id = str(source.id or "").strip()
+    if not source_id or not retention_policy:
+        return {"max_age_deleted": 0, "max_records_deleted": 0}
+
+    max_age_deleted = 0
+    max_records_deleted = 0
+
+    max_age_days = retention_policy.get("max_age_days")
+    if max_age_days is not None:
+        cutoff = _utcnow_naive() - timedelta(days=int(max_age_days))
+        delete_result = await session.execute(
+            delete(DataSourceRecord)
+            .where(DataSourceRecord.data_source_id == source_id)
+            .where(func.coalesce(DataSourceRecord.observed_at, DataSourceRecord.ingested_at) < cutoff)
+            .execution_options(synchronize_session=False)
+        )
+        max_age_deleted = int(delete_result.rowcount or 0)
+
+    max_records = retention_policy.get("max_records")
+    if max_records is not None:
+        # IMPORTANT: the prior implementation used
+        #     DELETE WHERE id IN (SELECT id ... ORDER BY ... OFFSET N)
+        # which forced Postgres to materialize and walk EVERY row past
+        # the keep-window before it could compute the id list — a 5.4s
+        # slow-execute in production soaks because the RETURNING also
+        # serializes all deleted ids back over the wire.  Switch to a
+        # keyset DELETE: find the boundary row's sort tuple at offset
+        # max_records, then DELETE anything older than that tuple in
+        # one indexed range scan.  The boundary lookup is a single
+        # index-only seek (no offset scan because it's LIMIT 1 after
+        # OFFSET, but on a 1-column return the planner can use the
+        # index directly).  No materialization, no RETURNING.
+        max_records_int = int(max_records)
+        ordered_at = func.coalesce(DataSourceRecord.observed_at, DataSourceRecord.ingested_at)
+        boundary_stmt = (
+            select(
+                ordered_at.label("ordered_at"),
+                DataSourceRecord.ingested_at,
+                DataSourceRecord.id,
+            )
+            .where(DataSourceRecord.data_source_id == source_id)
+            .order_by(
+                desc(ordered_at),
+                desc(DataSourceRecord.ingested_at),
+                desc(DataSourceRecord.id),
+            )
+            .offset(max_records_int)
+            .limit(1)
+        )
+        boundary_row = (await session.execute(boundary_stmt)).first()
+        if boundary_row is not None:
+            b_ordered_at, b_ingested, b_id = boundary_row
+            # Delete all rows whose sort tuple is <= the boundary
+            # (i.e. rows at offset max_records and beyond), keeping
+            # exactly max_records rows.
+            delete_stmt = delete(DataSourceRecord).where(
+                DataSourceRecord.data_source_id == source_id,
+                tuple_(
+                    ordered_at,
+                    DataSourceRecord.ingested_at,
+                    DataSourceRecord.id,
+                )
+                <= tuple_(b_ordered_at, b_ingested, b_id),
+            ).execution_options(synchronize_session=False)
+            delete_result = await session.execute(delete_stmt)
+            max_records_deleted = int(delete_result.rowcount or 0)
+
+    return {
+        "max_age_deleted": int(max_age_deleted),
+        "max_records_deleted": int(max_records_deleted),
+    }
+
+
+async def _invoke_callable(func: Any, *args: Any, **kwargs: Any) -> Any:
+    result = func(*args, **kwargs)
+    if inspect.isawaitable(result):
+        return await result
+    return result
+
+
+def _normalize_record(raw: dict[str, Any], transformed: dict[str, Any]) -> dict[str, Any]:
+    payload_raw = dict(raw)
+    final_raw = dict(transformed)
+
+    external_id = _as_text(final_raw.get("external_id")) or _as_text(payload_raw.get("external_id"))
+    title = _as_text(final_raw.get("title")) or _as_text(payload_raw.get("title"))
+    summary = _as_text(final_raw.get("summary")) or _as_text(payload_raw.get("summary"))
+    category_raw = _as_text(final_raw.get("category")) or _as_text(payload_raw.get("category"))
+    category = category_raw.lower() if category_raw else None
+    source = _as_text(final_raw.get("source")) or _as_text(payload_raw.get("source"))
+    url = _as_text(final_raw.get("url")) or _as_text(payload_raw.get("url"))
+
+    latitude = _as_float(final_raw.get("latitude"))
+    if latitude is None:
+        latitude = _as_float(payload_raw.get("latitude"))
+    longitude = _as_float(final_raw.get("longitude"))
+    if longitude is None:
+        longitude = _as_float(payload_raw.get("longitude"))
+
+    country_iso3 = _normalize_country_iso3(final_raw.get("country_iso3"))
+    if country_iso3 is None:
+        country_iso3 = _normalize_country_iso3(payload_raw.get("country_iso3"))
+
+    geotagged = _as_bool(final_raw.get("geotagged"), default=False)
+    if not geotagged:
+        geotagged = latitude is not None and longitude is not None
+
+    observed_at = _parse_datetime(final_raw.get("observed_at"))
+    if observed_at is None:
+        observed_at = _parse_datetime(payload_raw.get("observed_at"))
+
+    tags = _as_tags(final_raw.get("tags"))
+    if not tags:
+        tags = _as_tags(payload_raw.get("tags"))
+
+    payload = _json_safe(payload_raw)
+    if not isinstance(payload, dict):
+        payload = {}
+    final = _json_safe(final_raw)
+    if not isinstance(final, dict):
+        final = {}
+
+    return {
+        "external_id": external_id,
+        "title": title,
+        "summary": summary,
+        "category": category,
+        "source": source,
+        "url": url,
+        "geotagged": geotagged,
+        "country_iso3": country_iso3,
+        "latitude": latitude,
+        "longitude": longitude,
+        "observed_at": observed_at,
+        "payload_json": payload,
+        "transformed_json": final,
+        "tags_json": tags,
+    }
+
+
+async def run_data_source(
+    session: AsyncSession,
+    source: DataSource,
+    *,
+    max_records: int = 500,
+    commit: bool = True,
+    return_records: bool = False,
+    _retry_on_disconnect: bool = True,
+) -> dict[str, Any]:
+    """Run one source, normalize records, and upsert into data_source_records."""
+
+    source_slug = str(source.slug or "").strip().lower()
+    source_id = str(source.id or "")
+    if not source_slug:
+        raise ValueError("source.slug is required")
+    if not bool(source.enabled):
+        raise ValueError(f"Source '{source_slug}' is disabled")
+    source_code = str(source.source_code or "")
+    source_config = dict(source.config or {})
+    source_class_name = source.class_name
+    source_retention = source.retention
+    source_source_key = source.source_key
+    source_source_kind = source.source_kind
+
+    safe_max_records = max(1, min(5000, int(max_records)))
+    started_at = _utcnow_naive()
+    runtime = data_source_loader.get_runtime(source_slug)
+
+    # Build run_row but do NOT add it to the session yet. Adding it upfront
+    # causes SQLAlchemy autoflush to try to INSERT it when the subsequent
+    # SELECT queries run. If the connection dies between add() and the
+    # SELECT, autoflush throws InterfaceError on the INSERT — before we even
+    # reach the exception handler. We add it to the session only at the end
+    # (success path) or via a fresh session (error path).
+    run_row_id = uuid.uuid4().hex
+    run_row: DataSourceRun | None = None
+
+    fetched_count = 0
+    transformed_count = 0
+    upserted_count = 0
+    skipped_count = 0
+    retention_policy = _resolve_retention_policy(
+        source_retention,
+        slug=source_slug,
+        source_key=source_source_key,
+        source_kind=source_source_kind,
+    )
+    retention_pruned = {"max_age_deleted": 0, "max_records_deleted": 0}
+    recent_records: list[dict[str, Any]] = []
+
+    try:
+        if session.in_transaction():
+            await session.rollback()
+        if runtime is None:
+            runtime = data_source_loader.load(
+                slug=source_slug,
+                source_code=source_code,
+                config=source_config,
+                class_name=source_class_name,
+            )
+        instance = runtime.instance
+        _install_source_datetime_parser(instance)
+
+        async def _fetch_from_instance() -> Any:
+            if hasattr(instance, "fetch_async"):
+                return await _invoke_callable(instance.fetch_async)
+            if hasattr(instance, "fetch"):
+                return await _invoke_callable(instance.fetch)
+            raise DataSourceValidationError("Source instance has no fetch/fetch_async method")
+
+        async with release_conn(session):
+            try:
+                fetched = await _fetch_from_instance()
+            except TypeError as exc:
+                if not _is_naive_aware_datetime_compare_error(exc):
+                    raise
+                _install_source_datetime_parser(instance, aware=False)
+                fetched = await _fetch_from_instance()
+
+        if fetched is None:
+            fetched_rows: list[Any] = []
+        elif isinstance(fetched, list):
+            fetched_rows = fetched
+        else:
+            raise DataSourceValidationError("fetch/fetch_async must return a list of dict records")
+
+        fetched_rows = fetched_rows[:safe_max_records]
+        fetched_count = len(fetched_rows)
+
+        normalized_rows: list[dict[str, Any]] = []
+        for raw_item in fetched_rows:
+            if not isinstance(raw_item, dict):
+                skipped_count += 1
+                continue
+
+            raw_payload = dict(raw_item)
+            transformed_payload = dict(raw_payload)
+            if hasattr(instance, "transform"):
+                try:
+                    transformed = await _invoke_callable(instance.transform, dict(raw_payload))
+                except TypeError as exc:
+                    if not _is_naive_aware_datetime_compare_error(exc):
+                        raise
+                    _install_source_datetime_parser(instance, aware=False)
+                    transformed = await _invoke_callable(instance.transform, dict(raw_payload))
+                if isinstance(transformed, dict):
+                    transformed_payload = transformed
+                else:
+                    skipped_count += 1
+                    continue
+
+            normalized = _normalize_record(raw_payload, transformed_payload)
+            normalized_rows.append(normalized)
+
+        transformed_count = len(normalized_rows)
+        ingested_at = _utcnow_naive()
+        if return_records:
+            recent_records = [
+                {
+                    "external_id": normalized.get("external_id"),
+                    "title": normalized.get("title"),
+                    "summary": normalized.get("summary"),
+                    "category": normalized.get("category"),
+                    "source": normalized.get("source"),
+                    "url": normalized.get("url"),
+                    "observed_at": normalized.get("observed_at") or ingested_at,
+                    "ingested_at": ingested_at,
+                    "payload_json": normalized.get("payload_json") or {},
+                    "transformed_json": normalized.get("transformed_json") or {},
+                    "tags_json": normalized.get("tags_json") or [],
+                    "latitude": normalized.get("latitude"),
+                    "longitude": normalized.get("longitude"),
+                    "country_iso3": normalized.get("country_iso3"),
+                    "source_slug": source_slug,
+                }
+                for normalized in normalized_rows
+            ]
+
+        external_ids = sorted({record["external_id"] for record in normalized_rows if record.get("external_id")})
+
+        existing_by_external_id: dict[str, DataSourceRecord] = {}
+        source = await session.get(DataSource, source_id)
+        if source is None:
+            raise RuntimeError(f"Data source '{source_slug}' missing during writeback")
+        if not bool(source.enabled):
+            raise ValueError(f"Source '{source_slug}' is disabled")
+        source.retention = dict(retention_policy)
+        # 2026-05-09: incremental flush + commit every BATCH_SIZE records.
+        # The 2026-05-09 soak showed 4 concurrent ``news-feed-source-*::_worker``
+        # transactions held 12-16s each on data_source_runs/data_sources writes
+        # — a single bulk flush of 200-500 rows × 6 indexes. Splitting the
+        # upsert into 50-row batches drops each commit to <500ms in steady
+        # state, releases row locks back to the pool quickly, and prevents
+        # the events-worker / news-feed-worker from monopolising connections
+        # during their fetch cycle. Each batch is in its own short tx, so
+        # a partial failure mid-loop simply abandons the rest of the batch
+        # rather than rolling back the whole source run.
+        BATCH_SIZE = 50
+
+        async def _commit_batch_if_due(force: bool = False) -> None:
+            pending = len(session.new) + len(session.dirty)
+            if pending == 0:
+                return
+            if not force and pending < BATCH_SIZE:
+                return
+            try:
+                await session.commit()
+            except Exception:
+                # On commit failure, rollback the partial batch and re-raise
+                # so the surrounding error handler can mark the run failed.
+                try:
+                    await session.rollback()
+                except Exception:
+                    pass
+                raise
+
+        # Use no_autoflush for all reads and writes in this block so SQLAlchemy
+        # never tries to flush pending objects on a potentially-dead connection
+        # mid-operation. We flush explicitly at commit time.
+        with session.no_autoflush:
+            if external_ids:
+                existing_rows = (
+                    (
+                        await session.execute(
+                            select(DataSourceRecord)
+                            .where(DataSourceRecord.source_slug == source_slug)
+                            .where(DataSourceRecord.external_id.in_(external_ids))
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+                existing_by_external_id = {str(row.external_id): row for row in existing_rows if row.external_id}
+
+            for normalized in normalized_rows:
+                external_id = normalized.get("external_id")
+                existing = existing_by_external_id.get(str(external_id)) if external_id else None
+
+                if existing is not None:
+                    existing.title = normalized.get("title")
+                    existing.summary = normalized.get("summary")
+                    existing.category = normalized.get("category")
+                    existing.source = normalized.get("source")
+                    existing.url = normalized.get("url")
+                    existing.geotagged = bool(normalized.get("geotagged"))
+                    existing.country_iso3 = normalized.get("country_iso3")
+                    existing.latitude = normalized.get("latitude")
+                    existing.longitude = normalized.get("longitude")
+                    existing.observed_at = normalized.get("observed_at")
+                    existing.ingested_at = ingested_at
+                    existing.payload_json = normalized.get("payload_json")
+                    existing.transformed_json = normalized.get("transformed_json")
+                    existing.tags_json = normalized.get("tags_json")
+                else:
+                    session.add(
+                        DataSourceRecord(
+                            id=uuid.uuid4().hex,
+                            data_source_id=source.id,
+                            source_slug=source_slug,
+                            external_id=normalized.get("external_id"),
+                            title=normalized.get("title"),
+                            summary=normalized.get("summary"),
+                            category=normalized.get("category"),
+                            source=normalized.get("source"),
+                            url=normalized.get("url"),
+                            geotagged=bool(normalized.get("geotagged")),
+                            country_iso3=normalized.get("country_iso3"),
+                            latitude=normalized.get("latitude"),
+                            longitude=normalized.get("longitude"),
+                            observed_at=normalized.get("observed_at"),
+                            ingested_at=ingested_at,
+                            payload_json=normalized.get("payload_json"),
+                            transformed_json=normalized.get("transformed_json"),
+                            tags_json=normalized.get("tags_json"),
+                        )
+                    )
+                upserted_count += 1
+                # Commit when the in-memory batch reaches BATCH_SIZE so we
+                # don't hold the entire upsert as a single commit.
+                if upserted_count % BATCH_SIZE == 0:
+                    await _commit_batch_if_due()
+
+        # Drain anything that didn't reach a batch boundary before retention.
+        await _commit_batch_if_due(force=True)
+
+        if _retention_due(source_id):
+            retention_pruned = await _apply_retention_policy(
+                session,
+                source,
+                retention_policy=retention_policy,
+            )
+            _retention_last_applied_mono[source_id] = time.monotonic()
+
+        if runtime is not None:
+            runtime.run_count += 1
+            runtime.last_run = _utcnow_naive()
+            runtime.last_error = None
+
+        source.status = "loaded"
+        source.error_message = None
+    except Exception as exc:
+        is_disconnect_error = _is_retryable_db_disconnect_error(exc)
+        if _retry_on_disconnect and is_disconnect_error:
+            try:
+                await session.rollback()
+            except Exception:
+                pass
+            await _recover_pool_after_disconnect(source_slug)
+            logger.warning(
+                "Data source run hit transient DB disconnect; retrying once",
+                source_slug=source_slug,
+                error=str(exc),
+            )
+            await asyncio.sleep(_db_disconnect_retry_delay(0))
+            try:
+                async with AsyncSessionLocal() as retry_session:
+                    retry_source = await retry_session.get(DataSource, source_id)
+                    if retry_source is None:
+                        raise RuntimeError(f"Data source '{source_slug}' missing during retry")
+                    return await run_data_source(
+                        retry_session,
+                        retry_source,
+                        max_records=max_records,
+                        commit=commit,
+                        return_records=return_records,
+                        _retry_on_disconnect=False,
+                    )
+            except Exception as retry_exc:
+                if _is_retryable_db_disconnect_error(retry_exc):
+                    await _recover_pool_after_disconnect(source_slug)
+                logger.warning(
+                    "Data source retry with fresh session failed; falling back to normal error handling",
+                    source_slug=source_slug,
+                    error=str(retry_exc),
+                )
+
+        if runtime is not None:
+            runtime.error_count += 1
+            runtime.last_error = str(exc)
+        error_message = str(exc)
+        if is_disconnect_error:
+            logger.warning(
+                "Data source run failed due transient DB disconnect",
+                source_slug=source_slug,
+                error=error_message,
+            )
+        else:
+            logger.error("Data source run failed", source_slug=source_slug, exc_info=exc)
+
+        # Roll back tainted transaction.
+        try:
+            await session.rollback()
+        except Exception:
+            pass
+
+        completed_at = _utcnow_naive()
+        error_run_row = DataSourceRun(
+            id=uuid.uuid4().hex,
+            data_source_id=source_id,
+            source_slug=source_slug,
+            status="error",
+            fetched_count=fetched_count,
+            transformed_count=transformed_count,
+            upserted_count=upserted_count,
+            skipped_count=skipped_count,
+            error_message=error_message,
+            metadata_json={},
+            started_at=started_at,
+            completed_at=completed_at,
+            duration_ms=int((completed_at - started_at).total_seconds() * 1000),
+        )
+
+        # Always persist the error run row via a fresh session. The original
+        # session is in an indeterminate post-rollback state and may be shared
+        # with concurrent callers (e.g. asyncio.gather in feed_service). Using
+        # it here risks "another operation is in progress" asyncpg errors.
+        # Retry up to 3 times in case pool_pre_ping doesn't catch a stale connection.
+        _persist_attempts = 3
+        for _attempt in range(_persist_attempts):
+            try:
+                async with AsyncSessionLocal() as fresh_session:
+                    src = await fresh_session.get(DataSource, source_id)
+                    if src is not None:
+                        src.status = "error"
+                        src.error_message = error_message
+                    fresh_session.add(error_run_row)
+                    await fresh_session.commit()
+                break
+            except Exception as persist_exc:
+                if _attempt < _persist_attempts - 1 and _is_retryable_db_disconnect_error(persist_exc):
+                    await _recover_pool_after_disconnect(source_slug)
+                    await asyncio.sleep(_db_disconnect_retry_delay(_attempt))
+                    continue
+                if _is_retryable_db_disconnect_error(persist_exc):
+                    await _recover_pool_after_disconnect(source_slug)
+                logger.warning(
+                    "Failed to persist error run row for %s: %s",
+                    source_slug,
+                    persist_exc,
+                )
+                break
+
+        return {
+            "run_id": error_run_row.id,
+            "source_slug": source_slug,
+            "status": "error",
+            "fetched_count": fetched_count,
+            "transformed_count": transformed_count,
+            "upserted_count": upserted_count,
+            "skipped_count": skipped_count,
+            "error_message": error_message,
+            "duration_ms": error_run_row.duration_ms,
+            "retention_pruned_count": 0,
+            "records": [],
+        }
+
+    # Build and add run_row here — only after all the fetch/upsert work
+    # succeeded. Deferring the add() until this point prevents SQLAlchemy
+    # autoflush from trying to INSERT it during the SELECT queries above
+    # (which would fail with InterfaceError if the connection died).
+    completed_at = _utcnow_naive()
+    run_row = DataSourceRun(
+        id=run_row_id,
+        data_source_id=source_id,
+        source_slug=source_slug,
+        status="success",
+        fetched_count=fetched_count,
+        transformed_count=transformed_count,
+        upserted_count=upserted_count,
+        skipped_count=skipped_count,
+        error_message=None,
+        metadata_json={
+            "max_records": safe_max_records,
+            "retention": dict(retention_policy),
+            "retention_pruned": {
+                "max_age_deleted": int(retention_pruned.get("max_age_deleted") or 0),
+                "max_records_deleted": int(retention_pruned.get("max_records_deleted") or 0),
+                "total_deleted": int(retention_pruned.get("max_age_deleted") or 0)
+                + int(retention_pruned.get("max_records_deleted") or 0),
+            },
+        },
+        started_at=started_at,
+        completed_at=completed_at,
+        duration_ms=int((completed_at - started_at).total_seconds() * 1000),
+    )
+    session.add(run_row)
+
+    if commit:
+        await session.commit()
+    else:
+        await session.flush()
+
+    # Dispatch a DataEvent so subscribed strategies can react when a data
+    # source produces new records — bridging the DataSource SDK into the
+    # real-time event pipeline.
+    if run_row.status == "success" and upserted_count > 0:
+        try:
+            from services.data_events import DataEvent, EventType
+            from services.event_dispatcher import event_dispatcher
+
+            event = DataEvent(
+                event_type=EventType.DATA_SOURCE_UPDATE,
+                source=f"data_source:{source_slug}",
+                timestamp=datetime.now(timezone.utc),
+                payload={
+                    "source_slug": source_slug,
+                    "records_count": upserted_count,
+                    "run_id": run_row.id,
+                },
+            )
+            await event_dispatcher.dispatch(event)
+        except Exception as exc:
+            logger.warning(
+                "DataEvent dispatch after data source run failed (non-critical)",
+                source_slug=source_slug,
+                exc_info=exc,
+            )
+
+    return {
+        "run_id": run_row.id,
+        "source_slug": source_slug,
+        "status": run_row.status,
+        "fetched_count": fetched_count,
+        "transformed_count": transformed_count,
+        "upserted_count": upserted_count,
+        "skipped_count": skipped_count,
+        "error_message": run_row.error_message,
+        "duration_ms": run_row.duration_ms,
+        "retention_pruned_count": int(retention_pruned.get("max_age_deleted") or 0)
+        + int(retention_pruned.get("max_records_deleted") or 0),
+        "records": recent_records if return_records else [],
+    }
+
+
+async def run_data_source_by_slug(
+    session: AsyncSession,
+    *,
+    source_slug: str,
+    max_records: int = 500,
+    commit: bool = True,
+    return_records: bool = False,
+) -> dict[str, Any]:
+    slug = str(source_slug or "").strip().lower()
+    if not slug:
+        raise ValueError("source_slug is required")
+
+    row = (await session.execute(select(DataSource).where(DataSource.slug == slug))).scalar_one_or_none()
+    if row is None:
+        raise ValueError(f"Data source '{slug}' not found")
+
+    return await run_data_source(
+        session,
+        row,
+        max_records=max_records,
+        commit=commit,
+        return_records=return_records,
+    )
+
+
+async def preview_data_source(
+    source: DataSource,
+    *,
+    max_records: int = 25,
+) -> dict[str, Any]:
+    source_slug = str(source.slug or "").strip().lower()
+    if not source_slug:
+        raise ValueError("source.slug is required")
+
+    safe_max = max(1, min(200, int(max_records)))
+    started_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+
+    runtime = data_source_loader.get_runtime(source_slug)
+    if runtime is None:
+        runtime = data_source_loader.load(
+            slug=source_slug,
+            source_code=str(source.source_code or ""),
+            config=dict(source.config or {}),
+            class_name=source.class_name,
+        )
+    instance = runtime.instance
+
+    if hasattr(instance, "fetch_async"):
+        fetched = await _invoke_callable(instance.fetch_async)
+    elif hasattr(instance, "fetch"):
+        fetched = await _invoke_callable(instance.fetch)
+    else:
+        raise DataSourceValidationError("Source instance has no fetch/fetch_async method")
+
+    if fetched is None:
+        fetched_rows: list[Any] = []
+    elif isinstance(fetched, list):
+        fetched_rows = fetched
+    else:
+        raise DataSourceValidationError("fetch/fetch_async must return a list of dict records")
+
+    total_fetched = len(fetched_rows)
+    fetched_rows = fetched_rows[:safe_max]
+
+    normalized_rows: list[dict[str, Any]] = []
+    for raw_item in fetched_rows:
+        if not isinstance(raw_item, dict):
+            continue
+        raw_payload = dict(raw_item)
+        transformed_payload = dict(raw_payload)
+        if hasattr(instance, "transform"):
+            transformed = await _invoke_callable(instance.transform, dict(raw_payload))
+            if isinstance(transformed, dict):
+                transformed_payload = transformed
+            else:
+                continue
+        normalized = _normalize_record(raw_payload, transformed_payload)
+        normalized_rows.append(normalized)
+
+    elapsed_ms = int(datetime.now(timezone.utc).timestamp() * 1000) - started_ms
+
+    return {
+        "source_id": source.id,
+        "source_slug": source_slug,
+        "total_fetched": total_fetched,
+        "duration_ms": max(0, elapsed_ms),
+        "records": [
+            {
+                "external_id": row.get("external_id"),
+                "title": row.get("title"),
+                "summary": row.get("summary"),
+                "category": row.get("category"),
+                "source": row.get("source"),
+                "url": row.get("url"),
+                "geotagged": bool(row.get("geotagged")),
+                "country_iso3": row.get("country_iso3"),
+                "latitude": row.get("latitude"),
+                "longitude": row.get("longitude"),
+                "observed_at": row["observed_at"].isoformat() if row.get("observed_at") else None,
+                "payload": row.get("payload_json"),
+                "transformed": row.get("transformed_json"),
+                "tags": row.get("tags_json"),
+            }
+            for row in normalized_rows
+        ],
+    }
+
+
+__all__ = [
+    "run_data_source",
+    "run_data_source_by_slug",
+    "preview_data_source",
+]

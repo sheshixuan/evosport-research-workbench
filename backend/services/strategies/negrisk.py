@@ -1,0 +1,1063 @@
+# SEED TEMPLATE — not the live strategy. The DB `strategies.source_code` is the
+# runtime master (loaded by the orchestrator + backtester); edits here only seed
+# fresh installs / reset-to-factory. See services/opportunity_strategy_catalog.py.
+from __future__ import annotations
+
+import logging
+import re
+from typing import Any
+
+from models import Market, Event, Opportunity
+from .base import BaseStrategy, DecisionCheck, ExitDecision, ScoringWeights, SizingConfig, make_aware
+from services.quality_filter import QualityFilterOverrides, quality_filter
+from services.strategy_sdk import StrategySDK
+from utils.converters import to_float
+
+logger = logging.getLogger(__name__)
+
+
+_GENERIC_PLACEHOLDER_RE = re.compile(
+    r"\b(?:team|candidate|party|club|fighter|player|golfer|driver|school|country|city)\s+[a-z]\b",
+    re.IGNORECASE,
+)
+_SINGLE_LETTER_WINNER_RE = re.compile(r"^\s*will\s+[a-z]\s+win\b", re.IGNORECASE)
+
+
+class NegRiskStrategy(BaseStrategy):
+    """
+    Strategy 4: NegRisk / One-of-Many Arbitrage
+
+    For Polymarket-flagged NegRisk events where EXACTLY ONE outcome must win,
+    buy YES on all outcomes when total cost < $1.00
+
+    TRUE ARBITRAGE requires mutually exclusive, exhaustive outcomes:
+    - Polymarket NegRisk flag: Platform guarantees exactly one outcome wins
+    - Multi-outcome elections: "Who wins?" where one candidate must win
+
+    WARNING: Date-based "by X" markets are NOT valid for this strategy!
+    - "Event by March", "Event by June", "Event by December" are CUMULATIVE
+    - If event happens in March, ALL "by later date" markets also resolve YES
+    - Buying NO on all dates = 100% correlated loss if event happens early
+    - This is SPECULATIVE, not arbitrage
+
+    Valid Example (Multi-candidate election):
+    - Candidate A YES: $0.30
+    - Candidate B YES: $0.35
+    - Candidate C YES: $0.32
+    - Total: $0.97, one must win = $1.00
+    - Profit: $0.03 (guaranteed)
+    """
+
+    strategy_type = "negrisk"
+    name = "NegRisk / One-of-Many"
+    description = "Buy YES on all outcomes in verified mutually-exclusive events"
+    mispricing_type = "within_market"
+    subscriptions = ["market_data_refresh"]
+
+    quality_filter_overrides = QualityFilterOverrides(
+        min_roi=0.3,
+        min_annualized_roi=0.0,
+    )
+
+    scoring_weights = ScoringWeights(
+        edge_weight=0.65,
+        confidence_weight=35.0,
+        risk_penalty=10.0,
+        market_count_bonus=1.2,
+    )
+    sizing_config = SizingConfig(
+        base_divisor=120.0,
+        confidence_offset=0.8,
+        risk_scale_factor=0.0,
+        risk_floor=1.0,
+    )
+    default_config = {
+        "min_edge_percent": 3.0,
+        "min_confidence": 0.42,
+        "max_risk_score": 0.68,
+        "min_markets": 3,
+        "min_total_yes": 0.95,
+        "warn_total_yes": 0.97,
+        "election_min_total_yes": 0.97,
+        "max_resolution_spread_days": 7,
+        # Bid/ask-aware fill-cost gates. Both detection branches now price
+        # legs at the visible ask (with a small mid-cushion fallback) and
+        # require a minimum margin AFTER spread is paid. Without these, a
+        # 1-2¢ ask premium per leg silently consumes the edge — the latent
+        # bug that made the (never-traded) short side dangerous.
+        "long_min_ask_priced_margin": 0.02,   # $0.02 gross after ask fill
+        "short_min_ask_priced_margin": 0.04,  # $0.04 gross after ask fill (3+ legs)
+        # Per-leg liquidity floor — bundle-level min(...) is enforced inside
+        # create_opportunity, but a single thin leg breaks the bundle.
+        "long_min_per_leg_liquidity": 750.0,
+        "short_min_per_leg_liquidity": 750.0,
+    }
+
+    def detect(self, events: list[Event], markets: list[Market], prices: dict[str, dict]) -> list[Opportunity]:
+        opportunities = []
+
+        for event in events:
+            # Need multiple markets in the event
+            if len(event.markets) < 2:
+                continue
+
+            # Skip closed events
+            if event.closed:
+                continue
+
+            # Strategy A: NegRisk events (flagged by Polymarket)
+            # This is TRUE arbitrage - Polymarket guarantees exactly one outcome wins
+            if event.neg_risk:
+                opp = self._detect_negrisk_event(event, prices)
+                if opp:
+                    opportunities.append(opp)
+
+            # NOTE: Date sweep strategy REMOVED - it was incorrectly classified as arbitrage
+            # "By X date" markets are CUMULATIVE, not mutually exclusive:
+            # - If event happens by March, it ALSO happened "by June" and "by December"
+            # - So ALL NO positions lose together = 100% correlated loss
+            # - This is a SPECULATIVE BET, not arbitrage
+
+            # Strategy B: Multi-outcome (buy YES on all outcomes)
+            # Only for non-date-based events with verified exhaustive outcomes
+            opp = self._detect_multi_outcome(event, prices)
+            if opp:
+                opportunities.append(opp)
+
+        return opportunities
+
+    @staticmethod
+    def _build_position(
+        market: Market,
+        *,
+        outcome: str,
+        price: float,
+        token_index: int,
+    ) -> dict[str, Any]:
+        token_id = None
+        if market.clob_token_ids and token_index < len(market.clob_token_ids):
+            token_id = market.clob_token_ids[token_index]
+        return {
+            "action": "BUY",
+            "outcome": outcome,
+            "market": market.question,
+            "market_id": market.id,
+            "market_question": market.question,
+            "price": price,
+            "token_id": token_id,
+        }
+
+    # NOTE: realistic fill-cost pricing is delegated to
+    # StrategySDK.get_ask_priced_fill so the bid/ask trap stays patched
+    # in one place across every strategy. Detect paths call the SDK
+    # helper directly with side="YES" or side="NO".
+
+    def _finalize_opportunity(self, opportunity: Opportunity | None) -> Opportunity | None:
+        if opportunity is None:
+            return None
+        execution_plan = getattr(opportunity, "execution_plan", None)
+        if execution_plan is None:
+            return None
+        legs = list(execution_plan.legs or [])
+        if len(legs) != len(opportunity.positions_to_take):
+            return None
+        for leg in legs:
+            if not str(getattr(leg, "market_id", "") or "").strip():
+                return None
+            if not str(getattr(leg, "token_id", "") or "").strip():
+                return None
+        if float(getattr(opportunity, "net_profit", 0.0) or 0.0) <= 0.0:
+            return None
+        report = quality_filter.evaluate_opportunity(
+            opportunity,
+            overrides=self.quality_filter_overrides,
+        )
+        if not report.passed:
+            return None
+        return opportunity
+
+    def _detect_negrisk_event(self, event: Event, prices: dict[str, dict]) -> Opportunity | None:
+        """Detect arbitrage in official NegRisk events.
+
+        IMPORTANT: The NegRisk flag guarantees mutual exclusivity among LISTED
+        outcomes, but does NOT guarantee the list is EXHAUSTIVE. For example,
+        an election NegRisk bundle may list 6 candidates, but if a 7th (unlisted)
+        candidate wins, ALL listed outcomes resolve to $0 = 100% loss.
+
+        A low total YES price (e.g., $0.60-0.80) is a strong signal that the
+        market prices in a significant probability of an unlisted outcome winning.
+        This is NOT a mispricing — it's rational pricing of non-exhaustive risk.
+        """
+        active_markets = [m for m in event.markets if m.active and not m.closed]
+        if len(active_markets) < 2:
+            return None
+
+        verified_exhaustive, exhaustiveness_reason = self._verify_exhaustive_event_family(event, active_markets)
+        if not verified_exhaustive:
+            return None
+
+        # Per-leg minimum liquidity. A single thin leg makes the "buy all
+        # YES" bundle un-fillable at the quoted ask without slippage, even
+        # if the bundle's aggregate liquidity looks fine.
+        min_per_leg_liquidity = float(
+            to_float(self.config.get("long_min_per_leg_liquidity", 750.0), 750.0)
+        )
+        for market in active_markets:
+            if float(getattr(market, "liquidity", 0.0) or 0.0) < min_per_leg_liquidity:
+                return None
+
+        # Gather YES prices using ask when available (true fill cost) and
+        # mid as a fallback. Track both so we can warn when the spread
+        # cushion is non-trivial.
+        total_yes_ask = 0.0
+        total_yes_mid = 0.0
+        ask_used_count = 0
+        positions = []
+
+        for market in active_markets:
+            fill_price, yes_mid, ask_known = StrategySDK.get_ask_priced_fill(
+                market, prices, side="YES",
+            )
+            total_yes_ask += fill_price
+            total_yes_mid += yes_mid
+            ask_used_count += int(ask_known)
+            positions.append(self._build_position(market, outcome="YES", price=fill_price, token_index=0))
+
+        # The arb bound applies to the ask-priced bundle. If the bundle can
+        # be filled for less than $1.00 at ask (and exactly one outcome
+        # wins), we have a real edge — otherwise short arb may still apply.
+        total_yes = total_yes_ask
+
+        # In NegRisk, exactly one outcome wins, so total YES should = $1
+        if total_yes >= 1.0:
+            # Check for SHORT arbitrage (total YES > $1 means NOs are cheap)
+            return self._detect_negrisk_short(event, active_markets, prices)
+
+        is_election = self._is_election_market(event.title)
+        is_open_ended = self._is_open_ended_event(event.title)
+        min_total_yes = max(0.5, min(1.0, to_float(self.config.get("min_total_yes", 0.95), 0.95)))
+        election_min_total_yes = max(
+            min_total_yes,
+            min(1.0, to_float(self.config.get("election_min_total_yes", 0.97), 0.97)),
+        )
+        warn_total_yes = max(
+            min_total_yes,
+            min(1.0, to_float(self.config.get("warn_total_yes", 0.97), 0.97)),
+        )
+        max_resolution_spread_days = max(
+            0,
+            int(to_float(self.config.get("max_resolution_spread_days", 7), 7)),
+        )
+        min_required_total_yes = election_min_total_yes if is_election else min_total_yes
+
+        # Open-ended events (Nobel Prize, awards, "best X") where the outcome
+        # universe is inherently unbounded — anyone/anything could win.
+        # The listed outcomes can never be exhaustive.
+        if is_open_ended:
+            return None
+
+        # Hard reject when listed outcomes are likely non-exhaustive.
+        if total_yes < min_required_total_yes:
+            return None
+
+        # Reject when the ask-priced bundle gross margin is too thin.
+        # Long arb gross = $1 - total_yes_ask (because exactly one YES wins
+        # for $1.00). If that gross is less than the configured floor, the
+        # bundle isn't worth firing on.
+        min_long_margin = float(
+            to_float(self.config.get("long_min_ask_priced_margin", 0.02), 0.02)
+        )
+        gross_at_ask = 1.0 - total_yes_ask
+        if gross_at_ask < min_long_margin:
+            return None
+
+        # --- Multi-winner / threshold detection ---
+        # Multi-winner events (relegation, advancement) break the "exactly 1 wins" assumption.
+        # Threshold markets (above $X) are hierarchical, not mutually exclusive.
+        questions = [m.question for m in active_markets]
+        if self._is_multi_winner_event(event.title, questions):
+            return None
+        if self._is_threshold_market(questions):
+            return None
+
+        # --- Resolution date mismatch detection ---
+        # All outcomes in a NegRisk bundle must resolve at the same time.
+        # If outcome A resolves June 30 but outcome B resolves Dec 31,
+        # there's a window where ALL outcomes can resolve NO (e.g., event
+        # happens between July-December). This makes the "arbitrage" a trap.
+        end_dates = [make_aware(m.end_date) for m in active_markets if m.end_date]
+        if len(end_dates) >= 2:
+            earliest = min(end_dates)
+            latest = max(end_dates)
+            spread_days = (latest - earliest).days
+            if spread_days > max_resolution_spread_days:
+                return None
+
+        opp = self.create_opportunity(
+            title=f"NegRisk: {event.title[:50]}...",
+            description=f"Buy YES on all {len(active_markets)} outcomes for ${total_yes:.3f}, one wins = $1",
+            total_cost=total_yes,
+            markets=active_markets,
+            positions=positions,
+            event=event,
+        )
+
+        if opp:
+            opp.risk_factors.insert(0, f"Exhaustiveness verified: {exhaustiveness_reason.replace('_', ' ')}")
+            if total_yes < warn_total_yes:
+                opp.risk_factors.insert(
+                    0,
+                    f"Total YES ({total_yes:.1%}) below {warn_total_yes:.1%} — possible missing outcomes",
+                )
+        return self._finalize_opportunity(opp)
+
+    def _detect_negrisk_short(
+        self, event: Event, active_markets: list[Market], prices: dict[str, dict]
+    ) -> Opportunity | None:
+        """Detect short-side NegRisk arbitrage.
+
+        When total YES > $1.00, buying NO on all outcomes can be profitable.
+        In a NegRisk event with N outcomes where exactly 1 wins:
+        - Buy NO on all N outcomes
+        - Exactly N-1 outcomes resolve to NO, each paying $1
+        - Total payout = N - 1
+        - Profit = (N - 1) - total_ask_no_cost
+
+        Critical detail: a short bundle has to be filled by **crossing the
+        NO ask** on every leg. Detecting at the mid price systematically
+        underestimates fill cost — a 1-2¢ ask premium per leg easily wipes
+        out a $0.30 gross profit on a 3-leg bundle. Use mid only as a
+        last-resort when no ask is available, and require the ask-priced
+        bundle to still clear after fees.
+
+        Routes through create_opportunity so that shared hard filters
+        (min liquidity, min position size, min absolute profit, max plausible
+        ROI, max resolution window, fee-model adjustments) are applied.
+        """
+        n = len(active_markets)
+        if n < 3:
+            return None
+
+        verified_exhaustive, exhaustiveness_reason = self._verify_exhaustive_event_family(event, active_markets)
+        if not verified_exhaustive:
+            return None
+
+        # Multi-winner and threshold markets are ESPECIALLY dangerous for short:
+        # the payout math assumes exactly 1 winner, but these can have 0 or 2+ winners.
+        questions = [m.question for m in active_markets]
+        if self._is_multi_winner_event(event.title, questions):
+            return None
+        if self._is_threshold_market(questions):
+            return None
+
+        # Per-leg minimum liquidity. Bundle-level min(...) is enforced by
+        # create_opportunity, but in a short we need each leg individually
+        # tradeable at meaningful size — a single thin leg can't be filled
+        # at the quoted ask without large slippage.
+        min_per_leg_liquidity = float(
+            to_float(self.config.get("short_min_per_leg_liquidity", 750.0), 750.0)
+        )
+        for market in active_markets:
+            if float(getattr(market, "liquidity", 0.0) or 0.0) < min_per_leg_liquidity:
+                return None
+
+        total_no_ask = 0.0
+        total_no_mid = 0.0
+        ask_used_count = 0
+        positions = []
+
+        for market in active_markets:
+            fill_price, no_mid, ask_known = StrategySDK.get_ask_priced_fill(
+                market, prices, side="NO",
+            )
+            total_no_ask += fill_price
+            total_no_mid += no_mid
+            ask_used_count += int(ask_known)
+            positions.append(self._build_position(market, outcome="NO", price=fill_price, token_index=1))
+
+        expected_payout = float(n - 1)  # N-1 NOs win
+
+        gross_at_ask = expected_payout - total_no_ask
+        gross_at_mid = expected_payout - total_no_mid
+
+        # Reject when the ask-priced bundle would not clear the configured
+        # min absolute profit margin. The mid-priced version may have looked
+        # great, but if crossing the spread eats the edge we must not fire.
+        min_short_margin = float(
+            to_float(self.config.get("short_min_ask_priced_margin", 0.04), 0.04)
+        )
+        if gross_at_ask <= 0 or gross_at_ask < min_short_margin:
+            return None
+
+        opp = self.create_opportunity(
+            title=f"NegRisk Short: {event.title[:50]}...",
+            description=(
+                f"Buy NO on all {n} outcomes for ${total_no_ask:.3f} (ask), "
+                f"{n - 1} win = ${expected_payout:.0f} payout. "
+                f"Spread cushion: mid=${total_no_mid:.3f} → ask=${total_no_ask:.3f}."
+            ),
+            total_cost=total_no_ask,
+            markets=active_markets,
+            positions=positions,
+            event=event,
+            expected_payout=expected_payout,
+        )
+
+        if opp:
+            opp.risk_factors.insert(0, f"Short NegRisk: buying NO on all {n} outcomes")
+            opp.risk_factors.insert(1, f"Exhaustiveness verified: {exhaustiveness_reason.replace('_', ' ')}")
+            if ask_used_count < n:
+                opp.risk_factors.append(
+                    f"Ask price unavailable on {n - ask_used_count}/{n} legs — used mid+0.005 cushion"
+                )
+            opp.risk_factors.append(
+                f"Ask-priced gross ${gross_at_ask:.3f} vs mid-priced ${gross_at_mid:.3f}"
+            )
+
+        return self._finalize_opportunity(opp)
+
+    def _is_election_market(self, title: str) -> bool:
+        """Check if an event title suggests an election or primary."""
+        title_lower = title.lower()
+        election_keywords = [
+            "election",
+            "primary",
+            "governor",
+            "house",
+            "senate",
+            "congress",
+            "mayor",
+            "special election",
+            "presidential",
+            "nominee",
+            "caucus",
+            "runoff",
+        ]
+        return any(kw in title_lower for kw in election_keywords)
+
+    def _is_open_ended_event(self, title: str) -> bool:
+        """Check if an event has an inherently unbounded outcome universe.
+
+        These events can NEVER have an exhaustive listed outcome set because
+        the set of possible winners/results is effectively infinite.
+
+        Examples:
+        - "Nobel Peace Prize Winner 2026" (anyone in the world could win)
+        - "Which company has the best AI model" (subjective + any company)
+        - "Oscar Best Picture Winner" (nominees change)
+        - "Who will acquire Warner Bros" (any company could acquire)
+        """
+        title_lower = title.lower()
+        open_ended_keywords = [
+            "nobel",
+            "prize winner",
+            "award winner",
+            "best ai",
+            "best model",
+            "oscar",
+            "grammy",
+            "emmy",
+            "ballon d'or",
+            "mvp",
+            "player of the year",
+            "time person of the year",
+            "pulitzer",
+            # M&A / acquisition markets — the universe of potential acquirers
+            # is inherently unbounded (any company could acquire the target).
+            "acquisition",
+            "acquire",
+            "merger",
+            "takeover",
+            "buyout",
+            "who will buy",
+            "who will purchase",
+            "who will close",
+            # "Next CEO/coach/leader" type markets
+            "next ceo",
+            "next coach",
+            "next head coach",
+            "next manager",
+            "next leader",
+            "who will replace",
+        ]
+        return any(kw in title_lower for kw in open_ended_keywords)
+
+    def _is_independent_betting_market(self, question: str) -> bool:
+        """
+        Check if a market is an independent betting type (spread, over/under, etc.)
+        These are NOT mutually exclusive with other markets in the same event.
+        """
+        question_lower = question.lower()
+
+        # Independent bet type keywords - these can all be true simultaneously
+        independent_keywords = [
+            "spread",
+            "handicap",
+            "-1.5",
+            "+1.5",
+            "-0.5",
+            "+0.5",
+            "-2.5",
+            "+2.5",
+            "over/under",
+            "o/u",
+            "over ",
+            "under ",
+            "total goals",
+            "total points",
+            "both teams",
+            "btts",
+            "both to score",
+            "first half",
+            "second half",
+            "1st half",
+            "2nd half",
+            "corners",
+            "cards",
+            "yellow",
+            "red card",
+            "clean sheet",
+            "to nil",
+            "anytime scorer",
+            "first scorer",
+            "last scorer",
+            "odd/even",
+            "odd goals",
+            "even goals",
+            # Independent action keywords - multiple entities can do these
+            "will join",
+            "will pass",
+            "will be passed",
+            "will launch",
+            "will be approved",
+        ]
+
+        return any(kw in question_lower for kw in independent_keywords)
+
+    def _is_date_based_market(self, question: str) -> bool:
+        """
+        Check if a market is date-based (cumulative "by X date" style).
+        These are NOT mutually exclusive and should be excluded from arbitrage.
+        """
+        question_lower = question.lower()
+
+        # Date-based keywords that indicate cumulative markets
+        date_keywords = [
+            "by january",
+            "by february",
+            "by march",
+            "by april",
+            "by may",
+            "by june",
+            "by july",
+            "by august",
+            "by september",
+            "by october",
+            "by november",
+            "by december",
+            "by jan",
+            "by feb",
+            "by mar",
+            "by apr",
+            "by jun",
+            "by jul",
+            "by aug",
+            "by sep",
+            "by oct",
+            "by nov",
+            "by dec",
+            "before january",
+            "before february",
+            "before march",
+            "before april",
+            "by q1",
+            "by q2",
+            "by q3",
+            "by q4",
+            "by end of",
+            "by the end of",
+            "by 2025",
+            "by 2026",
+            "by 2027",
+        ]
+
+        return any(kw in question_lower for kw in date_keywords)
+
+    def _is_multi_winner_event(self, event_title: str, questions: list[str]) -> bool:
+        """Check if an event allows MORE THAN ONE outcome to win simultaneously.
+
+        NegRisk short assumes exactly N-1 outcomes win. Multi-winner events
+        (relegation, advancement, multiple selections) break this assumption
+        and cause guaranteed losses.
+        """
+        title_lower = event_title.lower()
+
+        # Title-level patterns (event-wide signals)
+        multi_winner_title_keywords = [
+            "relegate",
+            "relegated",
+            "relegation",
+            "advance to runoff",
+            "qualify",
+            "top 2",
+            "top 3",
+            "top 4",
+            "top 5",
+            "which countries will",
+            "which cities will",
+            "which teams will",
+            "which candidates will advance",
+            "will join",
+            "countries will join",
+        ]
+
+        if any(kw in title_lower for kw in multi_winner_title_keywords):
+            return True
+
+        # Question-level patterns (individual market signals)
+        multi_winner_question_keywords = [
+            "relegate",
+            "relegated",
+            "relegation",
+            "advance to runoff",
+            "advance",
+            "qualify",
+            "top 2",
+            "top 3",
+            "top 4",
+            "top 5",
+            "will join",
+            "countries will join",
+        ]
+
+        for question in questions:
+            question_lower = question.lower()
+            if any(kw in question_lower for kw in multi_winner_question_keywords):
+                return True
+
+        return False
+
+    def _contains_catch_all_outcome(self, questions: list[str]) -> bool:
+        catch_all_keywords = (
+            "another party",
+            "another club",
+            "another team",
+            "another candidate",
+            "another driver",
+            "another fighter",
+            "another player",
+            "another school",
+            "another country",
+            "another city",
+            "another outcome",
+            "other candidate",
+            "other team",
+            "other party",
+            "other club",
+        )
+        return any(any(keyword in question.lower() for keyword in catch_all_keywords) for question in questions)
+
+    def _contains_placeholder_outcome(self, questions: list[str]) -> bool:
+        for question in questions:
+            text = str(question or "").strip()
+            if not text:
+                continue
+            if _GENERIC_PLACEHOLDER_RE.search(text):
+                return True
+            if _SINGLE_LETTER_WINNER_RE.search(text):
+                return True
+        return False
+
+    def _is_three_way_sports_match_family(self, event: Event, markets: list[Market]) -> bool:
+        if len(markets) != 3:
+            return False
+        questions = [str(m.question or "").strip().lower() for m in markets]
+        sports_markets = sum(1 for market in markets if str(market.sports_market_type or "").strip())
+        draw_count = sum(1 for question in questions if "draw" in question)
+        win_count = sum(1 for question in questions if " win " in f" {question} ")
+        sports_category = "sports" in str(event.category or "").strip().lower()
+        return (sports_markets > 0 or sports_category) and draw_count == 1 and win_count >= 2
+
+    def _is_monotone_threshold_family(self, event_title: str, questions: list[str]) -> bool:
+        threshold_keywords = (
+            "above $",
+            "above ",
+            "below $",
+            "below ",
+            "over $",
+            "under $",
+            "more than",
+            "less than",
+            "greater than",
+            "fewer than",
+            "at least",
+            "at most",
+            "reach $",
+            "reach ",
+            "hit $",
+            "hit ",
+            "dip to",
+            "drop to",
+            "fall to",
+            "climb to",
+            "rise to",
+            "touch $",
+            "surpass",
+            "exceed",
+            ">$",
+            "<$",
+            "> $",
+            "< $",
+        )
+        title_lower = event_title.lower()
+        if any(keyword in title_lower for keyword in ("price", "market cap", "fdv", "debt", "valuation")):
+            if len(questions) >= 2:
+                return True
+        threshold_count = 0
+        for question in questions:
+            question_lower = question.lower()
+            if any(keyword in question_lower for keyword in threshold_keywords):
+                threshold_count += 1
+        return len(questions) > 0 and threshold_count >= max(2, (len(questions) + 1) // 2)
+
+    def _verify_exhaustive_event_family(self, event: Event, markets: list[Market]) -> tuple[bool, str]:
+        questions = [str(m.question or "").strip() for m in markets if str(m.question or "").strip()]
+        if len(questions) != len(markets):
+            return False, "missing_question_text"
+        if len(markets) < 3:
+            return False, "requires_at_least_three_markets"
+        if self._is_open_ended_event(event.title):
+            return False, "open_ended_event"
+        if self._is_election_market(event.title):
+            return False, "election_field_unverifiable"
+        if self._is_multi_winner_event(event.title, questions):
+            return False, "multi_winner_family"
+        if self._is_threshold_market(questions) or self._is_monotone_threshold_family(event.title, questions):
+            return False, "threshold_family"
+        if self._contains_catch_all_outcome(questions):
+            return False, "catch_all_outcome_present"
+        if self._contains_placeholder_outcome(questions):
+            return False, "placeholder_outcome_present"
+        if self._is_three_way_sports_match_family(event, markets):
+            return True, "sports_three_way_complete"
+        return False, "unverified_exhaustiveness"
+
+    def _is_threshold_market(self, questions: list[str]) -> bool:
+        """Check if questions form a hierarchical threshold/cumulative set.
+
+        Markets like "FDV above $500M", "price above $100K" are NOT mutually
+        exclusive -- if above $1B then also above $500M. Buying NO on all
+        thresholds = guaranteed loss if the value lands above the lowest.
+        """
+        threshold_keywords = [
+            "above $",
+            "above ",
+            "below $",
+            "below ",
+            "over $",
+            "under $",
+            "more than",
+            "less than",
+            "greater than",
+            "fewer than",
+            "at least",
+            "at most",
+            ">$",
+            "<$",
+            "> $",
+            "< $",
+            "reach $",
+            "hit $",
+            "dip to",
+            "drop to",
+            "fall to",
+        ]
+
+        threshold_count = 0
+        for question in questions:
+            question_lower = question.lower()
+            if any(kw in question_lower for kw in threshold_keywords):
+                threshold_count += 1
+
+        # If >=50% of questions match threshold patterns, this is a threshold market
+        return len(questions) > 0 and threshold_count >= len(questions) * 0.5
+
+    def _detect_multi_outcome(self, event: Event, prices: dict[str, dict]) -> Opportunity | None:
+        """
+        Detect multi-outcome arbitrage: exhaustive outcomes where one must win
+        Buy YES on all outcomes when total < $1
+
+        IMPORTANT: Only works for mutually exclusive outcomes like:
+        - "Who wins the election?" with multiple candidates
+        - "Which team wins?" with Team A / Team B / Draw
+
+        Does NOT work for:
+        - Independent betting markets (spread, over/under, BTTS - can all be true!)
+        - Date-based markets ("by March", "by June" - cumulative, not exclusive!)
+        """
+        # Skip if already handled as NegRisk
+        if event.neg_risk:
+            return None
+
+        active_markets = [m for m in event.markets if m.active and not m.closed]
+        if len(active_markets) < 3:  # Need at least 3 outcomes
+            return None
+
+        # CRITICAL: Filter out independent betting markets
+        # These are NOT mutually exclusive - spread, over/under, BTTS can all be true!
+        exclusive_markets = [m for m in active_markets if not self._is_independent_betting_market(m.question)]
+
+        # CRITICAL: Filter out date-based markets
+        # "By X date" markets are CUMULATIVE, not mutually exclusive!
+        exclusive_markets = [m for m in exclusive_markets if not self._is_date_based_market(m.question)]
+
+        # If most markets are independent bet types or date-based, skip this event
+        if len(exclusive_markets) < 3:
+            return None
+
+        # If there's a mix, the event likely has multiple bet types - skip
+        if len(exclusive_markets) != len(active_markets):
+            return None
+
+        # Per-leg liquidity floor.
+        min_per_leg = float(to_float(self.config.get("long_min_per_leg_liquidity", 750.0), 750.0))
+        for market in exclusive_markets:
+            if float(getattr(market, "liquidity", 0.0) or 0.0) < min_per_leg:
+                return None
+
+        # Calculate total YES cost using ask prices (same fix as the
+        # NegRisk-flagged branch). Mid pricing here was the latent
+        # bid/ask trap.
+        total_yes_ask = 0.0
+        total_yes_mid = 0.0
+        positions = []
+
+        for market in exclusive_markets:
+            fill_price, yes_mid, _ = StrategySDK.get_ask_priced_fill(
+                market, prices, side="YES",
+            )
+            total_yes_ask += fill_price
+            total_yes_mid += yes_mid
+            positions.append(self._build_position(market, outcome="YES", price=fill_price, token_index=0))
+
+        total_yes = total_yes_ask
+        if total_yes >= 1.0:
+            # Check for SHORT arbitrage (total YES > $1 means NOs are cheap)
+            return self._detect_multi_outcome_short(event, exclusive_markets, prices)
+
+        # Reject thin ask-priced margins — same gate as the negrisk
+        # long branch.
+        min_long_margin = float(to_float(self.config.get("long_min_ask_priced_margin", 0.02), 0.02))
+        if (1.0 - total_yes) < min_long_margin:
+            return None
+
+        # Very low totals usually indicate missing outcomes in non-NegRisk events.
+        if total_yes < 0.70:
+            return None
+
+        # Structural non-exhaustiveness checks (same as NegRisk)
+        is_election = self._is_election_market(event.title)
+        if self._is_open_ended_event(event.title):
+            return None
+
+        # Multi-winner / threshold detection (same as NegRisk)
+        questions = [m.question for m in exclusive_markets]
+        if self._is_multi_winner_event(event.title, questions):
+            return None
+        if self._is_threshold_market(questions) or self._is_monotone_threshold_family(event.title, questions):
+            return None
+        if self._contains_catch_all_outcome(questions):
+            return None
+        if self._contains_placeholder_outcome(questions):
+            return None
+        if is_election:
+            return None
+        if not self._is_three_way_sports_match_family(event, exclusive_markets):
+            return None
+
+        # Resolution date mismatch check (same as NegRisk)
+        end_dates = [make_aware(m.end_date) for m in exclusive_markets if m.end_date]
+        if len(end_dates) >= 2:
+            earliest = min(end_dates)
+            latest = max(end_dates)
+            spread_days = (latest - earliest).days
+            max_resolution_spread_days = max(
+                0,
+                int(to_float(self.config.get("max_resolution_spread_days", 7), 7)),
+            )
+            if spread_days > max_resolution_spread_days:
+                return None
+
+        opp = self.create_opportunity(
+            title=f"Multi-Outcome: {event.title[:40]}...",
+            description=f"Buy YES on all {len(exclusive_markets)} outcomes for ${total_yes:.3f}, one wins = $1",
+            total_cost=total_yes,
+            markets=exclusive_markets,
+            positions=positions,
+            event=event,
+        )
+
+        if opp:
+            opp.risk_factors.insert(0, "Exhaustiveness verified: sports three way complete")
+            if total_yes < 0.85:
+                opp.risk_factors.insert(
+                    0,
+                    f"LOW TOTAL ({total_yes:.1%}) suggests possible missing outcomes",
+                )
+
+        return self._finalize_opportunity(opp)
+
+    def _detect_multi_outcome_short(
+        self, event: Event, exclusive_markets: list[Market], prices: dict[str, dict]
+    ) -> Opportunity | None:
+        """Detect short-side multi-outcome arbitrage.
+
+        When total YES > $1.00, buying NO on all outcomes can be profitable.
+        In a multi-outcome event with N outcomes where exactly 1 wins:
+        - Buy NO on all N outcomes
+        - Exactly N-1 outcomes resolve to NO, each paying $1
+        - Total payout = N - 1
+        - Profit = (N - 1) - total_no_cost
+
+        Routes through create_opportunity so that shared hard filters
+        (min liquidity, min position size, min absolute profit, max plausible
+        ROI, max resolution window, fee-model adjustments) are applied.
+        """
+        n = len(exclusive_markets)
+        if n < 3:
+            return None
+
+        # Multi-winner and threshold markets are ESPECIALLY dangerous for short:
+        # the payout math assumes exactly 1 winner, but these can have 0 or 2+ winners.
+        questions = [m.question for m in exclusive_markets]
+        if self._is_multi_winner_event(event.title, questions):
+            return None
+        if self._is_threshold_market(questions) or self._is_monotone_threshold_family(event.title, questions):
+            return None
+        if self._contains_catch_all_outcome(questions):
+            return None
+        if self._contains_placeholder_outcome(questions):
+            return None
+        if self._is_election_market(event.title):
+            return None
+        if not self._is_three_way_sports_match_family(event, exclusive_markets):
+            return None
+
+        # Per-leg liquidity floor (same as long branch).
+        min_per_leg = float(to_float(self.config.get("short_min_per_leg_liquidity", 750.0), 750.0))
+        for market in exclusive_markets:
+            if float(getattr(market, "liquidity", 0.0) or 0.0) < min_per_leg:
+                return None
+
+        total_no_ask = 0.0
+        total_no_mid = 0.0
+        positions = []
+
+        for market in exclusive_markets:
+            fill_price, no_mid, _ = StrategySDK.get_ask_priced_fill(
+                market, prices, side="NO",
+            )
+            total_no_ask += fill_price
+            total_no_mid += no_mid
+            positions.append(self._build_position(market, outcome="NO", price=fill_price, token_index=1))
+
+        expected_payout = float(n - 1)  # N-1 NOs win
+        gross_at_ask = expected_payout - total_no_ask
+
+        # Reject thin ask-priced margins — same gate as the negrisk
+        # short branch.
+        min_short_margin = float(to_float(self.config.get("short_min_ask_priced_margin", 0.04), 0.04))
+        if gross_at_ask < min_short_margin:
+            return None
+
+        opp = self.create_opportunity(
+            title=f"Multi-Outcome Short: {event.title[:40]}...",
+            description=(
+                f"Buy NO on all {n} outcomes for ${total_no_ask:.3f} (ask), "
+                f"{n - 1} win = ${expected_payout:.0f} payout. "
+                f"Spread cushion: mid=${total_no_mid:.3f} → ask=${total_no_ask:.3f}."
+            ),
+            total_cost=total_no_ask,
+            markets=exclusive_markets,
+            positions=positions,
+            event=event,
+            expected_payout=expected_payout,
+        )
+
+        if opp:
+            opp.risk_factors.insert(0, f"Short Multi-Outcome: buying NO on all {n} outcomes")
+            opp.risk_factors.insert(1, "Exhaustiveness verified: sports three way complete")
+            opp.risk_factors.append(
+                f"Ask-priced gross ${gross_at_ask:.3f} vs mid-priced ${expected_payout - total_no_mid:.3f}"
+            )
+
+        return self._finalize_opportunity(opp)
+
+    SOURCES = {"scanner"}
+    STRUCTURAL_TYPES = {"within_market", "cross_market", "settlement_lag"}
+
+    def custom_checks(self, signal: Any, context: dict, params: dict, payload: dict) -> list[DecisionCheck]:
+        source = str(getattr(signal, "source", "") or "").strip().lower()
+        source_ok = source in self.SOURCES
+        mispricing_type = str(payload.get("mispricing_type", "") or "").strip().lower()
+        guaranteed = bool(payload.get("is_guaranteed", False))
+        structural_ok = guaranteed or mispricing_type in self.STRUCTURAL_TYPES
+        payload["_structural_ok"] = structural_ok
+
+        min_markets = max(1, int(to_float(params.get("min_markets", 3), 3)))
+        market_count = len(payload.get("markets") or [])
+
+        return [
+            DecisionCheck("source", "Scanner source", source_ok, detail="Requires source=scanner."),
+            DecisionCheck(
+                "structural",
+                "Structural opportunity type",
+                structural_ok,
+                detail="is_guaranteed or structural mispricing type",
+            ),
+            DecisionCheck(
+                "markets",
+                "Multi-leg structure",
+                market_count >= min_markets,
+                score=float(market_count),
+                detail=f"min={min_markets}",
+            ),
+        ]
+
+    def compute_score(
+        self, edge: float, confidence: float, risk_score: float, market_count: int, payload: dict
+    ) -> float:
+        structural_ok = bool(payload.get("_structural_ok", False))
+        return (
+            (edge * 0.65)
+            + (confidence * 35.0)
+            - (risk_score * 10.0)
+            + (min(6, market_count) * 1.2)
+            + (4.0 if structural_ok else 0.0)
+        )
+
+    def compute_size(
+        self, base_size: float, max_size: float, edge: float, confidence: float, risk_score: float, market_count: int
+    ) -> float:
+        market_scale = 1.0 + min(0.45, market_count * 0.06)
+        size = base_size * (1.0 + (edge / 120.0)) * (0.8 + confidence) * market_scale
+        return max(1.0, min(max_size, size))
+
+    def should_exit(self, position: Any, market_state: dict) -> ExitDecision:
+        """Guaranteed-spread: hold to resolution for maximum value."""
+        if market_state.get("is_resolved"):
+            return self.default_exit_check(position, market_state)
+        config = getattr(position, "config", None) or {}
+        if not config.get("resolve_only", True):
+            return self.default_exit_check(position, market_state)
+        return ExitDecision("hold", "Guaranteed spread — holding to resolution")
+
+    # ------------------------------------------------------------------
+    # Platform gate hooks
+    # ------------------------------------------------------------------
+
+    def on_blocked(self, signal, reason: str, context: dict) -> None:
+        logger.info("%s: signal blocked — %s (market=%s)", self.name, reason, getattr(signal, "market_id", "?"))
+
+    def on_size_capped(self, original_size: float, capped_size: float, reason: str) -> None:
+        logger.info("%s: size capped $%.0f → $%.0f — %s", self.name, original_size, capped_size, reason)

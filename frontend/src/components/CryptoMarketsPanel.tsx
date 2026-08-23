@@ -1,0 +1,1333 @@
+import { useState, useEffect, useMemo, useRef } from 'react'
+import { createPortal } from 'react-dom'
+import { AnimatePresence, motion } from 'framer-motion'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
+import { useAtomValue } from 'jotai'
+import { useTranslation } from 'react-i18next'
+import {
+  TrendingUp,
+  TrendingDown,
+  RefreshCw,
+  ExternalLink,
+  ChevronRight,
+  Settings,
+  Maximize2,
+  Minimize2,
+} from 'lucide-react'
+import { cn } from '../lib/utils'
+import { buildPolymarketMarketUrl } from '../lib/marketUrls'
+import { getCryptoMarkets, CryptoMarket } from '../services/api'
+import { useWebSocket } from '../hooks/useWebSocket'
+import { useBinanceDirectFeed } from '../hooks/useBinanceDirectFeed'
+import { Liveline } from 'liveline'
+import type { LivelinePoint, CandlePoint } from 'liveline'
+import { Card } from './ui/card'
+import { Badge } from './ui/badge'
+import { Button } from './ui/button'
+import OpportunityEmptyState from './OpportunityEmptyState'
+import { themeAtom } from '../store/atoms'
+import { CryptoCycleChart } from './CryptoCycleChart'
+
+// ─── Constants ────────────────────────────────────────────
+
+const WS_MARKETS_STALE_MS = 5000
+
+const ASSET_BAR: Record<string, string> = {
+  BTC: 'bg-orange-400',
+  ETH: 'bg-blue-400',
+  SOL: 'bg-purple-400',
+  XRP: 'bg-cyan-400',
+}
+
+const ASSET_ICONS: Record<string, string> = {
+  BTC: 'https://polymarket-upload.s3.us-east-2.amazonaws.com/BTC+fullsize.png',
+  ETH: 'https://polymarket-upload.s3.us-east-2.amazonaws.com/ETH+fullsize.jpg',
+  SOL: 'https://polymarket-upload.s3.us-east-2.amazonaws.com/SOL+fullsize.png',
+  XRP: 'https://polymarket-upload.s3.us-east-2.amazonaws.com/XRP-logo.png',
+}
+
+// ─── Helpers ─────────────────────────────────────────────
+
+function formatUsd(n: number): string {
+  if (n >= 1_000_000) return `$${(n / 1_000_000).toFixed(1)}M`
+  if (n >= 1_000) return `$${(n / 1_000).toFixed(1)}K`
+  if (n >= 1) return `$${n.toFixed(2)}`
+  return `$${n.toFixed(4)}`
+}
+
+function formatPrice(n: number | null | undefined, decimals = 2): string {
+  if (n === null || n === undefined) return '--'
+  return `$${n.toLocaleString(undefined, { minimumFractionDigits: decimals, maximumFractionDigits: decimals })}`
+}
+
+function toFiniteNumber(value: unknown): number | null {
+  const n = Number(value)
+  return Number.isFinite(n) ? n : null
+}
+
+function toUnixSeconds(value: number): number {
+  if (value > 1_000_000_000_000) return Math.floor(value / 1000)
+  if (value > 10_000_000_000) return Math.floor(value / 1000)
+  return Math.floor(value)
+}
+
+function livelineSeriesEqual(previous: LivelinePoint[], next: LivelinePoint[]): boolean {
+  if (previous.length !== next.length) return false
+  for (let i = 0; i < previous.length; i += 1) {
+    const prev = previous[i]
+    const curr = next[i]
+    if (prev.time !== curr.time) return false
+    if (Math.abs(prev.value - curr.value) > 1e-9) return false
+  }
+  return true
+}
+
+function aggregateCandles(points: LivelinePoint[], intervalSecs: number): CandlePoint[] {
+  if (points.length === 0) return []
+  const candles: CandlePoint[] = []
+  let bucketStart = Math.floor(points[0].time / intervalSecs) * intervalSecs
+  let open = points[0].value
+  let high = open
+  let low = open
+  let close = open
+
+  for (const pt of points) {
+    const bucket = Math.floor(pt.time / intervalSecs) * intervalSecs
+    if (bucket !== bucketStart) {
+      candles.push({ time: bucketStart, open, high, low, close })
+      bucketStart = bucket
+      open = pt.value
+      high = pt.value
+      low = pt.value
+    }
+    if (pt.value > high) high = pt.value
+    if (pt.value < low) low = pt.value
+    close = pt.value
+  }
+  candles.push({ time: bucketStart, open, high, low, close })
+  return candles
+}
+
+function candleInterval(timeframe: string): number {
+  switch (normalizeTimeframe(timeframe)) {
+    case '5m': return 30
+    case '15m': return 60
+    case '1h': return 300
+    case '4h': return 900
+    default: return 60
+  }
+}
+
+function clampProbability(value: number): number {
+  return Math.min(1, Math.max(0, value))
+}
+
+function polymarketTakerFeePerShare(price: number): number {
+  const p = clampProbability(price)
+  return p * 0.25 * (p * (1 - p)) ** 2
+}
+
+function polymarketTakerFeePct(price: number): number {
+  const p = clampProbability(price)
+  if (p <= 0) return 0
+  return polymarketTakerFeePerShare(p) / p
+}
+
+function normalizeTimeframe(value: string | null | undefined): string {
+  const raw = String(value || '').toLowerCase()
+  if (!raw) return ''
+  if (raw.includes('4h') || raw.includes('240') || raw.includes('4hr')) return '4h'
+  if (raw.includes('1h') || raw.includes('60')) return '1h'
+  if (raw.includes('15m') || raw.includes('15min') || raw.includes('15-min') || raw.includes('15 minute')) return '15m'
+  if (raw.includes('5m') || raw.includes('5min') || raw.includes('5-min') || raw.includes('5 minute') || (raw.startsWith('5') && !raw.includes('15'))) return '5m'
+  return raw
+}
+
+type TimeframeFilter = 'all' | '15m' | '5m' | '1h' | '4h'
+
+function extractCryptoMarketsFromInit(payload: any): CryptoMarket[] | null {
+  const workers = payload?.workers_status
+  if (!Array.isArray(workers)) return null
+  const cryptoWorker = workers.find((worker) => worker?.worker_name === 'crypto')
+  const markets = cryptoWorker?.stats?.markets
+  return Array.isArray(markets) ? markets as CryptoMarket[] : null
+}
+
+function marketIdentity(market: Partial<CryptoMarket>): string {
+  const id = String(market.id || '').trim()
+  if (id) return `id:${id}`
+  const conditionId = String(market.condition_id || '').trim()
+  if (conditionId) return `condition:${conditionId}`
+  const slug = String(market.slug || '').trim()
+  if (slug) return `slug:${slug}`
+  const asset = String(market.asset || '').trim().toUpperCase()
+  const timeframe = normalizeTimeframe(market.timeframe)
+  const endTime = String(market.end_time || '').trim()
+  return `fallback:${asset}:${timeframe}:${endTime}`
+}
+
+function dedupeMarkets(markets: CryptoMarket[]): CryptoMarket[] {
+  if (markets.length <= 1) return markets
+  const byKey = new Map<string, CryptoMarket>()
+  for (const market of markets) {
+    byKey.set(marketIdentity(market), market)
+  }
+  return Array.from(byKey.values())
+}
+
+function mergeMarkets(base: CryptoMarket[], updates: CryptoMarket[], appendUnknown = true): CryptoMarket[] {
+  if (updates.length === 0) return base
+  if (base.length === 0) return dedupeMarkets(updates)
+
+  const merged = [...base]
+  const indexByKey = new Map<string, number>()
+  for (let i = 0; i < merged.length; i += 1) {
+    indexByKey.set(marketIdentity(merged[i]), i)
+  }
+
+  for (const market of updates) {
+    const key = marketIdentity(market)
+    const index = indexByKey.get(key)
+    if (index === undefined) {
+      if (!appendUnknown) continue
+      indexByKey.set(key, merged.length)
+      merged.push(market)
+      continue
+    }
+    merged[index] = {
+      ...merged[index],
+      ...market,
+    }
+  }
+
+  return merged
+}
+
+function marketTakerFeePct(market: CryptoMarket): number | null {
+  if (!market.fees_enabled) return 0
+
+  const priceSamples = [toFiniteNumber(market.up_price), toFiniteNumber(market.down_price)]
+    .filter((v): v is number => v !== null)
+    .map((price) => polymarketTakerFeePct(price))
+
+  if (priceSamples.length > 0) {
+    return priceSamples.reduce((acc, value) => acc + value, 0) / priceSamples.length
+  }
+
+  const combined = toFiniteNumber(market.combined)
+  if (combined !== null) {
+    return polymarketTakerFeePct(clampProbability(combined / 2))
+  }
+
+  return null
+}
+
+function resolveCryptoStrategySdk(market: CryptoMarket): string {
+  const explicit = String(
+    market.strategy_sdk
+    || market.strategy_key
+    || market.strategy
+    || '',
+  ).trim().toLowerCase()
+  if (explicit) return explicit
+  return 'btc_eth_maker_quote'
+}
+
+function normalizeOracleSourceKey(value: string | null | undefined): string {
+  const raw = String(value || '').trim().toLowerCase()
+  if (!raw) return 'unknown'
+  if (raw.includes('binance_direct')) return 'binance_direct'
+  if (raw.includes('chainlink')) return 'chainlink'
+  if (raw.includes('binance')) return 'binance'
+  return raw
+}
+
+function oracleSourceLabel(value: string | null | undefined, t: (k: string) => string): string {
+  const key = normalizeOracleSourceKey(value)
+  if (key === 'chainlink') return t('cryptoMarketsPanel.oracle.source.chainlink')
+  if (key === 'binance_direct') return t('cryptoMarketsPanel.oracle.source.binanceDirect')
+  if (key === 'binance') return t('cryptoMarketsPanel.oracle.source.binanceRelay')
+  return key.replace(/_/g, ' ')
+}
+
+function oracleSourceSortOrder(value: string): number {
+  if (value === 'chainlink') return 0
+  if (value === 'binance_direct') return 1
+  if (value === 'binance') return 2
+  return 3
+}
+
+// ─── Countdown Timer ─────────────────────────────────────
+
+function LiveCountdown({ endTime }: { endTime: string | null }) {
+  const { t } = useTranslation()
+  const [now, setNow] = useState(Date.now())
+
+  useEffect(() => {
+    const iv = setInterval(() => setNow(Date.now()), 1000)
+    return () => clearInterval(iv)
+  }, [])
+
+  if (!endTime) return <span className="text-muted-foreground">--:--</span>
+
+  const endMs = new Date(endTime).getTime()
+  const diff = Math.max(0, endMs - now)
+  const totalSec = Math.floor(diff / 1000)
+  const min = Math.floor(totalSec / 60)
+  const sec = totalSec % 60
+
+  const urgency = totalSec <= 0 ? 'text-red-500' : min < 2 ? 'text-red-400 animate-pulse' : min < 5 ? 'text-yellow-400' : 'text-green-400'
+
+  if (totalSec <= 0) return <span className="text-red-500 font-bold font-data">{t('cryptoMarketsPanel.countdown.resolving')}</span>
+
+  return (
+    <div className={cn("flex items-center gap-2 font-data", urgency)}>
+      <div className="flex items-baseline gap-0.5">
+        <span className="text-2xl font-bold tabular-nums">{String(min).padStart(2, '0')}</span>
+        <span className="text-xs text-muted-foreground">{t('cryptoMarketsPanel.countdown.mins')}</span>
+      </div>
+      <span className="text-lg font-bold text-muted-foreground/40">:</span>
+      <div className="flex items-baseline gap-0.5">
+        <span className="text-2xl font-bold tabular-nums">{String(sec).padStart(2, '0')}</span>
+        <span className="text-xs text-muted-foreground">{t('cryptoMarketsPanel.countdown.secs')}</span>
+      </div>
+    </div>
+  )
+}
+
+// ─── Oracle Price Display ─────────────────────────────────
+
+function OraclePriceDisplay({
+  price,
+  priceToBeat,
+  source,
+  sourceMap,
+  nowMs,
+}: {
+  price: number | null
+  priceToBeat: number | null
+  source: string | null
+  sourceMap?: Record<
+    string,
+    {
+      source: string
+      price: number | null
+      updated_at_ms: number | null
+      age_seconds: number | null
+    }
+  >
+  nowMs: number
+}) {
+  const { t } = useTranslation()
+  if (price === null) return null
+
+  const delta = (priceToBeat !== null && priceToBeat !== undefined) ? price - priceToBeat : null
+  const isUp = delta !== null && delta >= 0
+  const sourceLabel = source ? oracleSourceLabel(source, t) : t('cryptoMarketsPanel.oracle.source.chainlink')
+
+  const sourceRows = Object.values(sourceMap || {})
+    .filter((row) => row && typeof row.price === 'number')
+    .map((row) => ({
+      key: normalizeOracleSourceKey(row.source),
+      label: oracleSourceLabel(row.source, t),
+      price: row.price as number,
+      age: typeof row.updated_at_ms === 'number' && Number.isFinite(row.updated_at_ms)
+        ? Math.max(0, (nowMs - row.updated_at_ms) / 1000)
+        : row.age_seconds,
+    }))
+    .sort((a, b) => {
+      const orderDiff = oracleSourceSortOrder(a.key) - oracleSourceSortOrder(b.key)
+      if (orderDiff !== 0) return orderDiff
+      return a.label.localeCompare(b.label)
+    })
+
+  const chainlink = sourceRows.find((row) => row.key === 'chainlink')
+  const binanceDirect = sourceRows.find((row) => row.key === 'binance_direct')
+  const binanceRelay = sourceRows.find((row) => row.key === 'binance')
+  const sourceDeltas = chainlink
+    ? [
+      ...(binanceDirect ? [{ label: t('cryptoMarketsPanel.oracle.delta.binanceDirectVsChainlink'), value: binanceDirect.price - chainlink.price }] : []),
+      ...(binanceRelay ? [{ label: t('cryptoMarketsPanel.oracle.delta.binanceRelayVsChainlink'), value: binanceRelay.price - chainlink.price }] : []),
+    ]
+    : []
+
+  return (
+    <div className="space-y-1.5">
+      <div className="flex items-center justify-between">
+        <span className="text-[10px] text-muted-foreground uppercase tracking-wider">{t('cryptoMarketsPanel.oracle.oracleSource')}</span>
+        <span className="text-[10px] font-medium text-muted-foreground">{sourceLabel}</span>
+      </div>
+      {/* Price to beat */}
+      <div className="flex items-center justify-between">
+        <span className="text-[10px] text-muted-foreground uppercase tracking-wider">{t('cryptoMarketsPanel.oracle.priceToBeat')}</span>
+        {priceToBeat !== null && priceToBeat !== undefined ? (
+          <span className="text-sm font-bold font-data text-muted-foreground">{formatPrice(priceToBeat, 2)}</span>
+        ) : (
+          <span className="text-[10px] text-muted-foreground/50 italic">{t('cryptoMarketsPanel.oracle.waitingWindow')}</span>
+        )}
+      </div>
+      {/* Current oracle price */}
+      <div className="flex items-center justify-between">
+        <span className="text-[10px] text-muted-foreground uppercase tracking-wider">{t('cryptoMarketsPanel.oracle.currentPrice')}</span>
+        <div className="flex items-center gap-2">
+          <span className={cn("text-lg font-bold font-data tabular-nums", delta !== null ? (isUp ? 'text-green-400' : 'text-red-400') : 'text-foreground')}>
+            {formatPrice(price, 2)}
+          </span>
+          {delta !== null && (
+            <span className={cn("text-xs font-data font-bold", isUp ? 'text-green-400' : 'text-red-400')}>
+              {isUp ? <TrendingUp className="w-3.5 h-3.5 inline" /> : <TrendingDown className="w-3.5 h-3.5 inline" />}
+              {' '}{isUp ? '+' : ''}{formatPrice(delta, 2)}
+            </span>
+          )}
+        </div>
+      </div>
+
+      {sourceRows.length > 0 && (
+        <div className="space-y-1 pt-1 border-t border-border/30">
+          <div className="text-[10px] text-muted-foreground uppercase tracking-wider pt-1.5">{t('cryptoMarketsPanel.oracle.sourceView')}</div>
+          {sourceRows.map((row) => (
+            <div key={row.label} className="flex items-center justify-between gap-2">
+              <span className="text-[10px] text-muted-foreground/70 uppercase tracking-wide">{row.label}</span>
+              <span className="text-xs font-data text-muted-foreground">
+                {formatPrice(row.price, 2)}
+                {row.age !== null ? <span className="text-[10px] text-muted-foreground/60"> · {row.age < 10 ? row.age.toFixed(3) : row.age.toFixed(1)}s</span> : null}
+              </span>
+            </div>
+          ))}
+          {sourceDeltas.map((sourceDelta) => (
+            <div key={sourceDelta.label} className="flex items-center justify-between">
+              <span className="text-[10px] text-muted-foreground uppercase tracking-wide">{sourceDelta.label}</span>
+              <span className={cn("text-xs font-data", sourceDelta.value >= 0 ? 'text-green-400' : 'text-red-400')}>
+                {sourceDelta.value >= 0 ? '+' : ''}{formatPrice(sourceDelta.value, 2)}
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ─── Market Card ─────────────────────────────────────────
+
+export function CryptoMarketCard({
+  market,
+  themeMode,
+  nowMs,
+  isModalView = false,
+  onCloseModal,
+}: {
+  market: CryptoMarket
+  themeMode: 'dark' | 'light'
+  nowMs: number
+  isModalView?: boolean
+  onCloseModal?: () => void
+}) {
+  const { t } = useTranslation()
+  const lastLivelineDataRef = useRef<LivelinePoint[]>([])
+  const [modalOpen, setModalOpen] = useState(false)
+  const [chartMode, setChartMode] = useState<'line' | 'candle'>('line')
+  // Per-cycle synchronized view (oracle + UP/DOWN + tracked-wallet trade
+  // markers on one canvas). Off by default; enable via the toggle in the
+  // modal header. Frontend-only — backing data already exists.
+  const [cycleChartEnabled, setCycleChartEnabled] = useState(false)
+  const closeModal = () => setModalOpen(false)
+
+  useEffect(() => {
+    if (isModalView || !modalOpen) return undefined
+    const previousOverflow = document.body.style.overflow
+    document.body.style.overflow = 'hidden'
+    return () => {
+      document.body.style.overflow = previousOverflow
+    }
+  }, [isModalView, modalOpen])
+
+  useEffect(() => {
+    if (isModalView || !modalOpen) return undefined
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        closeModal()
+      }
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [isModalView, modalOpen])
+
+  const asset = market.asset
+  const upPrice = toFiniteNumber(market.up_price)
+  const downPrice = toFiniteNumber(market.down_price)
+  const combined = toFiniteNumber(market.combined) ?? (
+    upPrice !== null && downPrice !== null ? upPrice + downPrice : null
+  )
+  const spread = combined !== null ? 1 - combined : null
+  const takerFeePct = marketTakerFeePct(market)
+  const isDarkTheme = themeMode === 'dark'
+  const strategySdk = resolveCryptoStrategySdk(market)
+
+  const polyUrl = buildPolymarketMarketUrl({
+    eventSlug: market.event_slug,
+  })
+
+  const livelineData = useMemo<LivelinePoint[]>(() => {
+    const raw = Array.isArray(market.oracle_history) ? market.oracle_history : []
+    const rawPoints = raw
+      .map((point) => {
+        const value = toFiniteNumber((point as { p?: unknown; price?: unknown })?.p ?? (point as { price?: unknown })?.price)
+        const rawTime = toFiniteNumber((point as { t?: unknown; time?: unknown })?.t ?? (point as { time?: unknown })?.time)
+        if (value === null || rawTime === null) return null
+        return {
+          time: toUnixSeconds(rawTime),
+          value,
+        }
+      })
+      .filter((point): point is LivelinePoint => point !== null)
+      .sort((a, b) => a.time - b.time)
+
+    const normalized: LivelinePoint[] = []
+    for (const point of rawPoints) {
+      const previous = normalized[normalized.length - 1]
+      if (previous && previous.time === point.time) {
+        normalized[normalized.length - 1] = point
+      } else {
+        normalized.push(point)
+      }
+    }
+
+    const current = toFiniteNumber(market.oracle_price)
+    const currentRawTime = toFiniteNumber(market.oracle_updated_at_ms)
+    const currentTime = currentRawTime !== null ? toUnixSeconds(currentRawTime) : null
+
+    if (normalized.length === 0) {
+      if (current === null) {
+        const previous = lastLivelineDataRef.current
+        return previous.length === 0 ? previous : []
+      }
+      const fallbackTime = currentTime ?? Math.floor(Date.now() / 1000)
+      const seeded = [
+        { time: Math.max(0, fallbackTime - 1), value: current },
+        { time: Math.max(1, fallbackTime), value: current },
+      ]
+      const previous = lastLivelineDataRef.current
+      if (livelineSeriesEqual(previous, seeded)) return previous
+      lastLivelineDataRef.current = seeded
+      return seeded
+    }
+
+    if (current !== null) {
+      const last = normalized[normalized.length - 1]
+      if (currentTime !== null && currentTime > last.time) {
+        normalized.push({
+          time: currentTime,
+          value: current,
+        })
+      } else if (currentTime !== null && currentTime === last.time && Math.abs(last.value - current) > 1e-9) {
+        normalized[normalized.length - 1] = {
+          time: last.time,
+          value: current,
+        }
+      } else if (currentTime === null && Math.abs(last.value - current) > 1e-9) {
+        normalized[normalized.length - 1] = {
+          time: last.time,
+          value: current,
+        }
+      }
+    }
+
+    const MAX_POINTS = 600
+    const candidate = normalized.length > MAX_POINTS
+      ? normalized.slice(normalized.length - MAX_POINTS)
+      : normalized
+
+    const previous = lastLivelineDataRef.current
+    if (livelineSeriesEqual(previous, candidate)) return previous
+    lastLivelineDataRef.current = candidate
+    return candidate
+  }, [market.oracle_history, market.oracle_price, market.oracle_updated_at_ms])
+
+  const livelineValue = (
+    toFiniteNumber(market.oracle_price)
+    ?? livelineData[livelineData.length - 1]?.value
+    ?? 0
+  )
+  const livelineWindow = (() => {
+    const tf = normalizeTimeframe(market.timeframe)
+    if (tf === '5m') return 300
+    if (tf === '15m') return 900
+    if (tf === '1h') return 3600
+    if (tf === '4h') return 14_400
+    return 900
+  })()
+  const livelineColor = (
+    market.oracle_price !== null && market.price_to_beat !== null
+      ? (
+        market.oracle_price >= market.price_to_beat
+          ? (isDarkTheme ? '#22c55e' : '#16a34a')
+          : (isDarkTheme ? '#f87171' : '#dc2626')
+      )
+      : (isDarkTheme ? '#60a5fa' : '#2563eb')
+  )
+
+  const candleIntervalSecs = useMemo(() => candleInterval(market.timeframe), [market.timeframe])
+
+  const candleData = useMemo<CandlePoint[]>(() => {
+    if (livelineData.length < 2) return []
+    return aggregateCandles(livelineData, candleIntervalSecs)
+  }, [livelineData, candleIntervalSecs])
+
+  const liveCandle = useMemo<CandlePoint | undefined>(() => {
+    if (candleData.length === 0) return undefined
+    return candleData[candleData.length - 1]
+  }, [candleData])
+
+  // Parse time window from title (e.g. "Bitcoin Up or Down - February 10, 10:45AM-11:00AM ET")
+  const timeWindow = market.event_title?.match(/(\d{1,2}:\d{2}[AP]M)-(\d{1,2}:\d{2}[AP]M)\s*ET/)?.[0] || ''
+
+  return (
+    <>
+    <Card className={cn(
+      "overflow-hidden relative group transition-all duration-200",
+      !isModalView && "hover:shadow-lg hover:shadow-black/20 hover:border-border/80",
+      isModalView && "w-[min(1100px,calc(100vw-2rem))] max-h-[90vh] overflow-hidden rounded-2xl border-border/70 bg-background shadow-[0_40px_120px_rgba(0,0,0,0.55)]",
+      market.is_live && 'ring-1 ring-green-500/10',
+    )}>
+      {/* Asset color accent bar */}
+      <div className={cn("absolute left-0 top-0 bottom-0 w-1.5 rounded-l-lg", ASSET_BAR[asset] || 'bg-gray-400')} />
+
+      <div className="pl-5 pr-4 py-4 space-y-3">
+        {/* Header: Asset icon + name + status */}
+        <div className="flex items-start justify-between gap-2">
+          <div className="flex min-w-0 items-start gap-3">
+            <img src={ASSET_ICONS[asset]} alt={asset} className="w-8 h-8 rounded-full shrink-0" onError={(e) => { (e.target as HTMLImageElement).style.display = 'none' }} />
+            <div className="min-w-0">
+              <h3 className="text-base font-semibold text-foreground truncate">{t('cryptoMarketsPanel.card.upOrDownTitle', { asset })}</h3>
+              <div className="mt-0.5 flex items-center gap-1.5 flex-wrap">
+                <Badge variant="outline" className="text-[9px] px-1.5 py-0 text-muted-foreground border-muted-foreground/20">
+                  {market.timeframe.toUpperCase()}
+                </Badge>
+                <Badge
+                  variant="outline"
+                  className="max-w-[170px] truncate text-[9px] px-1.5 py-0 font-mono border-border/50 bg-muted/25 text-muted-foreground"
+                  title={t('cryptoMarketsPanel.card.strategySdkTooltip', { sdk: strategySdk })}
+                >
+                  {t('cryptoMarketsPanel.card.sdkLabel', { sdk: strategySdk })}
+                </Badge>
+                {market.is_live ? (
+                  <Badge variant="outline" className="text-[9px] px-1.5 py-0 font-bold text-green-400 bg-green-500/15 border-green-500/25">
+                    <span className="w-1.5 h-1.5 rounded-full bg-green-400 animate-pulse mr-1" />
+                    {t('cryptoMarketsPanel.card.live')}
+                  </Badge>
+                ) : (
+                  <Badge variant="outline" className="text-[9px] px-1.5 py-0 text-yellow-400 bg-yellow-500/10 border-yellow-500/20">{t('cryptoMarketsPanel.card.next')}</Badge>
+                )}
+              </div>
+              <p className="text-[11px] text-muted-foreground font-data truncate">{timeWindow}</p>
+            </div>
+          </div>
+          <div className="flex items-center gap-1">
+            {!isModalView ? (
+              <button
+                type="button"
+                onClick={() => setModalOpen(true)}
+                className="inline-flex h-7 w-7 items-center justify-center rounded-md border border-border/50 bg-background/40 text-muted-foreground transition-colors hover:border-border hover:bg-background/70 hover:text-foreground"
+                title={t('cryptoMarketsPanel.card.expandTooltip')}
+              >
+                <Maximize2 className="w-2.5 h-2.5" />
+              </button>
+            ) : (
+              <button
+                type="button"
+                onClick={() => onCloseModal?.()}
+                className="inline-flex h-7 w-7 items-center justify-center rounded-md border border-border/50 bg-background/40 text-muted-foreground transition-colors hover:border-border hover:bg-background/70 hover:text-foreground"
+                title={t('cryptoMarketsPanel.card.returnToGridTooltip')}
+              >
+                <Minimize2 className="w-2.5 h-2.5" />
+              </button>
+            )}
+            {polyUrl && (
+              <a href={polyUrl} target="_blank" rel="noopener noreferrer"
+                className="text-muted-foreground hover:text-foreground transition-colors p-1">
+                <ExternalLink className="w-4 h-4" />
+              </a>
+            )}
+          </div>
+        </div>
+
+        {/* Oracle price + Price to beat */}
+        <OraclePriceDisplay
+          price={market.oracle_price}
+          priceToBeat={market.price_to_beat}
+          source={market.oracle_source}
+          sourceMap={market.oracle_prices_by_source}
+          nowMs={nowMs}
+        />
+
+        {/* Modal-only: per-cycle synchronized view toggle */}
+        {isModalView && (
+          <div className="flex items-center justify-end gap-2 -mb-1">
+            <button
+              type="button"
+              onClick={() => setCycleChartEnabled((v) => !v)}
+              className={cn(
+                'text-[10px] font-mono uppercase tracking-wider px-2 py-1 rounded border transition-colors',
+                cycleChartEnabled
+                  ? 'border-blue-500/40 bg-blue-500/10 text-blue-400'
+                  : 'border-border/40 bg-background/40 text-muted-foreground hover:text-foreground',
+              )}
+              title={t('cryptoMarketsPanel.card.cycleViewTooltip')}
+            >
+              {cycleChartEnabled ? '✓ ' : ''}{t('cryptoMarketsPanel.card.cycleView')}
+            </button>
+          </div>
+        )}
+
+        {/* Oracle price sparkline chart */}
+        {isModalView && cycleChartEnabled ? (
+          <div className={cn(
+            "relative w-full rounded-lg overflow-hidden border",
+            isDarkTheme
+              ? "border-slate-700/40"
+              : "border-slate-200/90",
+          )}>
+            <CryptoCycleChart market={market} theme={isDarkTheme ? 'dark' : 'light'} height={360} />
+          </div>
+        ) : isModalView ? (
+          <div className={cn(
+            "relative h-56 w-full rounded-lg overflow-hidden border flex flex-col",
+            isDarkTheme
+              ? "border-slate-700/40 bg-gradient-to-b from-slate-900/75 via-slate-950/80 to-black/90"
+              : "border-slate-200/90 bg-gradient-to-b from-white via-slate-50 to-slate-100/70",
+          )}>
+            {livelineData.length >= 2 ? (
+              <Liveline
+                data={livelineData}
+                value={livelineValue}
+                color={livelineColor}
+                theme={isDarkTheme ? 'dark' : 'light'}
+                showValue
+                valueMomentumColor
+                grid
+                badge
+                badgeVariant={isDarkTheme ? 'default' : 'minimal'}
+                badgeTail={isDarkTheme}
+                pulse
+                fill
+                window={livelineWindow}
+                lerpSpeed={0.1}
+                padding={{ top: 8, right: 80, bottom: 24, left: 14 }}
+                tooltipOutline={isDarkTheme}
+                formatValue={(value) => formatPrice(value, 2)}
+                referenceLine={market.price_to_beat !== null ? { value: market.price_to_beat, label: t('cryptoMarketsPanel.card.priceToBeatLabel') } : undefined}
+                mode={chartMode}
+                candles={candleData}
+                candleWidth={candleIntervalSecs}
+                liveCandle={liveCandle}
+                onModeChange={setChartMode}
+                style={{ flex: 1, height: 'auto', minHeight: 0 }}
+              />
+            ) : (
+              <div className="flex items-center justify-center h-full text-[10px] text-muted-foreground/40">
+                {t('cryptoMarketsPanel.card.waitingForPrice')}
+              </div>
+            )}
+          </div>
+        ) : (
+          <div className="relative h-14 w-full bg-muted/10 rounded-lg overflow-hidden">
+            {livelineData.length >= 2 ? (
+              <Liveline
+                data={livelineData}
+                value={livelineValue}
+                color={livelineColor}
+                theme={isDarkTheme ? 'dark' : 'light'}
+                window={livelineWindow}
+                grid={false}
+                badge={false}
+                fill
+                pulse={false}
+                momentum={false}
+                scrub={false}
+                lerpSpeed={0.12}
+                padding={{ top: 4, right: 4, bottom: 4, left: 4 }}
+                referenceLine={market.price_to_beat !== null ? { value: market.price_to_beat } : undefined}
+                formatValue={(value) => formatPrice(value, 2)}
+                style={{ height: 56 }}
+              />
+            ) : (
+              <div className="flex items-center justify-center h-full text-[10px] text-muted-foreground/40">
+                {t('cryptoMarketsPanel.card.waitingForPrice')}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Countdown timer */}
+        <div className="flex items-center justify-center py-2 bg-muted/20 rounded-lg">
+          <LiveCountdown endTime={market.end_time} />
+        </div>
+
+        {/* Up / Down prices */}
+        <div className="grid grid-cols-2 gap-2">
+          <div className={cn(
+            "rounded-lg p-2.5 text-center border",
+            upPrice !== null && downPrice !== null && upPrice > downPrice
+              ? 'bg-green-500/10 border-green-500/20'
+              : 'bg-muted/20 border-border/30',
+          )}>
+            <div className="text-[10px] text-green-400 uppercase tracking-wider font-medium mb-1">
+              <TrendingUp className="w-3 h-3 inline mr-1" />{t('cryptoMarketsPanel.card.up')}
+            </div>
+            <div className="text-lg font-bold font-data tabular-nums text-green-400">
+              {upPrice !== null ? `${(upPrice * 100).toFixed(0)}%` : '--'}
+            </div>
+            <div className="text-[10px] text-muted-foreground font-data">
+              {upPrice !== null ? `$${upPrice.toFixed(2)}` : '--'}
+            </div>
+          </div>
+          <div className={cn(
+            "rounded-lg p-2.5 text-center border",
+            upPrice !== null && downPrice !== null && downPrice > upPrice
+              ? 'bg-red-500/10 border-red-500/20'
+              : 'bg-muted/20 border-border/30',
+          )}>
+            <div className="text-[10px] text-red-400 uppercase tracking-wider font-medium mb-1">
+              <TrendingDown className="w-3 h-3 inline mr-1" />{t('cryptoMarketsPanel.card.down')}
+            </div>
+            <div className="text-lg font-bold font-data tabular-nums text-red-400">
+              {downPrice !== null ? `${(downPrice * 100).toFixed(0)}%` : '--'}
+            </div>
+            <div className="text-[10px] text-muted-foreground font-data">
+              {downPrice !== null ? `$${downPrice.toFixed(2)}` : '--'}
+            </div>
+          </div>
+        </div>
+
+        {/* Spread / Combined info */}
+        <div className="space-y-1">
+          <div className="flex items-center justify-between text-[10px]">
+            <span className="text-muted-foreground">{t('cryptoMarketsPanel.card.combinedCost')}</span>
+            <div className="flex items-center gap-2">
+              <span className="font-data font-bold text-foreground">
+                {combined !== null ? `$${combined.toFixed(3)}` : '--'}
+              </span>
+              {spread !== null && spread > 0.001 && (
+                <span className={cn("font-data font-bold text-green-400")}>
+                  {t('cryptoMarketsPanel.card.spreadPct', { value: (spread * 100).toFixed(1) })}
+                </span>
+              )}
+            </div>
+          </div>
+          {market.best_bid !== null && market.best_ask !== null && (
+            <div className="flex justify-between text-[9px] text-muted-foreground/60 font-data">
+              <span>{t('cryptoMarketsPanel.card.upBidAsk', { bid: market.best_bid.toFixed(2), ask: market.best_ask.toFixed(2) })}</span>
+              <span>{t('cryptoMarketsPanel.card.bookSpread', { value: (market.best_ask - market.best_bid).toFixed(2) })}</span>
+            </div>
+          )}
+        </div>
+
+        {/* Stats */}
+        <div className="grid grid-cols-4 gap-2 text-center">
+          <div>
+            <div className="text-[9px] text-muted-foreground uppercase tracking-wider">{t('cryptoMarketsPanel.stats.liquidity')}</div>
+            <div className="text-xs font-bold font-data text-foreground">{formatUsd(market.liquidity)}</div>
+          </div>
+          <div>
+            <div className="text-[9px] text-muted-foreground uppercase tracking-wider">{t('cryptoMarketsPanel.stats.volume')}</div>
+            <div className="text-xs font-bold font-data text-foreground">{formatUsd(market.volume)}</div>
+          </div>
+          <div>
+            <div className="text-[9px] text-muted-foreground uppercase tracking-wider">{t('cryptoMarketsPanel.stats.takerFee')}</div>
+            <div className={cn(
+              "text-xs font-bold font-data",
+              takerFeePct !== null && takerFeePct > 0 ? 'text-orange-400' : 'text-muted-foreground',
+            )}>
+              {takerFeePct !== null ? `${(takerFeePct * 100).toFixed(2)}%` : '--'}
+            </div>
+          </div>
+          <div>
+            <div className="text-[9px] text-muted-foreground uppercase tracking-wider">{t('cryptoMarketsPanel.stats.lastTrade')}</div>
+            <div className="text-xs font-bold font-data text-foreground">{market.last_trade_price !== null ? `$${market.last_trade_price.toFixed(2)}` : '--'}</div>
+          </div>
+        </div>
+
+        {/* Upcoming markets timeline */}
+        {market.upcoming_markets && market.upcoming_markets.length > 0 && (
+          <div className="space-y-1 pt-1 border-t border-border/20">
+            <div className="text-[9px] text-muted-foreground uppercase tracking-wider font-medium">{t('cryptoMarketsPanel.card.upcoming')}</div>
+            {market.upcoming_markets.map((um, i) => {
+              const umTime = um.event_title?.match(/(\d{1,2}:\d{2}[AP]M)-(\d{1,2}:\d{2}[AP]M)/)?.[0] || ''
+              return (
+                <div key={um.id || i} className="flex items-center justify-between text-[10px] font-data text-muted-foreground py-0.5">
+                  <div className="flex items-center gap-1.5">
+                    <ChevronRight className="w-3 h-3 text-muted-foreground/40" />
+                    <span>{umTime}</span>
+                  </div>
+                  <div className="flex items-center gap-3">
+                    {um.up_price !== null && um.down_price !== null && (
+                      <>
+                        <span className="text-green-400">{(um.up_price * 100).toFixed(0)}%</span>
+                        <span className="text-muted-foreground/40">/</span>
+                        <span className="text-red-400">{(um.down_price * 100).toFixed(0)}%</span>
+                      </>
+                    )}
+                    <span className="text-muted-foreground/50">{formatUsd(um.liquidity)}</span>
+                  </div>
+                </div>
+              )
+            })}
+          </div>
+        )}
+      </div>
+    </Card>
+      {!isModalView && typeof document !== 'undefined' && createPortal(
+        <AnimatePresence>
+          {modalOpen && (
+            <motion.div
+              key={`crypto-market-modal-${market.id}`}
+              className="fixed inset-0 z-[120] flex items-center justify-center p-4 sm:p-6"
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+            >
+              <motion.div
+                className="absolute inset-0 bg-black/70 backdrop-blur-[2px]"
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                exit={{ opacity: 0 }}
+                transition={{ duration: 0.2 }}
+                onClick={closeModal}
+                aria-hidden
+              />
+              <motion.div
+                className="relative z-10"
+                role="dialog"
+                aria-modal="true"
+                aria-label={t('cryptoMarketsPanel.card.expandedAria', { asset, timeframe: market.timeframe })}
+                initial={{ scale: 0.94, opacity: 0, y: 22 }}
+                animate={{ scale: 1, opacity: 1, y: 0 }}
+                exit={{ scale: 0.97, opacity: 0, y: 14 }}
+                transition={{ type: 'spring', stiffness: 260, damping: 28, mass: 0.9 }}
+              >
+                <CryptoMarketCard
+                  market={market}
+                  themeMode={themeMode}
+                  nowMs={nowMs}
+                  isModalView
+                  onCloseModal={closeModal}
+                />
+              </motion.div>
+            </motion.div>
+          )}
+        </AnimatePresence>,
+        document.body
+      )}
+    </>
+  )
+}
+
+// ─── Main Panel ──────────────────────────────────────────
+
+interface Props {
+  onOpenCryptoSettings?: () => void
+  showSettingsButton?: boolean
+}
+
+export default function CryptoMarketsPanel({
+  onOpenCryptoSettings,
+  showSettingsButton = true,
+}: Props) {
+  const { t } = useTranslation()
+  const panelRef = useRef<HTMLDivElement>(null)
+  const queryClient = useQueryClient()
+  const themeMode = useAtomValue(themeAtom)
+  const [timeframeFilter, setTimeframeFilter] = useState<TimeframeFilter>('all')
+  const [isDocumentVisible, setIsDocumentVisible] = useState(
+    () => (typeof document === 'undefined' ? true : document.visibilityState === 'visible')
+  )
+  const [isPanelInViewport, setIsPanelInViewport] = useState(true)
+  const { isConnected, lastMessage } = useWebSocket('/ws')
+  const [wsMarkets, setWsMarkets] = useState<CryptoMarket[]>([])
+  const [wsMarketsUpdatedAtMs, setWsMarketsUpdatedAtMs] = useState<number | null>(null)
+  const [nowMs, setNowMs] = useState(() => Date.now())
+  const isViewerActiveRef = useRef(true)
+
+  // Listen for real-time WebSocket pushes
+  useEffect(() => {
+    if (lastMessage?.type === 'crypto_markets_update' && Array.isArray(lastMessage.data?.markets)) {
+      // Drop high-frequency price updates while the panel is offscreen
+      // or the tab is hidden — the HTTP refetch on re-activation
+      // (enabled: isViewerActive) will repopulate within 1–2s without
+      // burning CPU on re-renders nobody can see.  init/membership
+      // events still flow through below so the seed isn't lost.
+      if (!isViewerActiveRef.current) return
+      const incoming = dedupeMarkets(lastMessage.data.markets as CryptoMarket[])
+      let membershipChanged = false
+      setWsMarkets((current) => {
+        const currentKeys = new Set(current.map(marketIdentity))
+        const incomingKeys = new Set(incoming.map(marketIdentity))
+        // Detect transitions: any incoming key not in current, or any current
+        // key dropped from the new push (e.g. hourly market expired at 12pm).
+        if (incoming.length === 0 && current.length > 0) {
+          membershipChanged = true
+        } else {
+          for (const key of incomingKeys) {
+            if (!currentKeys.has(key)) { membershipChanged = true; break }
+          }
+          if (!membershipChanged && incoming.length > 0) {
+            for (const key of currentKeys) {
+              if (!incomingKeys.has(key)) { membershipChanged = true; break }
+            }
+          }
+        }
+        if (!membershipChanged) {
+          // Steady-state tick: merge so price-only updates don't blow away
+          // fields the lightweight WS payload omits (e.g. oracle_history).
+          return mergeMarkets(current, incoming)
+        }
+        // Membership changed (market opened/closed): keep cached fields for
+        // surviving markets, drop expired ones, append new ones.
+        const survivors = current.filter((market) => incomingKeys.has(marketIdentity(market)))
+        return mergeMarkets(survivors, incoming)
+      })
+      setWsMarketsUpdatedAtMs(Date.now())
+      // Force an immediate HTTP refetch on transitions so the snapshot picks
+      // up newly-opened markets (with full oracle_history) without waiting
+      // for the next poll interval.
+      if (membershipChanged) {
+        queryClient.invalidateQueries({ queryKey: ['crypto-live-markets'] })
+      }
+      return
+    }
+
+    if (lastMessage?.type === 'init') {
+      const seededMarkets = extractCryptoMarketsFromInit(lastMessage.data)
+      if (seededMarkets) {
+        setWsMarkets((current) => mergeMarkets(current, dedupeMarkets(seededMarkets)))
+        setWsMarketsUpdatedAtMs(Date.now())
+      }
+    }
+  }, [lastMessage, queryClient])
+
+  // If websocket disconnects, immediately stop trusting any stale ws cache.
+  useEffect(() => {
+    if (!isConnected) {
+      setWsMarkets([])
+      setWsMarketsUpdatedAtMs(null)
+    }
+  }, [isConnected])
+
+  useEffect(() => {
+    // 250ms keeps the oracle-age readouts visibly sub-second without
+    // forcing the panel to re-render every animation frame. Pause the
+    // tick when the document is hidden OR the panel is scrolled out of
+    // view so we never burn CPU on age math nobody can see.
+    if (!isDocumentVisible || !isPanelInViewport) return
+    const iv = setInterval(() => setNowMs(Date.now()), 250)
+    return () => clearInterval(iv)
+  }, [isDocumentVisible, isPanelInViewport])
+
+  useEffect(() => {
+    const onVisibilityChange = () => {
+      setIsDocumentVisible(document.visibilityState === 'visible')
+    }
+    document.addEventListener('visibilitychange', onVisibilityChange)
+    return () => document.removeEventListener('visibilitychange', onVisibilityChange)
+  }, [])
+
+  useEffect(() => {
+    const el = panelRef.current
+    if (!el) return
+    if (typeof window === 'undefined' || !('IntersectionObserver' in window)) {
+      setIsPanelInViewport(true)
+      return
+    }
+
+    const observer = new IntersectionObserver(
+      (entries) => {
+        const entry = entries[0]
+        setIsPanelInViewport(Boolean(entry?.isIntersecting))
+      },
+      { threshold: 0.05 }
+    )
+    observer.observe(el)
+    return () => observer.disconnect()
+  }, [])
+
+  const isViewerActive = isDocumentVisible && isPanelInViewport
+  useEffect(() => {
+    isViewerActiveRef.current = isViewerActive
+  }, [isViewerActive])
+
+  // Browser-direct Binance bookTicker subscription.  The displayed
+  // binance_direct row is overlaid from this ref on every nowMs tick,
+  // bypassing the backend snapshot pipeline (debounce + rate-limit + WS
+  // broadcast).  Backend keeps its own connection for orchestrator
+  // execution gates.
+  const binanceDirectRef = useBinanceDirectFeed(isViewerActive)
+
+  const hasFreshWsMarkets =
+    wsMarkets.length > 0 &&
+    wsMarketsUpdatedAtMs !== null &&
+    nowMs - wsMarketsUpdatedAtMs <= WS_MARKETS_STALE_MS
+
+  // HTTP polling as fallback only
+  const { data: httpMarkets, isLoading } = useQuery({
+    queryKey: ['crypto-live-markets'],
+    queryFn: () => getCryptoMarkets({ viewer_active: true }),
+    enabled: isViewerActive,
+    refetchInterval: isViewerActive ? (hasFreshWsMarkets ? 15000 : 2000) : false,
+    refetchIntervalInBackground: false,
+    staleTime: 1000,
+  })
+
+  useEffect(() => {
+    if (!httpMarkets || httpMarkets.length === 0) return
+    const snapshotKeys = new Set(dedupeMarkets(httpMarkets).map((market) => marketIdentity(market)))
+    setWsMarkets((current) => current.filter((market) => snapshotKeys.has(marketIdentity(market))))
+  }, [httpMarkets])
+
+  const allMarkets = useMemo(() => {
+    const snapshotMarkets = dedupeMarkets(httpMarkets || [])
+    if (snapshotMarkets.length === 0) return wsMarkets
+    // appendUnknown=true so a fresh WS market list (e.g. immediately after an
+    // hourly transition) surfaces new markets even before the next HTTP poll
+    // returns. The prune effect on httpMarkets keeps wsMarkets a subset of
+    // the snapshot at steady state, so this can't accumulate stale entries.
+    return mergeMarkets(snapshotMarkets, wsMarkets, true)
+  }, [httpMarkets, wsMarkets])
+
+  const timeframeCounts = useMemo(() => {
+    const counts: Record<'5m' | '15m' | '1h' | '4h', number> = {
+      '5m': 0,
+      '15m': 0,
+      '1h': 0,
+      '4h': 0,
+    }
+
+    for (const market of allMarkets) {
+      const normalized = normalizeTimeframe(market.timeframe)
+      if ((['5m', '15m', '1h', '4h'] as const).includes(normalized as any)) {
+        counts[normalized as '5m' | '15m' | '1h' | '4h'] += 1
+      }
+    }
+
+    return counts
+  }, [allMarkets])
+
+  const filteredMarkets = useMemo(() => {
+    if (timeframeFilter === 'all') return allMarkets
+    return allMarkets.filter((market) => normalizeTimeframe(market.timeframe) === timeframeFilter)
+  }, [timeframeFilter, allMarkets])
+
+  // Overlay the freshest browser-direct Binance price into each market's
+  // oracle_prices_by_source.binance_direct row.  Re-evaluated on every
+  // nowMs tick (250ms when active) so the displayed age and the
+  // binance-direct-vs-chainlink delta both track wall-clock truth.
+  const liveMarkets = useMemo(() => {
+    const overrides = binanceDirectRef.current
+    if (!overrides || Object.keys(overrides).length === 0) return filteredMarkets
+    return filteredMarkets.map((market) => {
+      const asset = String(market.asset || '').trim().toUpperCase()
+      const local = overrides[asset]
+      if (!local) return market
+      const base = market.oracle_prices_by_source ?? {}
+      return {
+        ...market,
+        oracle_prices_by_source: {
+          ...base,
+          binance_direct: {
+            source: 'binance_direct',
+            price: local.price,
+            updated_at_ms: local.updatedAtMs,
+            age_seconds: null,
+          },
+        },
+      }
+    })
+  // nowMs drives re-evaluation; binanceDirectRef is a ref and intentionally
+  // not in the dep list (reading .current at evaluation time is the point).
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [filteredMarkets, nowMs])
+
+  // Stats from series data
+  const stats = useMemo(() => {
+    const live = filteredMarkets.filter(m => m.is_live).length
+    const seriesByKey = new Map<string, { liquidity: number; volume24h: number }>()
+    filteredMarkets.forEach((market) => {
+      const tf = normalizeTimeframe(market.timeframe) || String(market.timeframe || '').toLowerCase()
+      const key = `${market.asset}:${tf}`
+      if (seriesByKey.has(key)) return
+      seriesByKey.set(key, {
+        liquidity: market.series_liquidity || market.liquidity || 0,
+        volume24h: market.series_volume_24h || market.volume_24h || market.volume || 0,
+      })
+    })
+
+    const totalLiquidity = Array.from(seriesByKey.values()).reduce((acc, row) => acc + row.liquidity, 0)
+    const totalVolume24h = Array.from(seriesByKey.values()).reduce((acc, row) => acc + row.volume24h, 0)
+
+    const spreadSamples = filteredMarkets
+      .map((market) => toFiniteNumber(market.combined))
+      .filter((combined): combined is number => combined !== null)
+      .map((combined) => Math.abs(1 - combined))
+    const avgSpread = spreadSamples.length > 0
+      ? spreadSamples.reduce((acc, value) => acc + value, 0) / spreadSamples.length
+      : 0
+
+    const takerFeeSamples = filteredMarkets
+      .map((market) => marketTakerFeePct(market))
+      .filter((fee): fee is number => fee !== null)
+    const avgTakerFeePct = takerFeeSamples.length > 0
+      ? takerFeeSamples.reduce((acc, fee) => acc + fee, 0) / takerFeeSamples.length
+      : null
+    const maxTakerFeePct = takerFeeSamples.length > 0
+      ? Math.max(...takerFeeSamples)
+      : null
+
+    return {
+      total: filteredMarkets.length,
+      live,
+      totalLiquidity,
+      totalVolume24h,
+      avgSpread,
+      spreadSampleCount: spreadSamples.length,
+      seriesCount: seriesByKey.size,
+      avgTakerFeePct,
+      maxTakerFeePct,
+      takerFeeSampleCount: takerFeeSamples.length,
+    }
+  }, [filteredMarkets])
+
+  const wsStatus = !isViewerActive
+    ? {
+      label: t('cryptoMarketsPanel.wsStatus.paused'),
+      toneClass: 'text-muted-foreground border-border/50 bg-card/70',
+    }
+    : isConnected
+      ? hasFreshWsMarkets
+        ? {
+          label: t('cryptoMarketsPanel.wsStatus.live'),
+          toneClass: 'text-green-400 border-green-500/30 bg-green-500/10',
+        }
+        : {
+          label: t('cryptoMarketsPanel.wsStatus.connected'),
+          toneClass: 'text-blue-400 border-blue-500/30 bg-blue-500/10',
+        }
+      : {
+        label: t('cryptoMarketsPanel.wsStatus.polling'),
+        toneClass: 'text-yellow-400 border-yellow-500/30 bg-yellow-500/10',
+      }
+
+  return (
+    <div ref={panelRef} className="space-y-4">
+      {/* Header */}
+      <div className="rounded-xl border border-border/40 bg-card/60 px-3 py-2">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="flex items-center rounded-lg border border-border/50 overflow-hidden p-0.5 bg-card/70">
+              {([
+                { label: t('cryptoMarketsPanel.timeframe.all'), value: 'all', count: allMarkets.length },
+                { label: '5m', value: '5m', count: timeframeCounts['5m'] },
+                { label: '15m', value: '15m', count: timeframeCounts['15m'] },
+                { label: '1h', value: '1h', count: timeframeCounts['1h'] },
+                { label: '4h', value: '4h', count: timeframeCounts['4h'] },
+              ] as Array<{ label: string; value: TimeframeFilter; count: number }>).map((option) => (
+                <button
+                  key={option.value}
+                  onClick={() => setTimeframeFilter(option.value)}
+                  type="button"
+                  className={cn(
+                    "px-2.5 py-1 text-xs font-medium transition-colors",
+                    timeframeFilter === option.value
+                      ? "bg-primary/20 text-primary"
+                      : "text-muted-foreground hover:text-foreground hover:bg-muted/60"
+                  )}
+                >
+                  {option.label} ({option.count})
+                </button>
+              ))}
+          </div>
+          <div className="flex items-center gap-2 flex-wrap justify-end">
+            {showSettingsButton && onOpenCryptoSettings && (
+              <Button size="sm" variant="outline" onClick={onOpenCryptoSettings} className="h-7 px-2.5 text-xs gap-1.5">
+                <Settings className="w-3.5 h-3.5" />
+                {t('cryptoMarketsPanel.header.settings')}
+              </Button>
+            )}
+            <Button type="button" size="sm" variant="outline" className={cn("h-7 px-2.5 text-xs", wsStatus.toneClass)}>
+              {wsStatus.label}
+            </Button>
+          </div>
+        </div>
+
+        <div className="mt-2 border-t border-border/30 pt-2">
+          <div className="grid grid-cols-2 gap-x-3 gap-y-1 md:grid-cols-5">
+            <div className="min-w-0">
+              <div className="text-[9px] text-muted-foreground uppercase tracking-wider">{t('cryptoMarketsPanel.header.markets')}</div>
+              <div className="text-sm font-bold font-data leading-tight text-foreground">
+                {stats.total}
+                <span className="ml-1 text-[10px] font-medium text-muted-foreground">{t('cryptoMarketsPanel.header.liveCount', { n: stats.live })}</span>
+              </div>
+            </div>
+            <div className="min-w-0">
+              <div className="text-[9px] text-muted-foreground uppercase tracking-wider">{t('cryptoMarketsPanel.header.seriesLiquidity')}</div>
+              <div className="text-sm font-bold font-data leading-tight text-foreground">
+                {formatUsd(stats.totalLiquidity)}
+                <span className="ml-1 text-[10px] font-medium text-muted-foreground">{t('cryptoMarketsPanel.header.seriesCount', { n: stats.seriesCount })}</span>
+              </div>
+            </div>
+            <div className="min-w-0">
+              <div className="text-[9px] text-muted-foreground uppercase tracking-wider">{t('cryptoMarketsPanel.header.series24hVol')}</div>
+              <div className="text-sm font-bold font-data leading-tight text-foreground">
+                {formatUsd(stats.totalVolume24h)}
+                <span className="ml-1 text-[10px] font-medium text-muted-foreground">{t('cryptoMarketsPanel.header.seriesCount', { n: stats.seriesCount })}</span>
+              </div>
+            </div>
+            <div className="min-w-0">
+              <div className="text-[9px] text-muted-foreground uppercase tracking-wider">{t('cryptoMarketsPanel.header.avgSpread')}</div>
+              <div className={cn("text-sm font-bold font-data leading-tight", stats.avgSpread > 0.005 ? 'text-green-400' : 'text-muted-foreground')}>
+                {(stats.avgSpread * 100).toFixed(2)}%
+                <span className="ml-1 text-[10px] font-medium text-muted-foreground">{t('cryptoMarketsPanel.header.mktsCount', { n: stats.spreadSampleCount })}</span>
+              </div>
+            </div>
+            <div className="min-w-0">
+              <div className="text-[9px] text-muted-foreground uppercase tracking-wider">{t('cryptoMarketsPanel.header.takerFee')}</div>
+              <div className={cn("text-sm font-bold font-data leading-tight", stats.avgTakerFeePct !== null && stats.avgTakerFeePct > 0 ? 'text-orange-400' : 'text-muted-foreground')}>
+                {stats.avgTakerFeePct !== null ? `${(stats.avgTakerFeePct * 100).toFixed(2)}%` : '--'}
+                {stats.maxTakerFeePct !== null && (
+                  <span className="ml-1 text-[10px] font-medium text-muted-foreground">
+                    {t('cryptoMarketsPanel.header.maxPct', { value: (stats.maxTakerFeePct * 100).toFixed(2) })}
+                  </span>
+                )}
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Content */}
+      {isLoading && !hasFreshWsMarkets ? (
+        <div className="flex items-center justify-center py-16">
+          <RefreshCw className="w-8 h-8 animate-spin text-orange-400" />
+          <span className="ml-3 text-muted-foreground">{t('cryptoMarketsPanel.loading')}</span>
+        </div>
+      ) : filteredMarkets.length === 0 ? (
+        <OpportunityEmptyState
+          title={
+            timeframeFilter === 'all'
+              ? t('cryptoMarketsPanel.empty.allTitle')
+              : t('cryptoMarketsPanel.empty.timeframeTitle')
+          }
+          description={
+            timeframeFilter === 'all'
+              ? t('cryptoMarketsPanel.empty.allDescription')
+              : t('cryptoMarketsPanel.empty.timeframeDescription')
+          }
+        />
+      ) : (
+        <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-4">
+          {liveMarkets.map((market) => (
+            <CryptoMarketCard key={market.id} market={market} themeMode={themeMode} nowMs={nowMs} />
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}

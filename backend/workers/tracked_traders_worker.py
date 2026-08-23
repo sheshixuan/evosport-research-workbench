@@ -1,0 +1,974 @@
+"""Tracked-traders worker: smart pool + confluence lifecycle owner.
+
+Moves smart wallet pool and confluence loops out of the API process.
+Builds strategy-owned trader opportunities and writes them to shared snapshot state.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from datetime import timedelta
+from typing import Any, Awaitable, Callable, TypeVar
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import create_async_engine
+from sqlalchemy.orm import sessionmaker
+
+from config import settings
+from utils.utcnow import utcnow
+from models.database import AppSettings, RetryableAsyncSession
+from services.data_events import DataEvent, EventType
+from services.event_dispatcher import event_dispatcher
+from services.insider_detector import insider_detector
+from services.live_pressure import current_backpressure_level, db_pressure_snapshot, is_db_pressure_active
+from services.opportunity_strategy_catalog import ensure_all_strategies_seeded
+from services.strategy_signal_bridge import bridge_opportunities_to_signals
+from services.strategy_runtime import refresh_strategy_runtime_if_needed
+from services.market_cache import market_cache_service
+from services.market_tradability import get_market_tradability_map
+from services.scanner import scanner as market_scanner
+from services.smart_wallet_pool import smart_wallet_pool
+from services import shared_state
+from services.strategy_sdk import StrategySDK
+from services.wallet_intelligence import wallet_intelligence
+from services.worker_state import (
+    clear_worker_run_request,
+    ensure_worker_control,
+    read_worker_control,
+    write_worker_snapshot,
+)
+from utils.logger import get_logger
+
+logger = get_logger("tracked_traders_worker")
+
+_TRACKED_TRADERS_DB_POOL_SIZE = max(
+    1,
+    min(4, int(max(1, int(getattr(settings, "DATABASE_WORKER_POOL_SIZE", 8) or 8)) / 2)),
+)
+_TRACKED_TRADERS_DB_MAX_OVERFLOW = 0
+_tracked_traders_engine = create_async_engine(
+    settings.DATABASE_URL,
+    pool_pre_ping=True,
+    pool_size=_TRACKED_TRADERS_DB_POOL_SIZE,
+    max_overflow=_TRACKED_TRADERS_DB_MAX_OVERFLOW,
+    pool_timeout=max(1, int(getattr(settings, "DATABASE_POOL_TIMEOUT_SECONDS", 30) or 30)),
+    pool_recycle=max(30, int(getattr(settings, "DATABASE_POOL_RECYCLE_SECONDS", 300) or 300)),
+    pool_use_lifo=True,
+    connect_args={
+        "timeout": float(max(1.0, float(getattr(settings, "DATABASE_CONNECT_TIMEOUT_SECONDS", 8.0) or 8.0))),
+        "command_timeout": float(
+            max(
+                5.0,
+                float(getattr(settings, "DATABASE_POOL_TIMEOUT_SECONDS", 30) or 30),
+                (float(getattr(settings, "DATABASE_STATEMENT_TIMEOUT_MS", 30000) or 30000) / 1000.0) + 5.0,
+            )
+        ),
+        "server_settings": {
+            "timezone": "UTC",
+            "statement_timeout": str(max(1000, int(getattr(settings, "DATABASE_STATEMENT_TIMEOUT_MS", 30000) or 30000))),
+            "idle_in_transaction_session_timeout": str(
+                max(1000, int(getattr(settings, "DATABASE_IDLE_IN_TRANSACTION_TIMEOUT_MS", 60000) or 60000))
+            ),
+        },
+    },
+)
+AsyncSessionLocal = sessionmaker(
+    _tracked_traders_engine,
+    class_=RetryableAsyncSession,
+    expire_on_commit=False,
+)
+
+
+FULL_SWEEP_INTERVAL = timedelta(minutes=30)
+INCREMENTAL_REFRESH_INTERVAL = timedelta(minutes=2)
+ACTIVITY_RECONCILE_INTERVAL = timedelta(minutes=2)
+POOL_RECOMPUTE_INTERVAL = timedelta(minutes=1)
+FULL_INTELLIGENCE_INTERVAL = timedelta(minutes=20)
+INSIDER_RESCORING_INTERVAL = timedelta(minutes=10)
+POOL_RECOMPUTE_MODE_MAP = {"quality_only": "quality_only", "balanced": "balanced"}
+_RETRYABLE_DB_ATTEMPTS = 3
+_RETRYABLE_DB_BASE_DELAY_SECONDS = 0.2
+_RETRYABLE_DB_MAX_DELAY_SECONDS = 2.0
+
+_T = TypeVar("_T")
+
+# Grace period (seconds) given to a timed-out task to clean up DB sessions
+# before the result is abandoned.  This is critical: asyncio.wait_for
+# hard-cancels tasks, which interrupts session.close() mid-flight and
+# causes the "clean up" SAWarning connection leak.  Using asyncio.wait +
+# explicit cancel + grace avoids that.
+_CANCEL_GRACE_SECONDS = 5.0
+
+# Hold strong references to abandoned tasks so they can finish their DB
+# session cleanup naturally instead of being GC'd mid-flight (which causes
+# the SAWarning "connection was garbage collected" leak).
+_abandoned_tasks: set[asyncio.Task] = set()
+_inflight_timed_tasks: dict[str, asyncio.Task] = {}
+_FULL_INTELLIGENCE_STEP_TIMEOUTS: dict[str, float] = {
+    "confluence": 30.0,
+    "tagger": 25.0,
+    "clusterer": 25.0,
+    "cross_platform": 25.0,
+    "cohorts": 25.0,
+}
+
+
+class _TimedTaskStillRunningError(RuntimeError):
+    pass
+
+
+def _discard_abandoned(task: asyncio.Task) -> None:
+    _abandoned_tasks.discard(task)
+
+
+def _clear_inflight_timed_task(label: str, task: asyncio.Task) -> None:
+    if _inflight_timed_tasks.get(label) is task:
+        _inflight_timed_tasks.pop(label, None)
+
+
+async def _graceful_timeout(coro, *, timeout: float, label: str):
+    """Run *coro* with a timeout, but give it a grace period to clean up.
+
+    Unlike ``asyncio.wait_for`` which hard-cancels immediately:
+      1. Wrap the coroutine in a task.
+      2. ``asyncio.wait`` with the timeout (no cancellation).
+      3. If it didn't finish, cancel the task and wait again for a short
+         grace period so ``session.close()`` / ``rollback()`` inside the
+         coroutine can complete.
+      4. Raise ``asyncio.TimeoutError`` to the caller.
+
+    If the task still hasn't finished after the grace period, it is kept
+    alive in ``_abandoned_tasks`` so it can complete and return its DB
+    connection to the pool, rather than being GC'd.
+    """
+    existing = _inflight_timed_tasks.get(label)
+    if existing is not None and not existing.done():
+        close = getattr(coro, "close", None)
+        if callable(close):
+            close()
+        raise _TimedTaskStillRunningError(label)
+
+    task = asyncio.create_task(coro, name=f"tracked-traders-{label}")
+    _inflight_timed_tasks[label] = task
+    task.add_done_callback(lambda done_task, step_label=label: _clear_inflight_timed_task(step_label, done_task))
+
+    try:
+        done, _ = await asyncio.wait({task}, timeout=timeout)
+        if done:
+            return task.result()
+
+        # Timed out — cancel and give a grace period for DB cleanup.
+        task.cancel()
+        done_after, _ = await asyncio.wait({task}, timeout=_CANCEL_GRACE_SECONDS)
+        if done_after:
+            # Suppress CancelledError; propagate real exceptions.
+            try:
+                task.result()
+            except (asyncio.CancelledError, Exception):
+                pass
+        else:
+            # Keep the task alive so its session __aexit__ can still fire.
+            _abandoned_tasks.add(task)
+            task.add_done_callback(_discard_abandoned)
+            logger.warning(
+                "%s: task did not finish within %ss cancel-grace; holding reference until completion",
+                label,
+                _CANCEL_GRACE_SECONDS,
+            )
+        raise asyncio.TimeoutError()
+    except asyncio.CancelledError:
+        if not task.done():
+            task.cancel()
+            try:
+                await asyncio.shield(asyncio.wait({task}, timeout=_CANCEL_GRACE_SECONDS))
+            except (asyncio.CancelledError, Exception):
+                pass
+            if not task.done():
+                _abandoned_tasks.add(task)
+                task.add_done_callback(_discard_abandoned)
+                logger.warning(
+                    "%s: parent task cancelled during cleanup; holding reference until completion",
+                    label,
+                )
+        raise
+
+
+def _clamp_int(value: Any, default: int, minimum: int, maximum: int) -> int:
+    try:
+        parsed = int(value)
+    except Exception:
+        parsed = default
+    return max(minimum, min(maximum, parsed))
+
+
+def _clamp_float(value: Any, default: float, minimum: float, maximum: float) -> float:
+    try:
+        parsed = float(value)
+    except Exception:
+        parsed = default
+    return max(minimum, min(maximum, parsed))
+
+
+from utils.retry import is_retryable_db_error as _is_retryable_db_error  # noqa: E402
+
+
+def _retry_delay_seconds(attempt: int) -> float:
+    return min(_RETRYABLE_DB_BASE_DELAY_SECONDS * (2**attempt), _RETRYABLE_DB_MAX_DELAY_SECONDS)
+
+
+async def _run_with_retryable_db_retries(
+    step_name: str,
+    operation: Callable[[], Awaitable[_T]],
+) -> _T:
+    for attempt in range(_RETRYABLE_DB_ATTEMPTS):
+        try:
+            return await operation()
+        except _TimedTaskStillRunningError:
+            raise
+        except asyncio.TimeoutError:
+            raise
+        except Exception as exc:
+            retryable = _is_retryable_db_error(exc)
+            last_attempt = attempt >= _RETRYABLE_DB_ATTEMPTS - 1
+            if not retryable or last_attempt:
+                raise
+            delay = _retry_delay_seconds(attempt)
+            logger.warning(
+                "Tracked-traders %s hit retryable DB contention; retrying (attempt=%s delay=%.2fs)",
+                step_name,
+                attempt + 1,
+                delay,
+                exc_info=exc,
+            )
+            await asyncio.sleep(delay)
+    raise RuntimeError(f"unreachable retry loop for step={step_name}")
+
+
+async def _run_full_intelligence(*, include_confluence: bool) -> dict[str, str]:
+    step_specs: list[tuple[str, Callable[[], Awaitable[Any]], float]] = []
+    if include_confluence:
+        step_specs.append(
+            (
+                "confluence",
+                wallet_intelligence.confluence.scan_for_confluence,
+                _FULL_INTELLIGENCE_STEP_TIMEOUTS["confluence"],
+            )
+        )
+    step_specs.extend(
+        [
+            (
+                "tagger",
+                wallet_intelligence.tagger.tag_all_wallets,
+                _FULL_INTELLIGENCE_STEP_TIMEOUTS["tagger"],
+            ),
+            (
+                "clusterer",
+                wallet_intelligence.clusterer.run_clustering,
+                _FULL_INTELLIGENCE_STEP_TIMEOUTS["clusterer"],
+            ),
+            (
+                "cross_platform",
+                wallet_intelligence.cross_platform.scan_cross_platform,
+                _FULL_INTELLIGENCE_STEP_TIMEOUTS["cross_platform"],
+            ),
+            (
+                "cohorts",
+                wallet_intelligence.cohort_analyzer.analyze_cohorts,
+                _FULL_INTELLIGENCE_STEP_TIMEOUTS["cohorts"],
+            ),
+        ]
+    )
+
+    outcomes: dict[str, str] = {}
+    pressure_level = current_backpressure_level()
+    if is_db_pressure_active() or pressure_level >= 0.5:
+        for step_name, _operation, _timeout_seconds in step_specs:
+            outcomes[step_name] = "backpressure"
+        logger.warning(
+            "Tracked-traders full_intelligence cycle skipped under pressure",
+            db_pressure=db_pressure_snapshot(),
+            backpressure_level=round(pressure_level, 3),
+        )
+        return outcomes
+
+    for step_name, operation, timeout_seconds in step_specs:
+        try:
+            await _graceful_timeout(
+                operation(),
+                timeout=timeout_seconds,
+                label=f"full_intelligence_{step_name}",
+            )
+            outcomes[step_name] = "ok"
+        except _TimedTaskStillRunningError:
+            outcomes[step_name] = "still_running"
+            logger.warning(
+                "Tracked-traders full_intelligence step skipped because prior run is still finishing",
+                step=step_name,
+            )
+        except asyncio.TimeoutError:
+            outcomes[step_name] = "timeout"
+            logger.warning(
+                "Tracked-traders full_intelligence step timed out",
+                step=step_name,
+                timeout_seconds=timeout_seconds,
+            )
+        except Exception as exc:
+            retryable_db = _is_retryable_db_error(exc)
+            outcomes[step_name] = "retryable_db" if retryable_db else type(exc).__name__
+            if retryable_db:
+                logger.warning(
+                    "Tracked-traders full_intelligence step skipped due retryable DB contention",
+                    step=step_name,
+                    exc_info=exc,
+                )
+            else:
+                logger.warning(
+                    "Tracked-traders full_intelligence step failed",
+                    step=step_name,
+                    exc_info=exc,
+                )
+    return outcomes
+
+
+async def _trader_opportunity_intent_settings() -> dict[str, Any]:
+    config = {
+        "confluence_limit": 50,
+    }
+    try:
+        async with AsyncSessionLocal() as session:
+            row = (await session.execute(select(AppSettings).where(AppSettings.id == "default"))).scalar_one_or_none()
+            if not row:
+                return config
+
+            config["confluence_limit"] = _clamp_int(
+                row.discovery_trader_opps_confluence_limit,
+                default=50,
+                minimum=1,
+                maximum=400,
+            )
+    except Exception as exc:
+        logger.warning("Failed to read trader opportunity intent settings: %s", exc)
+    return config
+
+
+async def _pool_runtime_settings() -> dict[str, Any]:
+    _sdk = StrategySDK.POOL_ELIGIBILITY_DEFAULTS
+    config = {"recompute_mode": "quality_only", **_sdk}
+    try:
+        async with AsyncSessionLocal() as session:
+            row = (await session.execute(select(AppSettings).where(AppSettings.id == "default"))).scalar_one_or_none()
+            if not row:
+                return config
+            stored_mode = str(row.discovery_pool_recompute_mode or "quality_only").strip().lower()
+            config["recompute_mode"] = POOL_RECOMPUTE_MODE_MAP.get(stored_mode, "quality_only")
+            # DB overrides — fallback to SDK defaults for each field.
+            _db_overrides = {
+                "target_pool_size": row.discovery_pool_target_size,
+                "min_pool_size": row.discovery_pool_min_size,
+                "max_pool_size": row.discovery_pool_max_size,
+                "active_window_hours": row.discovery_pool_active_window_hours,
+                "inactive_rising_retention_hours": row.discovery_pool_inactive_rising_retention_hours,
+                "selection_score_quality_target_floor": row.discovery_pool_selection_score_floor,
+                "max_hourly_replacement_rate": row.discovery_pool_max_hourly_replacement_rate,
+                "replacement_score_cutoff": row.discovery_pool_replacement_score_cutoff,
+                "max_cluster_share": row.discovery_pool_max_cluster_share,
+                "high_conviction_threshold": row.discovery_pool_high_conviction_threshold,
+                "insider_priority_threshold": row.discovery_pool_insider_priority_threshold,
+                "min_eligible_trades": row.discovery_pool_min_eligible_trades,
+                "max_eligible_anomaly": row.discovery_pool_max_eligible_anomaly,
+                "core_min_win_rate": row.discovery_pool_core_min_win_rate,
+                "core_min_sharpe": row.discovery_pool_core_min_sharpe,
+                "core_min_profit_factor": row.discovery_pool_core_min_profit_factor,
+                "rising_min_win_rate": row.discovery_pool_rising_min_win_rate,
+                "slo_min_analyzed_pct": row.discovery_pool_slo_min_analyzed_pct,
+                "slo_min_profitable_pct": row.discovery_pool_slo_min_profitable_pct,
+                "leaderboard_wallet_trade_sample": row.discovery_pool_leaderboard_wallet_trade_sample,
+                "incremental_wallet_trade_sample": row.discovery_pool_incremental_wallet_trade_sample,
+                "full_sweep_interval_seconds": row.discovery_pool_full_sweep_interval_seconds,
+                "incremental_refresh_interval_seconds": row.discovery_pool_incremental_refresh_interval_seconds,
+                "activity_reconciliation_interval_seconds": row.discovery_pool_activity_reconciliation_interval_seconds,
+                "pool_recompute_interval_seconds": row.discovery_pool_recompute_interval_seconds,
+            }
+            for key, db_value in _db_overrides.items():
+                if db_value is not None:
+                    config[key] = db_value
+    except Exception as exc:
+        logger.warning("Failed to read pool runtime settings: %s", exc)
+    return config
+
+
+async def _market_cache_hygiene_settings() -> dict:
+    config = {
+        "enabled": True,
+        "interval_hours": 6,
+        "retention_days": 120,
+        "reference_lookback_days": 45,
+        "weak_entry_grace_days": 7,
+        "max_entries_per_slug": 3,
+    }
+    try:
+        async with AsyncSessionLocal() as session:
+            row = (await session.execute(select(AppSettings).where(AppSettings.id == "default"))).scalar_one_or_none()
+            if not row:
+                return config
+            config["enabled"] = bool(
+                row.market_cache_hygiene_enabled if row.market_cache_hygiene_enabled is not None else True
+            )
+            config["interval_hours"] = int(row.market_cache_hygiene_interval_hours or 6)
+            config["retention_days"] = int(row.market_cache_retention_days or 120)
+            config["reference_lookback_days"] = int(row.market_cache_reference_lookback_days or 45)
+            config["weak_entry_grace_days"] = int(row.market_cache_weak_entry_grace_days or 7)
+            config["max_entries_per_slug"] = int(row.market_cache_max_entries_per_slug or 3)
+    except Exception as exc:
+        logger.warning("Failed to read market cache hygiene settings: %s", exc)
+    return config
+
+
+async def _run_loop() -> None:
+    worker_name = "tracked_traders"
+    logger.info("Tracked-traders worker started")
+
+    try:
+        async with AsyncSessionLocal() as session:
+            await ensure_all_strategies_seeded(session)
+        await refresh_strategy_runtime_if_needed(
+            source_keys=["traders"],
+            force=True,
+        )
+    except Exception as exc:
+        logger.warning("Tracked-traders strategy startup sync failed: %s", exc)
+
+    now = utcnow()
+    next_full_sweep = now
+    next_incremental = now
+    next_reconcile = now
+    next_recompute = now
+    next_full_intelligence = now + FULL_INTELLIGENCE_INTERVAL
+    next_insider_rescore = now + INSIDER_RESCORING_INTERVAL
+    last_insider_flagged = 0
+
+    await wallet_intelligence.initialize()
+
+    async with AsyncSessionLocal() as session:
+        await ensure_worker_control(session, worker_name, default_interval=30)
+        await write_worker_snapshot(
+            session,
+            worker_name,
+            running=True,
+            enabled=True,
+            current_activity="Tracked-traders worker started; first cycle pending.",
+            interval_seconds=30,
+            last_run_at=None,
+            stats={
+                "pool_size": 0,
+                "active_signals": 0,
+                "signals_emitted_last_run": 0,
+                "confluence_high_extreme": 0,
+                "confluence_scanned": 0,
+                "confluence_executable": 0,
+                "insider_wallets_flagged": 0,
+            },
+        )
+
+    while True:
+        async with AsyncSessionLocal() as session:
+            control = await read_worker_control(session, worker_name, default_interval=30)
+        try:
+            await refresh_strategy_runtime_if_needed(
+                source_keys=["traders"],
+            )
+        except Exception as exc:
+            logger.warning("Tracked-traders strategy refresh check failed: %s", exc)
+
+        interval = max(10, min(3600, int(control.get("interval_seconds") or 60)))
+        paused = bool(control.get("is_paused", False))
+        enabled = bool(control.get("is_enabled", True))
+        requested = control.get("requested_run_at") is not None
+
+        if (not enabled or paused) and not requested:
+            async with AsyncSessionLocal() as session:
+                await shared_state.write_traders_snapshot(
+                    session,
+                    [],
+                    {
+                        "running": True,
+                        "enabled": enabled and not paused,
+                        "interval_seconds": interval,
+                        "last_scan": utcnow().isoformat(),
+                        "current_activity": "Paused" if paused else "Disabled",
+                        "strategies": [],
+                    },
+                )
+                await write_worker_snapshot(
+                    session,
+                    worker_name,
+                    running=True,
+                    enabled=enabled and not paused,
+                    current_activity="Paused" if paused else "Disabled",
+                    interval_seconds=interval,
+                    last_run_at=None,
+                    stats={
+                        "pool_size": 0,
+                        "active_signals": 0,
+                        "signals_emitted_last_run": 0,
+                        "confluence_high_extreme": 0,
+                        "confluence_scanned": 0,
+                        "confluence_executable": 0,
+                        "insider_wallets_flagged": 0,
+                    },
+                )
+            await asyncio.sleep(min(10, interval))
+            continue
+
+        cycle_started = utcnow()
+        emitted = 0
+        confluence_count = 0
+        confluence_scanned = 0
+        insider_flagged = last_insider_flagged
+
+        try:
+            now = utcnow()
+            activity_labels: list[str] = []
+            pool_config = await _pool_runtime_settings()
+            try:
+                smart_wallet_pool.configure_runtime(pool_config)
+                smart_wallet_pool.set_recompute_mode(pool_config["recompute_mode"])
+            except Exception as exc:
+                logger.warning("Failed to apply pool recompute mode '%s': %s", pool_config.get("recompute_mode"), exc)
+            full_sweep_interval = timedelta(
+                seconds=max(
+                    10, int(pool_config.get("full_sweep_interval_seconds") or FULL_SWEEP_INTERVAL.total_seconds())
+                )
+            )
+            incremental_refresh_interval = timedelta(
+                seconds=max(
+                    10,
+                    int(
+                        pool_config.get("incremental_refresh_interval_seconds")
+                        or INCREMENTAL_REFRESH_INTERVAL.total_seconds()
+                    ),
+                )
+            )
+            activity_reconcile_interval = timedelta(
+                seconds=max(
+                    10,
+                    int(
+                        pool_config.get("activity_reconciliation_interval_seconds")
+                        or ACTIVITY_RECONCILE_INTERVAL.total_seconds()
+                    ),
+                )
+            )
+            pool_recompute_interval = timedelta(
+                seconds=max(
+                    10,
+                    int(pool_config.get("pool_recompute_interval_seconds") or POOL_RECOMPUTE_INTERVAL.total_seconds()),
+                )
+            )
+
+            market_cache_cfg = await _market_cache_hygiene_settings()
+            if market_cache_cfg["enabled"]:
+                hygiene = await market_cache_service.run_hygiene_if_due(
+                    force=requested,
+                    interval_hours=market_cache_cfg["interval_hours"],
+                    retention_days=market_cache_cfg["retention_days"],
+                    reference_lookback_days=market_cache_cfg["reference_lookback_days"],
+                    weak_entry_grace_days=market_cache_cfg["weak_entry_grace_days"],
+                    max_entries_per_slug=market_cache_cfg["max_entries_per_slug"],
+                )
+                if hygiene.get("status") != "skipped":
+                    activity_labels.append("market_cache_hygiene")
+                    deleted = int(hygiene.get("markets_deleted", 0))
+                    if deleted > 0:
+                        activity_labels.append(f"market_cache_pruned:{deleted}")
+
+            if requested or now >= next_full_sweep:
+                activity_labels.append("full_sweep")
+                try:
+                    await _run_with_retryable_db_retries(
+                        "full_sweep",
+                        lambda: _graceful_timeout(smart_wallet_pool.run_full_sweep(), timeout=180, label="full_sweep"),
+                    )
+                except _TimedTaskStillRunningError:
+                    activity_labels.append("full_sweep_still_running")
+                    logger.warning("Tracked-traders full_sweep skipped because prior run is still finishing")
+                except asyncio.TimeoutError:
+                    activity_labels.append("full_sweep_timeout")
+                    logger.warning("Tracked-traders full_sweep timed out after 180s")
+                next_full_sweep = now + full_sweep_interval
+
+            if requested or now >= next_incremental:
+                activity_labels.append("incremental_refresh")
+                try:
+                    await _run_with_retryable_db_retries(
+                        "incremental_refresh",
+                        lambda: _graceful_timeout(
+                            smart_wallet_pool.run_incremental_refresh(), timeout=150, label="incremental_refresh"
+                        ),
+                    )
+                except _TimedTaskStillRunningError:
+                    activity_labels.append("incremental_refresh_still_running")
+                    logger.warning(
+                        "Tracked-traders incremental_refresh skipped because prior run is still finishing"
+                    )
+                except asyncio.TimeoutError:
+                    activity_labels.append("incremental_refresh_timeout")
+                    logger.warning("Tracked-traders incremental_refresh timed out after 150s")
+                next_incremental = now + incremental_refresh_interval
+
+            if requested or now >= next_reconcile:
+                activity_labels.append("activity_reconcile")
+                try:
+                    await _run_with_retryable_db_retries(
+                        "activity_reconcile",
+                        lambda: _graceful_timeout(
+                            smart_wallet_pool.reconcile_activity(), timeout=45, label="activity_reconcile"
+                        ),
+                    )
+                except _TimedTaskStillRunningError:
+                    activity_labels.append("activity_reconcile_still_running")
+                    logger.warning(
+                        "Tracked-traders activity_reconcile skipped because prior run is still finishing"
+                    )
+                except asyncio.TimeoutError:
+                    activity_labels.append("activity_reconcile_timeout")
+                    logger.warning("Tracked-traders activity_reconcile timed out after 45s")
+                next_reconcile = now + activity_reconcile_interval
+
+            if requested or now >= next_recompute:
+                activity_labels.append("pool_recompute")
+                try:
+                    await _run_with_retryable_db_retries(
+                        "pool_recompute",
+                        lambda: _graceful_timeout(smart_wallet_pool.recompute_pool(), timeout=90, label="pool_recompute"),
+                    )
+                except _TimedTaskStillRunningError:
+                    activity_labels.append("pool_recompute_still_running")
+                    logger.warning("Tracked-traders pool_recompute skipped because prior run is still finishing")
+                except asyncio.TimeoutError:
+                    activity_labels.append("pool_recompute_timeout")
+                    logger.warning("Tracked-traders pool_recompute timed out after 90s")
+                next_recompute = now + pool_recompute_interval
+
+            activity_labels.append("confluence_scan")
+            try:
+                await _run_with_retryable_db_retries(
+                    "confluence_scan",
+                    lambda: _graceful_timeout(
+                        wallet_intelligence.confluence.scan_for_confluence(), timeout=45, label="confluence_scan"
+                    ),
+                )
+            except _TimedTaskStillRunningError:
+                activity_labels.append("confluence_scan_still_running")
+                logger.warning("Tracked-traders confluence_scan skipped because prior run is still finishing")
+            except asyncio.TimeoutError:
+                activity_labels.append("confluence_scan_timeout")
+                logger.warning("Tracked-traders confluence_scan timed out after 45s")
+
+            trader_intent_settings = await _trader_opportunity_intent_settings()
+
+            confluence_limit = int(trader_intent_settings["confluence_limit"])
+
+            confluence_scan_limit = max(250, confluence_limit * 6)
+            firehose_rows = await StrategySDK.get_trader_firehose_signals(
+                limit=confluence_scan_limit,
+                include_filtered=True,
+                include_source_context=True,
+            )
+            if firehose_rows:
+                market_ids = [
+                    str(row.get("market_id") or "").strip().lower()
+                    for row in firehose_rows
+                    if isinstance(row, dict) and str(row.get("market_id") or "").strip()
+                ]
+                if market_ids:
+                    tradability_map = await get_market_tradability_map(market_ids)
+                    for row in firehose_rows:
+                        if not isinstance(row, dict):
+                            continue
+                        market_id = str(row.get("market_id") or "").strip().lower()
+                        if not market_id:
+                            continue
+                        if market_id in tradability_map:
+                            tradable = bool(tradability_map[market_id])
+                            row["is_tradeable"] = tradable
+                            if not tradable:
+                                row["is_active"] = False
+            confluence_scanned = len(firehose_rows)
+            deduped_by_stable_id: dict[str, Any] = {}
+            deduped_opportunities: list[Any] = []
+            strategies_used: list[str] = []
+            emitted = 0
+
+            # Dispatch trader_activity DataEvent so subscribed strategies
+            # (e.g. TradersConfluenceStrategy) can react via on_event().
+            if firehose_rows:
+                try:
+                    trader_event = DataEvent(
+                        event_type=EventType.TRADER_ACTIVITY,
+                        source="tracked_traders_worker",
+                        timestamp=utcnow(),
+                        payload={
+                            "confluence_count": len(firehose_rows),
+                            "signals": firehose_rows,
+                        },
+                    )
+                    # Tee to the recorded-event bus for replay — see
+                    # news_worker for the design pattern.
+                    try:
+                        await _publish_trader_activity_to_bus(trader_event, firehose_rows)
+                    except Exception:
+                        logger.warning("recorded_event_bus tee failed for trader_activity", exc_info=True)
+                    event_opps = await event_dispatcher.dispatch(trader_event)
+                    if event_opps:
+                        for opp in event_opps:
+                            stable_id = str(getattr(opp, "stable_id", "") or getattr(opp, "id", "")).strip()
+                            if stable_id and stable_id not in deduped_by_stable_id:
+                                deduped_by_stable_id[stable_id] = opp
+                        deduped_opportunities = list(deduped_by_stable_id.values())
+                        if confluence_limit > 0:
+                            deduped_opportunities = deduped_opportunities[:confluence_limit]
+                        strategies_used = sorted(
+                            {
+                                str(getattr(opp, "strategy", "") or "").strip()
+                                for opp in deduped_opportunities
+                                if str(getattr(opp, "strategy", "") or "").strip()
+                            }
+                        )
+                except Exception as exc:
+                    logger.warning("trader_activity DataEvent dispatch failed: %s", exc)
+            confluence_count = len(deduped_opportunities)
+
+            # Attach shared sparkline price history from the scanner cache
+            if deduped_opportunities:
+                try:
+                    await market_scanner.attach_price_history_to_opportunities(
+                        deduped_opportunities,
+                        timeout_seconds=0.0,
+                    )
+                except Exception as exc:
+                    logger.warning("Sparkline backfill for trader opps failed: %s", exc)
+
+            async def _bridge_and_snapshot() -> int:
+                async with AsyncSessionLocal() as session:
+                    _emitted = await bridge_opportunities_to_signals(
+                        deduped_opportunities,
+                        source="traders",
+                        sweep_missing=True,
+                        refresh_prices=False,
+                    )
+                async with AsyncSessionLocal() as session:
+                    await shared_state.write_traders_snapshot(
+                        session,
+                        deduped_opportunities,
+                        {
+                            "running": True,
+                            "enabled": True,
+                            "interval_seconds": interval,
+                            "last_scan": cycle_started.isoformat(),
+                            "current_activity": "Tracked traders strategy cycle complete.",
+                            "strategies": strategies_used,
+                        },
+                    )
+                    if requested:
+                        await clear_worker_run_request(session, worker_name)
+                    return _emitted
+
+            emitted = await _run_with_retryable_db_retries(
+                "bridge_and_snapshot", _bridge_and_snapshot,
+            )
+
+            maintenance_now = utcnow()
+            if requested or maintenance_now >= next_full_intelligence:
+                activity_labels.append("full_intelligence")
+                try:
+                    await _run_with_retryable_db_retries(
+                        "full_intelligence",
+                        lambda: _run_full_intelligence(include_confluence=False),
+                    )
+                except _TimedTaskStillRunningError:
+                    activity_labels.append("full_intelligence_still_running")
+                    logger.warning("Tracked-traders full_intelligence skipped because prior run is still finishing")
+                except Exception as exc:
+                    if _is_retryable_db_error(exc):
+                        activity_labels.append("full_intelligence_db_contention")
+                        logger.warning(
+                            "Tracked-traders full_intelligence skipped due retryable DB contention",
+                            exc_info=exc,
+                        )
+                    else:
+                        raise
+                next_full_intelligence = maintenance_now + FULL_INTELLIGENCE_INTERVAL
+
+            if requested or maintenance_now >= next_insider_rescore:
+                activity_labels.append("insider_rescore")
+                try:
+                    rescore = await _run_with_retryable_db_retries(
+                        "insider_rescore",
+                        lambda: _graceful_timeout(insider_detector.rescore_wallets(stale_minutes=15), timeout=90, label="insider_rescore"),
+                    )
+                    insider_flagged = int(rescore.get("flagged_insiders") or 0)
+                    last_insider_flagged = insider_flagged
+                except _TimedTaskStillRunningError:
+                    activity_labels.append("insider_rescore_still_running")
+                    logger.warning("Tracked-traders insider_rescore skipped because prior run is still finishing")
+                except asyncio.TimeoutError:
+                    activity_labels.append("insider_rescore_timeout")
+                    logger.warning("Tracked-traders insider rescore timed out after 90s")
+                except Exception as exc:
+                    if _is_retryable_db_error(exc):
+                        activity_labels.append("insider_rescore_db_contention")
+                        logger.warning(
+                            "Tracked-traders insider rescore skipped due retryable DB contention",
+                            exc_info=exc,
+                        )
+                    else:
+                        raise
+                next_insider_rescore = maintenance_now + INSIDER_RESCORING_INTERVAL
+
+            pool_stats = await _run_with_retryable_db_retries("get_pool_stats", smart_wallet_pool.get_pool_stats)
+
+            async with AsyncSessionLocal() as session:
+                await write_worker_snapshot(
+                    session,
+                    worker_name,
+                    running=True,
+                    enabled=True,
+                    current_activity=(
+                        "Idle - tracked-traders cycle complete."
+                        if not activity_labels
+                        else f"Ran: {', '.join(activity_labels)}"
+                    ),
+                    interval_seconds=interval,
+                    last_run_at=cycle_started,
+                    last_error=None,
+                    stats={
+                        "pool_size": int(pool_stats.get("pool_size") or 0),
+                        "active_signals": confluence_count,
+                        "signals_emitted_last_run": int(emitted),
+                        "confluence_high_extreme": int(emitted),
+                        "confluence_scanned": int(confluence_scanned),
+                        "confluence_executable": int(confluence_count),
+                        "insider_wallets_flagged": int(insider_flagged),
+                        "intent_settings": trader_intent_settings,
+                        "pool_stats": pool_stats,
+                    },
+                )
+
+            logger.info(
+                "Tracked-traders cycle complete: raw=%s filtered=%s opportunities=%s",
+                confluence_scanned,
+                confluence_count,
+                emitted,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if _is_retryable_db_error(exc):
+                logger.warning(
+                    "Tracked-traders worker cycle hit retryable DB error; will retry next cycle",
+                    exc_info=exc,
+                )
+            elif isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
+                logger.warning("Tracked-traders worker cycle timed out: %s", exc)
+            else:
+                logger.exception("Tracked-traders worker cycle failed: %s", exc)
+            try:
+                async with AsyncSessionLocal() as session:
+                    if requested:
+                        await clear_worker_run_request(session, worker_name)
+                    await write_worker_snapshot(
+                        session,
+                        worker_name,
+                        running=True,
+                        enabled=True,
+                        current_activity=f"Last tracked-traders cycle error: {exc}",
+                        interval_seconds=interval,
+                        last_run_at=cycle_started,
+                        last_error=str(exc),
+                        stats={
+                            "pool_size": 0,
+                            "active_signals": confluence_count,
+                            "signals_emitted_last_run": int(emitted),
+                            "confluence_high_extreme": confluence_count,
+                            "confluence_scanned": int(confluence_scanned),
+                            "confluence_executable": int(confluence_count),
+                            "insider_wallets_flagged": int(insider_flagged),
+                        },
+                    )
+            except Exception as snapshot_exc:
+                logger.warning("Failed to write error snapshot: %s", snapshot_exc)
+
+        await asyncio.sleep(interval)
+
+
+async def start_loop() -> None:
+    """Run the tracked-traders worker loop (called from API process lifespan).
+
+    market_cache_service.load_from_db() is already done in main.py lifespan.
+    """
+    try:
+        await _run_loop()
+    except asyncio.CancelledError:
+        logger.info("Tracked-traders worker shutting down")
+
+
+# ── Recorded-event bus tap ──────────────────────────────────────────
+
+
+_TRADER_ACTIVITY_TOPIC = "trader.activity"
+_trader_topic_registered = False
+
+
+async def _ensure_trader_topic_registered() -> None:
+    """Idempotent topic registration — see news_worker pattern."""
+    global _trader_topic_registered
+    if _trader_topic_registered:
+        return
+    from services.recorded_event_bus.catalog import register_topic
+    from services.external_data.parquet_schema import parquet_root
+    import json
+
+    root = parquet_root()
+    storage_uri = json.dumps({
+        "sources": [{
+            "kind": "parquet",
+            "uri": str(root / "recorded_event_bus" / _TRADER_ACTIVITY_TOPIC),
+        }],
+    })
+    await register_topic(
+        slug=_TRADER_ACTIVITY_TOPIC,
+        title="Trader activity signals (confluence bundle)",
+        description=(
+            "Aggregated signals from the tracked-traders firehose: "
+            "each envelope is one batch of correlated trader actions "
+            "(wallets converging on the same market in the same "
+            "direction).  Subscribed by traders_confluence strategy.  "
+            "Different from wallet.trade — that's raw per-trade events; "
+            "this is the post-aggregation signal bundle."
+        ),
+        storage_kind="parquet",
+        storage_uri=storage_uri,
+        retention_days=30,
+        publishers=["tracked_traders_worker"],
+        subscribers=["traders_confluence"],
+    )
+    _trader_topic_registered = True
+
+
+async def _publish_trader_activity_to_bus(event, firehose_rows: list[dict]) -> None:
+    await _ensure_trader_topic_registered()
+    from services.recorded_event_bus import RecordedEvent, bus as _bus
+    import services.recorded_event_bus.storage  # noqa: F401
+
+    observed_at_us = int(event.timestamp.timestamp() * 1_000_000)
+    envelope = RecordedEvent(
+        topic=_TRADER_ACTIVITY_TOPIC,
+        entity_id="confluence_batch",
+        observed_at_us=observed_at_us,
+        payload={
+            "signals": firehose_rows,
+            "confluence_count": len(firehose_rows),
+        },
+        source="tracked_traders_worker",
+    )
+    await _bus.publish(envelope)
+

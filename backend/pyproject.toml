@@ -1,0 +1,27 @@
+[tool.pytest.ini_options]
+asyncio_mode = "strict"
+timeout = 60
+markers = [
+    "unit: pure logic, no external IO (default for unmarked tests once the marker sweep lands)",
+    "db: requires a real Postgres reachable via DATABASE_URL — uses build_postgres_session_factory or hits the live engine",
+    "slow: wall-clock > 5 s under normal load; safe to skip for fast pre-commit feedback",
+]
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+# Pin the enforced rule set explicitly. Ruff's own "default" selection has
+# drifted across releases; without an explicit `select` here, upgrading the
+# unpinned `ruff` CLI installed in CI (see .github/workflows/ci.yml) silently
+# activates whole new rule categories (isort, flake8-bandit, flake8-bugbear,
+# etc.) across the entire pre-existing codebase and breaks the lint job.
+select = ["E4", "E7", "E9", "F"]
+
+[tool.ruff.lint.per-file-ignores]
+"api/websocket.py" = ["E402"]
+"tests/*.py" = ["E402"]
+"tests/**/*.py" = ["E402"]
+"workers/*.py" = ["E402"]
+"workers/**/*.py" = ["E402"]
+"services/simulation/__init__.py" = ["E402"]

@@ -1,0 +1,89 @@
+fastapi>=0.115.0
+uvicorn[standard]>=0.31.1
+
+# MCP server SDK — exposes homerun's backtest + iteration tools to
+# external agents (Claude Code, Cursor, etc.) over stdio and HTTP/SSE.
+# See backend/services/mcp/ for the tool surface.
+mcp>=1.27.0
+sse-starlette>=3.4.0
+python-multipart>=0.0.27
+
+httpx[socks]>=0.27.0,<1.0
+websockets==12.0
+pydantic>=2.7.0
+pydantic-settings>=2.5.2
+jsonschema>=4.20.0
+sqlalchemy[asyncio]==2.0.25
+alembic==1.13.2
+asyncpg==0.30.0
+greenlet>=3.0.0
+
+# Faster asyncio event loop for the worker plane (API process is
+# unaffected — validation_service.py uses create_subprocess_exec which
+# requires stdlib Proactor on Windows).  workers/host.py picks the
+# fastest loop at startup; both opt out via HOMERUN_FAST_LOOP=0.
+#
+#   * Linux + macOS: uvloop (libuv-based, de-facto standard for
+#     high-throughput asyncio).  Skipped on Windows: POSIX-only.
+#   * Windows: winloop (uvloop's Windows port, IOCP-based).  Avoids
+#     the stdlib ProactorEventLoop _loop_reading failures.
+#
+# Either dep is optional at install time — host.py falls back to the
+# stdlib default if the platform-appropriate package can't import.
+uvloop>=0.21.0; sys_platform != "win32"
+winloop>=0.6.3; sys_platform == "win32"
+cryptography>=42.0.0
+
+# pyarrow — backtester reads parquet datasets dropped into Data Lab's
+# storage root (see services/external_data/parquet_*).  Avoids
+# round-tripping bring-your-own-data through Postgres (faster reads,
+# no autovacuum pressure on mms).  15.0 is the first version with a
+# stable streaming dataset scanner; pinning ">=" because parquet
+# format is forwards-compatible.
+pyarrow>=15.0
+
+# Redis (cross-process bus + ephemeral cache).  See backend/services/redis_client.py.
+# 5.x is the first major to ship redis.asyncio with stable connection-pool
+# semantics + native socket_timeout / health_check_interval kwargs.
+redis>=5.0,<8.0
+
+# urllib3 is pulled in transitively by requests (via sentence-transformers /
+# huggingface-hub). v2 requires OpenSSL 1.1.1+ which is available on
+# Python 3.9+ from Homebrew/python.org (macOS) and all Windows installs.
+urllib3>=1.26.0
+
+# AI Intelligence Layer
+pyyaml>=6.0
+markdown>=3.5
+
+# Data Source Runners (RSS/Atom feed parsing)
+feedparser>=6.0
+
+# News Intelligence Layer (semantic matching)
+numpy>=1.24.0
+scikit-learn>=1.8.0
+onnxruntime>=1.24.0
+xgboost-cpu>=3.2.0; platform_system != "Darwin"
+xgboost>=3.2.0; platform_system == "Darwin"
+lightgbm>=4.6.0
+sentence-transformers>=2.2.0
+faiss-cpu>=1.7.0
+
+# Shadow simulator: Cox proportional hazards fill model
+# (services/fill_simulator/cox_trainer.py).  Provides CoxPHFitter,
+# KaplanMeierFitter, concordance_index.  Pure-Python on top of scipy;
+# no GPU.  Pinned >=0.27 for the ``baseline_survival_at_times`` API.
+lifelines>=0.27.0
+
+# Report generation — strategy reverse-engineer executive PDFs and any
+# future HTML→PDF deliverables.  WeasyPrint depends on native
+# Pango/Cairo libs; the platform-specific install steps are baked into
+# the Dockerfile + scripts/launchers/install-deps.* and
+# services/reports/wallet_strategy_report.py prints actionable hints
+# when the import fails.
+weasyprint>=60.0
+jinja2>=3.1.0
+
+# GUI uses tkinter (ships with Python, no pip install needed)
+pytest-asyncio>=0.23.0,<1.0
+pytest-timeout>=2.3.0,<3.0

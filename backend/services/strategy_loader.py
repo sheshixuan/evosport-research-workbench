@@ -1,0 +1,1604 @@
+"""
+Unified Strategy Loader
+
+The ONE loader for all strategies. Handles detect, evaluate, and exit phases.
+
+Each strategy is a Python file defining a class that extends ``BaseStrategy``
+and implements one or more of:
+
+  - **detect()** / **detect_async()** — opportunity detection (scanner phase).
+  - **evaluate(signal, context)** — execution gating (orchestrator phase).
+  - **should_exit(position, market_state)** — exit logic (lifecycle phase).
+
+The loader validates source via AST, enforces an import allow-list, compiles
+in an isolated module, and exposes runtime status tracking for dashboards.
+"""
+
+from __future__ import annotations
+
+import ast
+import asyncio
+import hashlib
+import json
+import sys
+import traceback
+import types
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import TYPE_CHECKING, Any, Optional
+
+if TYPE_CHECKING:
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+from utils.logger import get_logger
+from services.event_dispatcher import event_dispatcher
+
+logger = get_logger(__name__)
+
+
+@dataclass(frozen=True)
+class _StrategyRefreshSnapshot:
+    slug: str
+    enabled: bool
+    source_code: str
+    config: dict[str, Any]
+    status: str | None
+    error_message: str | None
+
+
+# ---------------------------------------------------------------------------
+# Strategy template — shown to users as a starting point
+# ---------------------------------------------------------------------------
+
+STRATEGY_TEMPLATE = '''"""
+Strategy: My Custom Strategy
+
+A unified strategy that handles detection, execution gating, and exit logic.
+Implement detect() to find opportunities, evaluate() to gate execution,
+and should_exit() to manage open positions.
+"""
+
+from models import Market, Event, Opportunity
+from services.strategies.base import BaseStrategy, StrategyDecision, ExitDecision, DecisionCheck
+
+
+class MyCustomStrategy(BaseStrategy):
+    """
+    A custom unified strategy.
+
+    Required: detect() or detect_async() — find opportunities
+    Optional: evaluate() — custom execution gating (default: passthrough)
+    Optional: should_exit() — custom exit logic (default: TP/SL/trailing)
+    Optional: allow_new_entries = False — manage existing positions only
+    """
+
+    name = "My Custom Strategy"
+    description = "Describe what this strategy detects and how it trades"
+
+    # Strategy metadata
+    mispricing_type = "within_market"  # or "cross_market", "settlement_lag", "news_information"
+    source_key = "scanner"
+    subscriptions = ["market_data_refresh"]  # Required for scanner strategies
+    opportunity_ttl_minutes = 45  # None = use global default
+    allow_deduplication = True
+    binary_only = True
+    accepted_signal_strategy_types = []  # Optional additional strategy_type inputs for evaluate()
+    allow_new_entries = True  # Set False for exit-only/manual-management strategies
+
+    default_config = {
+        # Detection params
+        "example_threshold": 0.05,
+        "max_opportunities": 120,
+        "retention_window": "45m",
+        # Execution params
+        "min_edge_percent": 3.0,
+        "min_confidence": 0.4,
+        # Exit params
+        "take_profit_pct": 15.0,
+        "stop_loss_pct": 8.0,
+        "max_hold_minutes": None,
+        "trailing_stop_pct": None,
+    }
+
+    def detect(self, events, markets, prices):
+        """Find opportunities. Runs every scan cycle.
+
+        Use self.state to persist data across cycles:
+            prior = self.state.get("last_prices", {})
+            self.state["last_prices"] = {m.id: m.yes_price for m in markets}
+        """
+        opportunities = []
+        for market in markets:
+            if market.closed or not market.active:
+                continue
+            # Your detection logic here...
+            # opp = self.create_opportunity(...)
+            # if opp:
+            #     opp.strategy_context = {"my_signal_data": ...}
+            #     opportunities.append(opp)
+        return opportunities
+
+    def evaluate(self, signal, context):
+        """Gate execution. Called when orchestrator picks up signal."""
+        params = context.get("params") or {}
+        edge = float(getattr(signal, "edge_percent", 0) or 0)
+
+        if edge < float(params.get("min_edge_percent", 3.0)):
+            return StrategyDecision("skipped", f"Edge {edge:.1f}% too low")
+
+        return StrategyDecision(
+            "selected", "Signal approved",
+            checks=[DecisionCheck("edge", "Edge check", True, score=edge)]
+        )
+
+    def should_exit(self, position, market_state):
+        """Manage open positions. Called every lifecycle cycle."""
+        # Fall back to standard TP/SL/trailing from config
+        return self.default_exit_check(position, market_state)
+'''
+
+
+# Compound-movement / multi-timeframe-confirmation example. Showcases
+# StrategySDK.MultiWindow (fans one tick into 5m/15m/1h/4h lookbacks),
+# the on_timeframe_close() hook, and StrategySDK.PersistentState for
+# durable cross-restart counters. Strategy authors can copy this when
+# building strategies that reason about candle closes rather than every
+# tick.
+MULTI_WINDOW_STRATEGY_TEMPLATE = '''"""
+Strategy: Multi-Timeframe Compound Movement
+
+Fires when 5m + 15m + 1h windows on a shared price stream agree on
+direction. Acts only when a timeframe boundary closes, not on every
+tick. Persistent counter survives worker restarts.
+"""
+
+from datetime import datetime
+from typing import Any
+
+from models import Market, Event, Opportunity
+from services.strategies.base import BaseStrategy
+from services.strategy_sdk import StrategySDK
+
+
+class CompoundMovementStrategy(BaseStrategy):
+    name = "Compound Movement (5m / 15m / 1h)"
+    description = "Trades only when all configured timeframes agree on direction"
+
+    mispricing_type = "within_market"
+    source_key = "scanner"
+    subscriptions = ["market_data_refresh"]
+
+    # Opt into candle-close callbacks. The default on_event(MARKET_DATA_REFRESH)
+    # will call on_timeframe_close(timeframe, boundary_ts, ...) once per
+    # crossing.
+    timeframe_close_intervals = ["5m", "15m", "1h"]
+
+    default_config = {
+        "min_return_per_window": 0.005,  # 0.5% per timeframe to count as aligned
+        "min_aligned_windows": 3,
+        "min_edge_percent": 3.0,
+        "take_profit_pct": 12.0,
+        "stop_loss_pct": 6.0,
+    }
+
+    def __init__(self):
+        super().__init__()
+        # token_id -> MultiWindow tracking 5m / 15m / 1h on the same stream
+        self._windows: dict[str, Any] = {}
+        # Durable counter — survives worker restarts.
+        self._stats: StrategySDK.PersistentState | None = None
+
+    def detect(self, events, markets, prices):
+        """Update multi-window trackers for every active market."""
+        for market in markets:
+            if not market.active or market.closed:
+                continue
+            token_id = self._primary_token_id(market)
+            if not token_id:
+                continue
+            price = StrategySDK.get_live_price(market, prices)
+            if price is None:
+                continue
+            mw = self._windows.get(token_id)
+            if mw is None:
+                mw = StrategySDK.MultiWindow(lookbacks={
+                    "5m": 300,
+                    "15m": 900,
+                    "1h": 3600,
+                })
+                self._windows[token_id] = mw
+            mw.record(price)
+        return []  # entry decisions happen on candle close, not every tick
+
+    async def on_timeframe_close(self, timeframe, boundary_ts, events, markets, prices):
+        """Act once per closed candle: emit when enough timeframes agree."""
+        if self._stats is None:
+            self._stats = StrategySDK.PersistentState(self.strategy_type)
+            await self._stats.load()
+
+        opportunities = []
+        min_return = float(self.config.get("min_return_per_window", 0.005))
+        min_aligned = int(self.config.get("min_aligned_windows", 3))
+
+        for market in markets:
+            if not market.active or market.closed:
+                continue
+            token_id = self._primary_token_id(market)
+            mw = self._windows.get(token_id)
+            if mw is None or not mw.has_data:
+                continue
+
+            returns = mw.log_returns()
+            up_count = sum(
+                1 for r in returns.values()
+                if r is not None and r >= min_return
+            )
+            if up_count < min_aligned:
+                continue
+
+            opp = self.create_opportunity(
+                title=f"Compound up ({up_count}/{len(returns)} agree)",
+                description=f"All windows agree at {boundary_ts.isoformat()}",
+                total_cost=float(StrategySDK.get_live_price(market, prices) or 0),
+                markets=[market],
+                positions=[{"market": market, "side": "YES", "size": 1.0}],
+            )
+            if opp is not None:
+                opp.strategy_context = {
+                    "boundary_ts": boundary_ts.isoformat(),
+                    "timeframe": timeframe,
+                    "log_returns": returns,
+                    "aligned_count": up_count,
+                }
+                opportunities.append(opp)
+
+        # Track lifetime emissions across worker restarts.
+        emitted = int(self._stats.get("total_emitted", default=0))
+        self._stats.set("total_emitted", emitted + len(opportunities))
+        if self._stats.dirty:
+            await self._stats.flush()
+
+        return opportunities
+
+    @staticmethod
+    def _primary_token_id(market) -> str | None:
+        token_ids = getattr(market, "clob_token_ids", None) or []
+        return token_ids[0] if token_ids else None
+'''
+
+
+# ---------------------------------------------------------------------------
+# Allowed imports (merged superset from plugin_loader + strategy_db_loader)
+# ---------------------------------------------------------------------------
+
+ALLOWED_IMPORT_PREFIXES = {
+    # Future annotations
+    "__future__",
+    # App modules
+    "models",
+    "services.strategies",
+    "services.strategies.base",
+    "services.trader_orchestrator.strategies.base",
+    "services.trader_orchestrator.strategies",
+    "services.news",
+    "services.optimization",
+    "services.ws_feeds",
+    "services.chainlink_feed",
+    "services.fee_model",
+    "services.ai",
+    "services.strategy_sdk",
+    "services.strategy_helpers",
+    "services.quality_filter",
+    "services.data_source_sdk",
+    "services.traders_sdk",
+    "services.weather",
+    "services.data_events",
+    "services.event_dispatcher",
+    "services.forecasting",
+    "config",
+    "utils",
+    # Standard library (safe subset)
+    "math",
+    "statistics",
+    "collections",
+    "datetime",
+    "re",
+    "json",
+    "random",
+    "threading",
+    "asyncio",
+    "calendar",
+    "pathlib",
+    "decimal",
+    "fractions",
+    "itertools",
+    "functools",
+    "operator",
+    "copy",
+    "enum",
+    "dataclasses",
+    "typing",
+    "abc",
+    "time",
+    "hashlib",
+    "hmac",
+    "base64",
+    "uuid",
+    "urllib.parse",
+    "logging",
+    "bisect",
+    "heapq",
+    "textwrap",
+    "string",
+    "concurrent",
+    # Third party
+    "httpx",
+    "numpy",
+    "scipy",
+}
+
+# Explicitly blocked imports (dangerous even if they happen to pass prefix)
+BLOCKED_IMPORTS = {
+    "os",
+    "sys",
+    "subprocess",
+    "shutil",
+    "importlib",
+    "builtins",
+    "ctypes",
+    "socket",
+    "http",
+    "urllib",  # urllib itself is blocked; urllib.parse is allowed via prefix
+    "requests",
+    "aiohttp",
+    "pickle",
+    "shelve",
+    "marshal",
+    "code",
+    "codeop",
+    "compile",
+    "compileall",
+    "exec",
+    "eval",
+    "__import__",
+    "runpy",
+    "ast",
+    "dis",
+    "inspect",
+    "signal",
+    "multiprocessing",
+    "io",
+    "tempfile",
+    "glob",
+    "fnmatch",
+    "webbrowser",
+}
+
+# Blocked bare function calls
+_BLOCKED_CALL_NAMES = {"exec", "eval", "compile", "__import__", "open", "input"}
+
+_REPRODUCIBLE_ALLOWED_IMPORTS = {
+    "__future__",
+    "abc",
+    "base64",
+    "bisect",
+    "calendar",
+    "collections",
+    "collections.abc",
+    "copy",
+    "dataclasses",
+    "decimal",
+    "enum",
+    "fractions",
+    "functools",
+    "hashlib",
+    "heapq",
+    "hmac",
+    "itertools",
+    "json",
+    "math",
+    "models.opportunity",
+    "operator",
+    "re",
+    "services.strategies.base",
+    "statistics",
+    "string",
+    "textwrap",
+    "typing",
+    "urllib.parse",
+}
+_REPRODUCIBLE_APPLICATION_SYMBOLS = {
+    "models.opportunity": {
+        "AIAnalysis",
+        "ExecutionConstraints",
+        "ExecutionLeg",
+        "ExecutionPlan",
+        "MispricingType",
+        "Opportunity",
+        "ROIType",
+    },
+    "services.strategies.base": {
+        "BaseStrategy",
+        "DecisionCheck",
+        "ExitDecision",
+        "StrategyDecision",
+    },
+}
+_REPRODUCIBLE_SYMBOL_ONLY_IMPORTS = {
+    "datetime": {"timedelta", "timezone"},
+}
+_REPRODUCIBLE_AMBIENT_APIS = {
+    "datetime.date.today",
+    "datetime.datetime.now",
+    "datetime.datetime.today",
+    "datetime.datetime.utcnow",
+}
+_REPRODUCIBLE_DYNAMIC_NAMES = {
+    "__builtins__",
+    "__import__",
+    "compile",
+    "eval",
+    "exec",
+    "globals",
+    "input",
+    "locals",
+    "open",
+    "vars",
+}
+_REPRODUCIBLE_PROCESS_VARYING_NAMES = {"hash", "id"}
+_REPRODUCIBLE_UNORDERED_NAMES = {"frozenset", "set"}
+
+
+# ---------------------------------------------------------------------------
+# Exceptions
+# ---------------------------------------------------------------------------
+
+
+class StrategyValidationError(Exception):
+    """Raised when strategy source code fails validation or loading."""
+
+    pass
+
+
+# ---------------------------------------------------------------------------
+# AST validation helpers
+# ---------------------------------------------------------------------------
+
+
+def _check_imports(tree: ast.AST) -> list[str]:
+    """Check all imports in the AST against the allow-list. Returns violations."""
+    violations: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                mod_root = alias.name.split(".")[0]
+                # Allow urllib.parse explicitly even though urllib is blocked
+                if alias.name.startswith("urllib.parse"):
+                    continue
+                if mod_root in BLOCKED_IMPORTS:
+                    violations.append(f"Blocked import: '{alias.name}' (line {node.lineno})")
+                elif not any(alias.name.startswith(p) for p in ALLOWED_IMPORT_PREFIXES):
+                    violations.append(
+                        f"Disallowed import: '{alias.name}' (line {node.lineno}). "
+                        f"Use standard library or app modules only."
+                    )
+        elif isinstance(node, ast.ImportFrom):
+            if node.module:
+                mod_root = node.module.split(".")[0]
+                if node.module.startswith("urllib.parse"):
+                    continue
+                if mod_root in BLOCKED_IMPORTS:
+                    violations.append(f"Blocked import: 'from {node.module}' (line {node.lineno})")
+                elif not any(node.module.startswith(p) for p in ALLOWED_IMPORT_PREFIXES):
+                    violations.append(
+                        f"Disallowed import: 'from {node.module}' (line {node.lineno}). "
+                        f"Use standard library or app modules only."
+                    )
+    return violations
+
+
+def _check_blocked_calls(tree: ast.AST) -> list[str]:
+    """Check for dangerous bare function calls. Returns violations."""
+    violations: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        if isinstance(node.func, ast.Name):
+            if node.func.id in _BLOCKED_CALL_NAMES:
+                violations.append(f"Blocked call '{node.func.id}()' (line {node.lineno})")
+        elif isinstance(node.func, ast.Attribute):
+            if node.func.attr in _BLOCKED_CALL_NAMES:
+                target = node.func.value
+                if isinstance(target, ast.Name) and target.id in {"builtins", "__builtins__"}:
+                    violations.append(f"Blocked call '{target.id}.{node.func.attr}()' (line {node.lineno})")
+    return violations
+
+
+def _check_reproducible_source(tree: ast.AST) -> list[str]:
+    violations: list[str] = []
+    aliases: dict[str, set[str]] = {}
+    application_module_aliases: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name not in _REPRODUCIBLE_ALLOWED_IMPORTS:
+                    violations.append(
+                        f"Import '{alias.name}' is unavailable in reproducible strategies "
+                        f"(line {node.lineno})"
+                    )
+                bound_name = alias.asname or alias.name.split(".")[0]
+                aliases.setdefault(bound_name, set()).add(
+                    alias.name if alias.asname else bound_name
+                )
+                if alias.name in _REPRODUCIBLE_APPLICATION_SYMBOLS:
+                    if alias.asname is None:
+                        violations.append(
+                            f"Application import '{alias.name}' requires an explicit alias in "
+                            f"reproducible strategies (line {node.lineno})"
+                        )
+                    application_module_aliases.add(bound_name)
+        elif isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            if node.level or (
+                module not in _REPRODUCIBLE_ALLOWED_IMPORTS
+                and module not in _REPRODUCIBLE_SYMBOL_ONLY_IMPORTS
+            ):
+                violations.append(
+                    f"Import 'from {'.' * node.level}{module}' is unavailable in "
+                    f"reproducible strategies (line {node.lineno})"
+                )
+            for alias in node.names:
+                if alias.name == "*":
+                    violations.append(
+                        f"Wildcard imports are unavailable in reproducible strategies "
+                        f"(line {node.lineno})"
+                    )
+                    continue
+                allowed_symbols = _REPRODUCIBLE_APPLICATION_SYMBOLS.get(module)
+                if allowed_symbols is not None and alias.name not in allowed_symbols:
+                    violations.append(
+                        f"Application symbol '{module}.{alias.name}' is unavailable in "
+                        f"reproducible strategies (line {node.lineno})"
+                    )
+                symbol_only_imports = _REPRODUCIBLE_SYMBOL_ONLY_IMPORTS.get(module)
+                if symbol_only_imports is not None and alias.name not in symbol_only_imports:
+                    violations.append(
+                        f"Symbol '{module}.{alias.name}' is unavailable in reproducible "
+                        f"strategies (line {node.lineno})"
+                    )
+                aliases.setdefault(alias.asname or alias.name, set()).add(
+                    f"{module}.{alias.name}"
+                )
+
+    def _qualified_names(node: ast.AST) -> set[str]:
+        if isinstance(node, ast.Name):
+            return aliases.get(node.id, {node.id})
+        if isinstance(node, ast.Attribute):
+            return {f"{base}.{node.attr}" for base in _qualified_names(node.value)}
+        if isinstance(node, ast.IfExp):
+            return _qualified_names(node.body) | _qualified_names(node.orelse)
+        if isinstance(node, ast.NamedExpr):
+            return _qualified_names(node.value)
+        return set()
+
+    def _bind_assignment(target: ast.expr, value: ast.expr) -> bool:
+        changed = False
+        if isinstance(target, ast.Name):
+            qualified = _qualified_names(value)
+            if qualified - aliases.setdefault(target.id, set()):
+                aliases[target.id].update(qualified)
+                changed = True
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            if isinstance(value, (ast.Tuple, ast.List)) and len(target.elts) == len(value.elts):
+                for target_item, value_item in zip(target.elts, value.elts):
+                    changed = _bind_assignment(target_item, value_item) or changed
+            else:
+                for target_item in target.elts:
+                    changed = _bind_assignment(target_item, value) or changed
+        return changed
+
+    assignments: list[tuple[list[ast.expr], ast.expr]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            assignments.append((node.targets, node.value))
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            assignments.append(([node.target], node.value))
+        elif isinstance(node, ast.NamedExpr):
+            assignments.append(([node.target], node.value))
+    changed = True
+    while changed:
+        changed = False
+        for targets, value in assignments:
+            for target in targets:
+                changed = _bind_assignment(target, value) or changed
+
+    def _application_symbol_is_allowed(qualified: str) -> bool:
+        for module, allowed_symbols in _REPRODUCIBLE_APPLICATION_SYMBOLS.items():
+            prefix = f"{module}."
+            if qualified.startswith(prefix):
+                symbol = qualified[len(prefix):].split(".", 1)[0]
+                return symbol in allowed_symbols
+        return True
+
+    parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+            if node.id in _REPRODUCIBLE_DYNAMIC_NAMES:
+                violations.append(
+                    f"Dynamic API reference '{node.id}' is unavailable at the "
+                    f"reproducibility boundary (line {node.lineno})"
+                )
+            elif node.id in _REPRODUCIBLE_PROCESS_VARYING_NAMES:
+                violations.append(
+                    f"Process-varying builtin reference '{node.id}' is unavailable at the "
+                    f"reproducibility boundary (line {node.lineno})"
+                )
+            elif node.id in _REPRODUCIBLE_UNORDERED_NAMES:
+                violations.append(
+                    f"Unordered builtin reference '{node.id}' is unavailable at the "
+                    f"reproducibility boundary (line {node.lineno})"
+                )
+            elif node.id in application_module_aliases:
+                parent = parents.get(node)
+                direct_attribute = isinstance(parent, ast.Attribute) and parent.value is node
+                literal_getattr_target = (
+                    isinstance(parent, ast.Call)
+                    and "getattr" in _qualified_names(parent.func)
+                    and bool(parent.args)
+                    and parent.args[0] is node
+                )
+                if not direct_attribute and not literal_getattr_target:
+                    violations.append(
+                        f"Application module reference '{node.id}' must select an explicit "
+                        f"reproducible symbol (line {node.lineno})"
+                    )
+        elif isinstance(node, (ast.Set, ast.SetComp)):
+            violations.append(
+                f"Set construction is unavailable at the reproducibility boundary "
+                f"(line {node.lineno})"
+            )
+        elif isinstance(node, ast.Attribute):
+            for qualified in sorted(_qualified_names(node)):
+                if qualified in _REPRODUCIBLE_AMBIENT_APIS:
+                    violations.append(
+                        f"Ambient API '{qualified}' is unavailable at the reproducibility "
+                        f"boundary (line {node.lineno})"
+                    )
+                elif not _application_symbol_is_allowed(qualified):
+                    violations.append(
+                        f"Application symbol '{qualified}' is unavailable in reproducible "
+                        f"strategies (line {node.lineno})"
+                    )
+        elif (
+            isinstance(node, ast.Call)
+            and "getattr" in _qualified_names(node.func)
+            and len(node.args) >= 2
+            and isinstance(node.args[1], ast.Constant)
+            and isinstance(node.args[1].value, str)
+        ):
+            for target in sorted(_qualified_names(node.args[0])):
+                qualified = f"{target}.{node.args[1].value}"
+                if qualified in _REPRODUCIBLE_AMBIENT_APIS:
+                    violations.append(
+                        f"Ambient API '{qualified}' is unavailable at the reproducibility "
+                        f"boundary (line {node.lineno})"
+                    )
+                elif not _application_symbol_is_allowed(qualified):
+                    violations.append(
+                        f"Application symbol '{qualified}' is unavailable in reproducible "
+                        f"strategies (line {node.lineno})"
+                    )
+    return violations
+
+
+def _find_strategy_class(tree: ast.AST, class_name: Optional[str] = None) -> Optional[str]:
+    """Find a class extending BaseStrategy in the AST.
+
+    If *class_name* is given, look for that exact class; otherwise pick the
+    first class whose name ends with ``Strategy`` or fallback to the first
+    class that extends ``BaseStrategy``.
+    """
+    base_names = {"BaseStrategy"}
+
+    # If explicit class_name requested, look for it
+    if class_name:
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef) and node.name == class_name:
+                return class_name
+        return None
+
+    # Auto-detect: first class extending BaseStrategy
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef):
+            for base in node.bases:
+                base_id = None
+                if isinstance(base, ast.Name):
+                    base_id = base.id
+                elif isinstance(base, ast.Attribute):
+                    base_id = base.attr
+                if base_id in base_names:
+                    return node.name
+
+    # Fallback: first class whose name contains "Strategy"
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef) and "Strategy" in node.name:
+            return node.name
+
+    return None
+
+
+def _extract_class_capabilities(tree: ast.AST, class_name: str) -> dict:
+    """Return which methods are present on the strategy class."""
+    result = {
+        "has_detect": False,
+        "has_detect_async": False,
+        "has_on_event": False,
+        "has_evaluate": False,
+        "has_should_exit": False,
+    }
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef) and node.name == class_name:
+            for item in node.body:
+                if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    if item.name == "detect":
+                        result["has_detect"] = True
+                    elif item.name == "detect_async":
+                        result["has_detect_async"] = True
+                    elif item.name == "on_event":
+                        result["has_on_event"] = True
+                    elif item.name == "evaluate":
+                        result["has_evaluate"] = True
+                    elif item.name == "should_exit":
+                        result["has_should_exit"] = True
+            break
+    return result
+
+
+def _extract_class_attribute(tree: ast.AST, class_name: str, attr_name: str) -> Optional[str]:
+    """Extract a string class attribute value from the AST."""
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef) and node.name == class_name:
+            for item in node.body:
+                if isinstance(item, ast.Assign):
+                    for target in item.targets:
+                        if isinstance(target, ast.Name) and target.id == attr_name:
+                            if isinstance(item.value, ast.Constant):
+                                return str(item.value.value)
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Public validation function
+# ---------------------------------------------------------------------------
+
+
+def validate_strategy_source(
+    source_code: str,
+    class_name: Optional[str] = None,
+    *,
+    reproducible: bool = False,
+) -> dict:
+    """Validate strategy source code without executing it.
+
+    Returns a dict with:
+        valid (bool): Whether the code is valid
+        class_name (str|None): Name of the strategy class found
+        strategy_name (str|None): Value of the 'name' attribute
+        strategy_description (str|None): Value of the 'description' attribute
+        capabilities (dict): Which methods are defined
+        errors (list[str]): Validation error messages
+        warnings (list[str]): Non-fatal warnings
+    """
+    result: dict[str, Any] = {
+        "valid": False,
+        "class_name": None,
+        "strategy_name": None,
+        "strategy_description": None,
+        "capabilities": None,
+        "errors": [],
+        "warnings": [],
+    }
+
+    # 1. Syntax check
+    try:
+        tree = ast.parse(source_code)
+    except SyntaxError as e:
+        result["errors"].append(f"Syntax error at line {e.lineno}: {e.msg}")
+        return result
+
+    # 2. Import safety check
+    import_violations = _check_imports(tree)
+    if import_violations:
+        result["errors"].extend(import_violations)
+        return result
+
+    # 3. Blocked call check
+    call_violations = _check_blocked_calls(tree)
+    if call_violations:
+        result["errors"].extend(call_violations)
+        return result
+
+    if reproducible:
+        reproducible_violations = _check_reproducible_source(tree)
+        if reproducible_violations:
+            result["errors"].extend(reproducible_violations)
+            return result
+
+    # 4. Find strategy class
+    found_class = _find_strategy_class(tree, class_name)
+    if not found_class:
+        if class_name:
+            result["errors"].append(f"Class '{class_name}' was not found in strategy source.")
+        else:
+            result["errors"].append(
+                "No class extending BaseStrategy found. "
+                "Your strategy must define a class like: class MyStrategy(BaseStrategy):"
+            )
+        return result
+    result["class_name"] = found_class
+
+    # 5. Check capabilities
+    capabilities = _extract_class_capabilities(tree, found_class)
+    result["capabilities"] = capabilities
+
+    # 6. Require at least one of detect, detect_async, on_event, evaluate, or should_exit.
+    # - detect() / detect_async(): scanner strategies (base on_event routes to them)
+    # - on_event(): event-driven strategies reacting to non-scanner data
+    # - evaluate(): execution-only strategies (signals generated externally)
+    # - should_exit(): position-management-only strategies for adopted/manual holdings
+    has_any = (
+        capabilities["has_detect"]
+        or capabilities["has_detect_async"]
+        or capabilities["has_on_event"]
+        or capabilities["has_evaluate"]
+        or capabilities["has_should_exit"]
+    )
+    if not has_any:
+        result["errors"].append(
+            f"Class '{found_class}' must implement at least one of: detect(), "
+            f"detect_async(), on_event(), evaluate(), or should_exit(). "
+            f"Use detect() for synchronous scanner strategies, detect_async() for "
+            f"async I/O-bound strategies, on_event() for event-driven strategies "
+            f"reacting to crypto/weather/news data, evaluate() for "
+            f"execution-gating of externally generated signals, or should_exit() "
+            f"for exit-management-only strategies."
+        )
+        return result
+
+    # 7. Extract metadata
+    strategy_name = _extract_class_attribute(tree, found_class, "name")
+    strategy_description = _extract_class_attribute(tree, found_class, "description")
+
+    if not strategy_name:
+        result["warnings"].append(f"Class '{found_class}' has no 'name' attribute. A default name will be used.")
+    if not strategy_description:
+        result["warnings"].append(
+            f"Class '{found_class}' has no 'description' attribute. A default description will be used."
+        )
+
+    result["strategy_name"] = strategy_name
+    result["strategy_description"] = strategy_description
+    result["valid"] = True
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Runtime state for a loaded strategy
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class StrategyAvailability:
+    """Whether a strategy is available for use."""
+
+    available: bool
+    strategy_key: str
+    resolved_key: str
+    reason: Optional[str] = None
+
+
+@dataclass
+class LoadedStrategy:
+    """Runtime state for a loaded strategy."""
+
+    slug: str
+    instance: Any  # BaseStrategy instance
+    class_name: str
+    source_hash: str
+    loaded_at: datetime
+    module_name: str = ""
+    run_count: int = 0
+    error_count: int = 0
+    total_opportunities: int = 0
+    last_run: Optional[datetime] = None
+    last_error: Optional[str] = None
+
+
+def _strategy_runtime_hash(source_code: str, config: Optional[dict]) -> str:
+    """Hash strategy source + config so config-only changes trigger reloads."""
+    normalized_config = config if isinstance(config, dict) else {}
+    serialized = json.dumps(normalized_config, sort_keys=True, separators=(",", ":"))
+    payload = f"{source_code}\n{serialized}".encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()[:16]
+
+
+# ---------------------------------------------------------------------------
+# Strategy Loader
+# ---------------------------------------------------------------------------
+
+
+class StrategyLoader:
+    """Manages loading, validation, and lifecycle of strategies from source code.
+
+    This is the SINGLE loader for all strategies — detection, evaluation, and exit.
+    """
+
+    def __init__(self) -> None:
+        self._loaded: dict[str, LoadedStrategy] = {}
+        self._errors: dict[str, str] = {}
+        self._module_counter: int = 0
+        self._refresh_lock: Optional[asyncio.Lock] = None
+        # Plan 0041: per-trader strategy instances, keyed by (slug, trader_id).
+        # Populated lazily by ``get_or_clone_for_trader``; invalidated whenever
+        # the global slug reloads (via ``load`` / ``unload``) or the trader's
+        # ``source_configs_json`` mutates (via ``invalidate_per_trader``).
+        self._per_trader: dict[tuple[str, str], LoadedStrategy] = {}
+
+    @property
+    def refresh_lock(self) -> asyncio.Lock:
+        if self._refresh_lock is None:
+            self._refresh_lock = asyncio.Lock()
+        return self._refresh_lock
+
+    # ── Load / Unload ────────────────────────────────────────
+
+    def load(
+        self,
+        slug: str,
+        source_code: str,
+        config: Optional[dict] = None,
+        *,
+        reproducible: bool = False,
+    ) -> LoadedStrategy:
+        """Load a strategy from source code.
+
+        Validates the source via AST, compiles in an isolated module,
+        instantiates the strategy class, and stores it in ``_loaded``.
+
+        Args:
+            slug: Unique identifier for this strategy.
+            source_code: Python source code defining a BaseStrategy subclass.
+            config: Optional config overrides passed to ``instance.configure()``.
+
+        Returns:
+            LoadedStrategy instance.
+
+        Raises:
+            StrategyValidationError: If the source code is invalid or loading fails.
+        """
+        # Validate
+        validation = validate_strategy_source(source_code, reproducible=reproducible)
+        if not validation["valid"]:
+            raise StrategyValidationError("Strategy validation failed:\n" + "\n".join(validation["errors"]))
+
+        class_name = validation["class_name"]
+
+        # Unload existing version if present
+        if slug in self._loaded:
+            self.unload(slug)
+
+        # Create a unique module name
+        self._module_counter += 1
+        module_name = f"_strategy_{slug}_{self._module_counter}"
+
+        try:
+            # Compile
+            code = compile(source_code, f"<strategy:{slug}>", "exec")
+
+            # Create isolated module
+            module = types.ModuleType(module_name)
+            module.__file__ = f"<strategy:{slug}>"
+            module.__builtins__ = __builtins__
+
+            # Register so imports within the module resolve
+            sys.modules[module_name] = module
+
+            # Execute in the module's namespace
+            exec(code, module.__dict__)  # noqa: S102
+
+            # Retrieve the strategy class
+            strategy_class = getattr(module, class_name, None)
+            if strategy_class is None:
+                raise StrategyValidationError(
+                    f"Class '{class_name}' not found after loading. This is likely a bug in the strategy loader."
+                )
+
+            # Verify it extends BaseStrategy
+            from services.strategies.base import BaseStrategy
+
+            is_valid_class = isinstance(strategy_class, type) and issubclass(strategy_class, BaseStrategy)
+            if not is_valid_class:
+                raise StrategyValidationError(f"Class '{class_name}' does not extend BaseStrategy.")
+
+            # Set strategy_type to slug
+            strategy_class.strategy_type = slug
+
+            # Default name / description if missing
+            if not getattr(strategy_class, "name", None):
+                strategy_class.name = slug.replace("_", " ").title()
+            if not getattr(strategy_class, "description", None):
+                strategy_class.description = f"Strategy: {slug}"
+
+            # Instantiate
+            instance = strategy_class()
+
+            # Set key for orchestrator lookups
+            instance.key = slug
+
+            # Config cascade (2-level, deterministic):
+            #   1. strategy.default_config  — class-level defaults defined in strategy source code
+            #   2. DB Strategy.config       — user overrides via UI (takes precedence)
+            #
+            # Previously a 3rd level (file-based overrides) existed but was removed.
+            # All strategy config should be managed through the UI.
+            merged_config = {**(instance.default_config or {}), **(config or {})}
+            instance.configure(merged_config)
+
+            # Source hash for change detection
+            source_hash = _strategy_runtime_hash(source_code, merged_config)
+
+            loaded = LoadedStrategy(
+                slug=slug,
+                instance=instance,
+                class_name=class_name,
+                source_hash=source_hash,
+                loaded_at=datetime.now(timezone.utc),
+                module_name=module_name,
+            )
+            self._loaded[slug] = loaded
+
+            # Register event subscriptions
+            subs = getattr(instance, "subscriptions", [])
+            if subs:
+                event_dispatcher.unsubscribe_all(slug)  # Clear stale subscriptions
+                for event_type in subs:
+                    event_dispatcher.subscribe(slug, event_type, instance.on_event)
+
+            # SDK guardrail — divergent-detection footgun.  ``on_event`` is the
+            # live AND backtest entry point (it's the handler we subscribe just
+            # above).  If a strategy overrides BOTH ``on_event`` and a ``detect*``
+            # method, its ``detect()`` will NOT run unless its ``on_event`` calls
+            # back into it — a common mistake that silently strands the user's
+            # detect() logic and surfaces as a confusing zero-fills backtest.
+            # Flag it at load time so it's caught before production, never let the
+            # diagnostic itself break loading.
+            try:
+                from services.strategies.base import divergent_detection_warning
+
+                _divergence_warning = divergent_detection_warning(instance)
+                if _divergence_warning:
+                    logger.warning("Strategy '%s' %s", slug, _divergence_warning)
+            except Exception:  # noqa: BLE001 — a diagnostic must never break loading
+                pass
+
+            caps = validation.get("capabilities") or {}
+            cap_parts = [k.replace("has_", "") for k, v in caps.items() if v]
+            logger.info(
+                "Strategy loaded: %s (class=%s, name='%s', capabilities=[%s])",
+                slug,
+                class_name,
+                instance.name,
+                ", ".join(cap_parts),
+            )
+            return loaded
+
+        except StrategyValidationError:
+            sys.modules.pop(module_name, None)
+            raise
+        except Exception as e:
+            sys.modules.pop(module_name, None)
+            tb = traceback.format_exc()
+            raise StrategyValidationError(f"Failed to load strategy '{slug}': {e}\n\n{tb}") from e
+
+    def unload(self, slug: str) -> None:
+        """Unload a strategy by slug."""
+        event_dispatcher.unsubscribe_all(slug)
+        loaded = self._loaded.pop(slug, None)
+        if loaded:
+            # Clean up the tracked module from sys.modules to prevent namespace leak.
+            # Use the exact module_name stored on LoadedStrategy for O(1) targeted deletion
+            # rather than scanning all of sys.modules.
+            if loaded.module_name and loaded.module_name in sys.modules:
+                del sys.modules[loaded.module_name]
+            logger.info("Strategy unloaded: %s", slug)
+        self.invalidate_per_trader(slug=slug)
+
+    def reconfigure_loaded(
+        self,
+        slug: str,
+        source_code: str,
+        config: Optional[dict] = None,
+    ) -> bool:
+        """Apply config updates to an already loaded strategy instance.
+
+        Returns ``False`` when the strategy is not currently loaded.
+        """
+        loaded = self._loaded.get(slug)
+        if loaded is None:
+            return False
+
+        try:
+            merged_config = {**(loaded.instance.default_config or {}), **(config or {})}
+            loaded.instance.configure(merged_config)
+            loaded.source_hash = _strategy_runtime_hash(source_code, merged_config)
+            # Plan 0041: global config rebuilt -> every per-trader clone is
+            # stale (its merged config was layered on the OLD self.config).
+            # Drop the cached clones; next dispatch tick will rebuild them
+            # from the fresh global instance + the trader's strategy_params.
+            self.invalidate_per_trader(slug=slug)
+            return True
+        except Exception as exc:
+            tb = traceback.format_exc()
+            raise StrategyValidationError(
+                f"Failed to reconfigure strategy '{slug}': {exc}\n\n{tb}"
+            ) from exc
+
+    # ── Per-trader instances (plan 0041) ─────────────────────
+
+    def get_or_clone_for_trader(
+        self,
+        slug: str,
+        trader_id: str,
+        trader_config: Optional[dict] = None,
+    ) -> Optional[LoadedStrategy]:
+        """Return the per-trader clone for ``(slug, trader_id)``.
+
+        The clone is built on first access by calling
+        ``BaseStrategy.clone_for_trader(trader_config)`` on the global
+        singleton. Cached under ``(slug, trader_id)`` until either:
+
+        - The global strategy reloads — ``invalidate_per_trader(slug=...)``
+          fires from ``load`` / ``unload`` / ``reconfigure_loaded``.
+        - The trader's ``source_configs_json`` mutates — caller invokes
+          ``invalidate_per_trader(trader_id=...)`` from the trader-update
+          route.
+        - The trader-binding cache TTL elapses and a stale clone is detected
+          via ``source_hash`` mismatch on the next access.
+
+        Returns ``None`` if the global slug isn't loaded.
+        """
+        global_loaded = self._loaded.get(slug)
+        if global_loaded is None:
+            return None
+
+        key = (slug, str(trader_id or "").strip())
+        if not key[1]:
+            return None
+        cached = self._per_trader.get(key)
+        if cached is not None and cached.source_hash == global_loaded.source_hash:
+            return cached
+
+        try:
+            clone = global_loaded.instance.clone_for_trader(trader_config or {})
+        except Exception as exc:
+            tb = traceback.format_exc()
+            raise StrategyValidationError(
+                f"Failed to clone strategy '{slug}' for trader '{key[1]}': {exc}\n\n{tb}"
+            ) from exc
+
+        clone.key = slug
+        entry = LoadedStrategy(
+            slug=slug,
+            instance=clone,
+            class_name=global_loaded.class_name,
+            source_hash=global_loaded.source_hash,
+            loaded_at=datetime.now(timezone.utc),
+            module_name=global_loaded.module_name,
+        )
+        self._per_trader[key] = entry
+        return entry
+
+    def invalidate_per_trader(
+        self,
+        *,
+        slug: Optional[str] = None,
+        trader_id: Optional[str] = None,
+    ) -> int:
+        """Drop cached per-trader clones; force the next access to rebuild.
+
+        Call shapes:
+
+        - ``invalidate_per_trader()`` — drop everything.
+        - ``invalidate_per_trader(slug='crypto_5m_midcycle')`` — drop every
+          trader's clone of one slug (use when the global strategy reloads).
+        - ``invalidate_per_trader(trader_id='abc…')`` — drop every slug's
+          clone for one trader (use when that trader's strategy_params
+          changed).
+        - Both args — drop the single specific ``(slug, trader_id)`` entry.
+
+        Returns the number of entries removed.
+        """
+        normalized_slug = str(slug or "").strip().lower() if slug is not None else None
+        normalized_trader = str(trader_id or "").strip() if trader_id is not None else None
+        if normalized_slug is None and normalized_trader is None:
+            removed = len(self._per_trader)
+            self._per_trader.clear()
+            return removed
+        removed = 0
+        for key in list(self._per_trader.keys()):
+            slug_key, trader_key = key
+            if normalized_slug is not None and slug_key != normalized_slug:
+                continue
+            if normalized_trader is not None and trader_key != normalized_trader:
+                continue
+            del self._per_trader[key]
+            removed += 1
+        return removed
+
+    def loaded_per_trader_count(self) -> int:
+        """Diagnostic accessor — returns the per-trader cache size."""
+        return len(self._per_trader)
+
+    # ── DB reload ────────────────────────────────────────────
+
+    async def reload_from_db(
+        self,
+        slug: str,
+        session: "AsyncSession",
+    ) -> dict:
+        """Reload a single strategy from the ``strategies`` DB table.
+
+        Reads the ``Strategy`` row by slug, validates, compiles, and loads.
+        Updates the row's ``status`` and ``error_message`` columns.
+
+        Args:
+            slug: Strategy slug to reload.
+            session: SQLAlchemy async session (caller manages commit/close).
+
+        Returns:
+            Dict with ``"status"`` key: ``"loaded"``, ``"not_found"``,
+            ``"disabled"``, or ``"error"``.
+        """
+        from models.database import Strategy
+        from sqlalchemy import select
+
+        row = (await session.execute(select(Strategy).where(Strategy.slug == slug))).scalar_one_or_none()
+
+        if not row:
+            return {"status": "not_found", "slug": slug}
+
+        if not row.enabled:
+            # Unload if previously loaded
+            self.unload(slug)
+            row.status = "disabled"
+            row.error_message = None
+            return {"status": "disabled", "slug": slug}
+
+        try:
+            config = row.config if isinstance(row.config, dict) else {}
+            loaded = self.load(
+                slug=slug,
+                source_code=row.source_code or "",
+                config=config,
+            )
+            row.status = "loaded"
+            row.error_message = None
+            return {
+                "status": "loaded",
+                "slug": slug,
+                "class_name": loaded.class_name,
+                "source_hash": loaded.source_hash,
+            }
+        except Exception as exc:
+            tb = traceback.format_exc()
+            error_msg = str(exc)
+            row.status = "error"
+            row.error_message = f"{error_msg}\n{tb}"
+            logger.error("Failed to reload strategy '%s': %s", slug, error_msg)
+            return {
+                "status": "error",
+                "slug": slug,
+                "error": error_msg,
+            }
+
+    async def refresh_all_from_db(
+        self,
+        *,
+        strategy_keys: Optional[list[str]] = None,
+        source_keys: Optional[list[str]] = None,
+        prune_unlisted: bool = False,
+    ) -> dict[str, Any]:
+        """Bulk-load all enabled strategies from the DB.
+
+        Replaces the in-memory cache with fresh data. Disabled strategies
+        are unloaded. Rows are updated with ``status`` and ``error_message``.
+
+        Args:
+            strategy_keys: Optional subset of slugs to refresh. If None,
+                refreshes all rows.
+            source_keys: Optional subset of source keys to refresh.
+            prune_unlisted: If True, unload loaded strategies not present in
+                the selected result set. Full refreshes always prune deletions.
+
+        Returns:
+            Dict with ``"loaded"``, ``"errors"`` keys.
+        """
+        from models.database import AsyncSessionLocal, Strategy
+        from sqlalchemy import func, select
+        from utils.utcnow import utcnow
+
+        keys_filter = {str(key or "").strip().lower() for key in (strategy_keys or []) if str(key or "").strip()}
+        source_filter = {str(key or "").strip().lower() for key in (source_keys or []) if str(key or "").strip()}
+
+        async with self.refresh_lock:
+            query = select(Strategy).order_by(Strategy.slug.asc())
+            if keys_filter:
+                query = query.where(func.lower(func.coalesce(Strategy.slug, "")).in_(tuple(sorted(keys_filter))))
+            if source_filter:
+                query = query.where(
+                    func.lower(func.coalesce(Strategy.source_key, "")).in_(tuple(sorted(source_filter)))
+                )
+            async with AsyncSessionLocal() as read_session:
+                rows = list((await read_session.execute(query)).scalars().all())
+            snapshots = [
+                _StrategyRefreshSnapshot(
+                    slug=str(row.slug or "").strip().lower(),
+                    enabled=bool(row.enabled),
+                    source_code=str(row.source_code or ""),
+                    config=dict(row.config) if isinstance(row.config, dict) else {},
+                    status=str(row.status or "").strip() or None,
+                    error_message=str(row.error_message) if row.error_message is not None else None,
+                )
+                for row in rows
+                if str(row.slug or "").strip()
+            ]
+
+            next_loaded = dict(self._loaded)
+            next_errors = dict(self._errors)
+            status_updates: dict[str, tuple[str, str | None, datetime]] = {}
+            selected_slugs = {snapshot.slug for snapshot in snapshots}
+
+            is_filtered_refresh = bool(keys_filter or source_filter)
+            should_prune = bool(prune_unlisted or not is_filtered_refresh)
+            if should_prune:
+                for loaded_slug in list(next_loaded.keys()):
+                    if loaded_slug in selected_slugs:
+                        continue
+                    # When pruning a source-filtered refresh, only unload
+                    # strategies whose source_key matches the filter.
+                    # Otherwise strategies from other sources (e.g. "crypto")
+                    # get killed when the scanner refreshes "scanner" strategies.
+                    if source_filter:
+                        loaded_source = str(
+                            getattr(next_loaded[loaded_slug].instance, "source_key", "") or ""
+                        ).strip().lower()
+                        if loaded_source and loaded_source not in source_filter:
+                            continue
+                    self.unload(loaded_slug)
+                    next_loaded.pop(loaded_slug, None)
+                    next_errors.pop(loaded_slug, None)
+
+            for snapshot in snapshots:
+                slug = snapshot.slug
+                row_config = snapshot.config
+
+                # Compute hash of the incoming source code for change detection
+                new_source_hash = _strategy_runtime_hash(snapshot.source_code, row_config)
+                current_loaded = next_loaded.get(slug)
+
+                # Skip reload if already loaded with identical source and still enabled
+                if current_loaded and current_loaded.source_hash == new_source_hash and snapshot.enabled:
+                    if snapshot.status != "loaded" or snapshot.error_message is not None:
+                        status_updates[slug] = ("loaded", None, utcnow())
+                    continue
+
+                # Clear previous state for this slug
+                if slug in next_loaded:
+                    self.unload(slug)
+                    next_loaded.pop(slug, None)
+                next_errors.pop(slug, None)
+
+                if not snapshot.enabled:
+                    if snapshot.status != "disabled" or snapshot.error_message is not None:
+                        status_updates[slug] = ("disabled", None, utcnow())
+                    continue
+
+                try:
+                    loaded = self.load(
+                        slug=slug,
+                        source_code=snapshot.source_code,
+                        config=row_config,
+                    )
+                    next_loaded[slug] = loaded
+                    if snapshot.status != "loaded" or snapshot.error_message is not None:
+                        status_updates[slug] = ("loaded", None, utcnow())
+                except Exception as exc:
+                    error_message = str(exc)
+                    tb = traceback.format_exc()
+                    next_errors[slug] = error_message
+                    formatted_error = f"{error_message}\n{tb}"
+                    if snapshot.status != "error" or snapshot.error_message != formatted_error:
+                        status_updates[slug] = ("error", formatted_error, utcnow())
+
+            self._loaded = next_loaded
+            self._errors = next_errors
+
+            if status_updates:
+                update_slugs = tuple(sorted(status_updates.keys()))
+                async with AsyncSessionLocal() as write_session:
+                    update_rows = list(
+                        (
+                            await write_session.execute(
+                                select(Strategy).where(
+                                    func.lower(func.coalesce(Strategy.slug, "")).in_(update_slugs)
+                                )
+                            )
+                        )
+                        .scalars()
+                        .all()
+                    )
+                    for row in update_rows:
+                        slug = str(row.slug or "").strip().lower()
+                        update = status_updates.get(slug)
+                        if update is None:
+                            continue
+                        status, error_message, updated_at = update
+                        row.status = status
+                        row.error_message = error_message
+                        row.updated_at = updated_at
+                    await write_session.commit()
+
+            return {
+                "loaded": sorted(self._loaded.keys()),
+                "errors": dict(self._errors),
+            }
+
+    async def refresh_from_db(
+        self,
+        *,
+        session: "AsyncSession",
+        strategy_keys: Optional[list[str]] = None,
+        source_keys: Optional[list[str]] = None,
+        prune_unlisted: bool = False,
+    ) -> dict[str, Any]:
+        return await self.refresh_all_from_db(
+            session=session,
+            strategy_keys=strategy_keys,
+            source_keys=source_keys,
+            prune_unlisted=prune_unlisted,
+        )
+
+    # ── Accessors ────────────────────────────────────────────
+
+    def get_strategy(self, slug: str) -> Optional[LoadedStrategy]:
+        """Return the LoadedStrategy for *slug*, or None."""
+        return self._loaded.get(slug)
+
+    def get_instance(self, slug: str) -> Any:
+        """Return the BaseStrategy instance for *slug*, or None."""
+        loaded = self._loaded.get(slug)
+        return loaded.instance if loaded else None
+
+    def get_all_instances(self) -> list:
+        """Return all loaded strategy instances (e.g. for the scanner)."""
+        return [ls.instance for ls in self._loaded.values()]
+
+    def is_loaded(self, slug: str) -> bool:
+        """Check whether a strategy is currently loaded."""
+        return slug in self._loaded
+
+    def get_availability(self, strategy_key: str) -> StrategyAvailability:
+        """Check if a strategy is loaded and available for use."""
+        slug = str(strategy_key or "").strip().lower()
+        if slug in self._loaded:
+            return StrategyAvailability(available=True, strategy_key=strategy_key, resolved_key=slug)
+        reason = self._errors.get(slug)
+        return StrategyAvailability(
+            available=False,
+            strategy_key=strategy_key,
+            resolved_key=slug,
+            reason=reason or f"strategy_unavailable:{slug}",
+        )
+
+    def get_runtime_status(self, slug: str) -> Optional[dict]:
+        """Return full runtime status for a loaded strategy (used by serializers)."""
+        loaded = self._loaded.get(slug)
+        if loaded is not None:
+            return {
+                "strategy_key": loaded.slug,
+                "class_name": loaded.class_name,
+                "source_hash": loaded.source_hash,
+                "status": "loaded",
+                "error_message": None,
+                "loaded_at": loaded.loaded_at.isoformat(),
+            }
+        if slug in self._errors:
+            return {
+                "strategy_key": slug,
+                "status": "error",
+                "error_message": self._errors[slug],
+            }
+        return None
+
+    # ── Run tracking ─────────────────────────────────────────
+
+    def record_run(
+        self,
+        slug: str,
+        opportunities_found: int = 0,
+        error: Optional[str] = None,
+    ) -> None:
+        """Record a run result for status tracking."""
+        loaded = self._loaded.get(slug)
+        if not loaded:
+            return
+        loaded.run_count += 1
+        loaded.last_run = datetime.now(timezone.utc)
+        if error:
+            loaded.error_count += 1
+            loaded.last_error = error
+        else:
+            loaded.total_opportunities += opportunities_found
+
+    # ── Status / introspection ───────────────────────────────
+
+    def get_status(self, slug: str) -> Optional[dict]:
+        """Get status info for a loaded strategy."""
+        loaded = self._loaded.get(slug)
+        if not loaded:
+            return None
+        return {
+            "slug": loaded.slug,
+            "class_name": loaded.class_name,
+            "name": getattr(loaded.instance, "name", loaded.slug),
+            "description": getattr(loaded.instance, "description", ""),
+            "source_hash": loaded.source_hash,
+            "loaded_at": loaded.loaded_at.isoformat(),
+            "run_count": loaded.run_count,
+            "error_count": loaded.error_count,
+            "total_opportunities": loaded.total_opportunities,
+            "last_run": loaded.last_run.isoformat() if loaded.last_run else None,
+            "last_error": loaded.last_error,
+        }
+
+    def get_all_statuses(self) -> list[dict]:
+        """Get status for all loaded strategies."""
+        return [self.get_status(slug) for slug in self._loaded if self.get_status(slug) is not None]
+
+
+# ---------------------------------------------------------------------------
+# Module-level singleton
+# ---------------------------------------------------------------------------
+
+strategy_loader = StrategyLoader()
+
+
+# ---------------------------------------------------------------------------
+# Serialization helper (replaces strategy_db_loader.serialize_strategy_definition)
+# ---------------------------------------------------------------------------
+
+
+def serialize_strategy_definition(row: Any) -> dict[str, Any]:
+    """Serialize a Strategy ORM row to a dict for API responses."""
+    runtime = strategy_loader.get_runtime_status(str(row.slug or ""))
+    return {
+        "id": row.id,
+        "strategy_key": row.slug,
+        "source_key": row.source_key,
+        "label": row.name,
+        "description": row.description,
+        "class_name": row.class_name,
+        "source_code": row.source_code,
+        "default_params_json": row.config or {},
+        "param_schema_json": row.config_schema or {},
+        "aliases_json": [],
+        "is_system": bool(row.is_system),
+        "enabled": bool(row.enabled),
+        "status": row.status,
+        "error_message": row.error_message,
+        "version": int(row.version or 1),
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+        "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+        "runtime": runtime,
+    }

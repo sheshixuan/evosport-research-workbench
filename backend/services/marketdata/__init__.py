@@ -1,0 +1,107 @@
+"""Unified market-data layer.
+
+This package is the single, point-in-time-correct foundation for reading
+recorded/imported market data — used by both the backtest engine and (at
+``as_of=now``) live strategies, so live and replay share one access path.
+
+Layering (built across phases):
+
+  * ``asof``     — the one point-in-time (<= tau) lookup primitive.
+  * ``merge``    — the one ordered k-way merge (sync + async).
+  * ``manifest`` — content-hashed DatasetSnapshot for reproducible runs.
+  * ``schema``   — the single schema authority (validate on read + write).
+  * ``view``     — (Phase 2) ``MarketDataView``: book_at / iter_books /
+                   events / coverage, resolving across canonical parquet +
+                   the event bus, hiding source selection from callers.
+
+Phase 1 ships the bottom four as pure, independently-tested primitives with
+no wiring into the engine yet (no behavior change).
+"""
+from __future__ import annotations
+
+from services.marketdata.asof import AsOfSeries, bisect_as_of
+from services.marketdata.book import (
+    BookSnapshot,
+    PriceLevel,
+    load_book_series,
+    row_to_book_snapshot,
+)
+from services.marketdata.book_source import MarketDataViewSource
+from services.marketdata.coverage import (
+    CoverageMap,
+    TokenCoverage,
+    resolve_coverage,
+)
+from services.marketdata.manifest import (
+    DatasetSnapshot,
+    SnapshotEntry,
+    build_snapshot,
+    compute_content_hash,
+)
+from services.marketdata.merge import aordered_merge, ordered_merge
+from services.marketdata.schema import (
+    BOOK_SCHEMA_VERSION,
+    SchemaValidationError,
+    schema_for,
+    validate_arrow_schema,
+    validate_file,
+    validate_table,
+)
+from services.marketdata.projection import (
+    ProjectedMarket,
+    load_projected_markets,
+    project_crypto_update_events,
+)
+from services.marketdata.pins import (
+    active_pinned_paths,
+    is_path_pinned,
+    pin_paths,
+    release_pin,
+)
+from services.marketdata.provider import MarketDataProvider
+from services.marketdata.quality import assess_book_quality, assess_universe_quality
+from services.marketdata.view import MarketDataView
+from services.marketdata.writer import write_canonical_table
+
+__all__ = [
+    # primitives (Phase 1)
+    "AsOfSeries",
+    "bisect_as_of",
+    "ordered_merge",
+    "aordered_merge",
+    "DatasetSnapshot",
+    "SnapshotEntry",
+    "build_snapshot",
+    "compute_content_hash",
+    "BOOK_SCHEMA_VERSION",
+    "SchemaValidationError",
+    "schema_for",
+    "validate_arrow_schema",
+    "validate_file",
+    "validate_table",
+    # access layer (Phase 2)
+    "MarketDataView",
+    "MarketDataViewSource",
+    "CoverageMap",
+    "TokenCoverage",
+    "resolve_coverage",
+    "BookSnapshot",
+    "PriceLevel",
+    "load_book_series",
+    "row_to_book_snapshot",
+    # crypto_update projection (Phase 2b)
+    "ProjectedMarket",
+    "load_projected_markets",
+    "project_crypto_update_events",
+    # canonical writer + provider contract (Phase 6)
+    "write_canonical_table",
+    "MarketDataProvider",
+    # reproducibility pins (Phase 7)
+    "pin_paths",
+    "release_pin",
+    "active_pinned_paths",
+    "is_path_pinned",
+    # data-quality observability (Phase 8)
+    "assess_book_quality",
+    "assess_universe_quality",
+]

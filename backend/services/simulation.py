@@ -1,0 +1,753 @@
+import asyncio
+import contextlib
+import uuid
+from typing import Any, Optional
+
+from sqlalchemy import select
+from sqlalchemy.exc import OperationalError
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from models.database import (
+    SimulationAccount,
+    SimulationPosition,
+    SimulationTrade,
+    TradeStatus,
+    PositionSide,
+    AsyncSessionLocal,
+)
+from models.opportunity import Opportunity
+from utils.logger import get_logger
+from utils.retry import is_retryable_db_error as _is_retryable_db_error
+from utils.utcnow import utcnow
+
+logger = get_logger("simulation")
+
+
+class SlippageModel:
+    """Calculate execution slippage"""
+
+    @staticmethod
+    def fixed(base_price: float, slippage_bps: float) -> float:
+        """Fixed slippage in basis points"""
+        return base_price * (1 + slippage_bps / 10000)
+
+    @staticmethod
+    def linear(base_price: float, size: float, liquidity: float, slippage_bps: float) -> float:
+        """Linear slippage based on size vs liquidity"""
+        impact = (size / liquidity) * slippage_bps / 10000
+        return base_price * (1 + impact)
+
+    @staticmethod
+    def sqrt(base_price: float, size: float, liquidity: float, slippage_bps: float) -> float:
+        """Square root slippage (more realistic for large orders)"""
+        impact = (size / liquidity) ** 0.5 * slippage_bps / 10000
+        return base_price * (1 + impact)
+
+
+class SimulationService:
+    """Shadow trading simulation service"""
+
+    POLYMARKET_FEE = 0.02  # 2% winner fee
+    DB_RETRY_ATTEMPTS = 8
+    DB_RETRY_BASE_DELAY_SECONDS = 0.2
+    DB_RETRY_MAX_DELAY_SECONDS = 1.5
+
+    @staticmethod
+    def _direction_to_position_side(
+        direction: str,
+        payload: Optional[dict[str, Any]] = None,
+    ) -> tuple[PositionSide, str]:
+        """Map a leg ``direction`` to a binary ``PositionSide``.
+
+        Canonical fast path: ``buy_yes`` / ``sell_yes`` resolve to YES,
+        ``buy_no`` / ``sell_no`` resolve to NO.  ``PositionSide`` denotes
+        which side of the binary market the leg sits on, regardless of
+        the buy/sell action — selling out of a YES position is still on
+        the YES side.  Defensive widening: when the direction is the
+        bare ``buy``/``sell`` (emitted by ``traders_copy_trade`` when
+        the leader trade lands on a non-canonical outcome label and by
+        any pre-fix in-flight orders that already shipped without the
+        ``_yes``/``_no`` suffix), resolve via the payload's market
+        ``token_ids`` / ``clob_token_ids`` array and the leg's
+        ``token_id`` (index 0 → YES, index 1 → NO).  Truly multi-outcome
+        single-market structures (>2 tokens) still raise — those need
+        first-class support.
+        """
+
+        normalized = str(direction or "").strip().lower()
+        if normalized in {"buy_yes", "sell_yes"}:
+            return PositionSide.YES, "YES"
+        if normalized in {"buy_no", "sell_no"}:
+            return PositionSide.NO, "NO"
+        if normalized in {"buy", "sell"} and isinstance(payload, dict):
+            token_id = str(payload.get("token_id") or "").strip()
+            market_info: Optional[dict[str, Any]] = None
+            for key in ("market", "live_market"):
+                candidate = payload.get(key)
+                if isinstance(candidate, dict):
+                    market_info = candidate
+                    break
+            if not isinstance(market_info, dict):
+                market_info = payload
+            tokens: list[str] = []
+            for key in ("token_ids", "tokenIds", "clob_token_ids", "clobTokenIds"):
+                raw = market_info.get(key) if isinstance(market_info, dict) else None
+                if isinstance(raw, list):
+                    tokens = [str(t or "").strip() for t in raw if str(t or "").strip()]
+                    if tokens:
+                        break
+            if token_id and tokens:
+                if len(tokens) > 2:
+                    raise ValueError(
+                        f"Unsupported direction '{direction}' on multi-outcome market "
+                        f"({len(tokens)} tokens); first-class support required"
+                    )
+                try:
+                    idx = tokens.index(token_id)
+                except ValueError as exc:
+                    raise ValueError(
+                        f"Unsupported direction '{direction}'; token_id={token_id} "
+                        f"not in market tokens={tokens}"
+                    ) from exc
+                if idx == 0:
+                    return PositionSide.YES, "YES"
+                if idx == 1:
+                    return PositionSide.NO, "NO"
+        raise ValueError(f"Unsupported direction '{direction}'")
+
+    @staticmethod
+    def is_retryable_db_error(exc: Exception) -> bool:
+        return _is_retryable_db_error(exc)
+
+    async def create_account(
+        self,
+        name: str,
+        initial_capital: float = 10000.0,
+        max_position_pct: float = 10.0,
+        max_positions: int = 10,
+    ) -> SimulationAccount:
+        """Create a new simulation account.
+
+        Retry transient database lock/serialization windows so account creation
+        remains responsive while workers are writing concurrently.
+        """
+        for attempt in range(self.DB_RETRY_ATTEMPTS):
+            async with AsyncSessionLocal() as session:
+                try:
+                    account = SimulationAccount(
+                        id=str(uuid.uuid4()),
+                        name=name,
+                        initial_capital=initial_capital,
+                        current_capital=initial_capital,
+                        max_position_size_pct=max_position_pct,
+                        max_open_positions=max_positions,
+                    )
+                    session.add(account)
+                    await session.commit()
+                    await session.refresh(account)
+
+                    logger.info(
+                        "Created simulation account",
+                        account_id=account.id,
+                        name=name,
+                        capital=initial_capital,
+                        retry_attempt=attempt + 1,
+                    )
+                    return account
+                except OperationalError as exc:
+                    await session.rollback()
+                    is_retryable_lock = self.is_retryable_db_error(exc)
+                    is_last_attempt = attempt >= self.DB_RETRY_ATTEMPTS - 1
+                    if not is_retryable_lock or is_last_attempt:
+                        raise
+
+                    delay = min(
+                        self.DB_RETRY_BASE_DELAY_SECONDS * (2**attempt),
+                        self.DB_RETRY_MAX_DELAY_SECONDS,
+                    )
+                    logger.warning(
+                        "Simulation account create hit transient DB error; retrying",
+                        attempt=attempt + 1,
+                        max_attempts=self.DB_RETRY_ATTEMPTS,
+                        retry_in_seconds=delay,
+                    )
+
+            await asyncio.sleep(delay)
+
+        raise RuntimeError("Failed to create simulation account after retries")
+
+    async def get_account(self, account_id: str) -> Optional[SimulationAccount]:
+        """Get simulation account by ID"""
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(select(SimulationAccount).where(SimulationAccount.id == account_id))
+            return result.scalar_one_or_none()
+
+    async def get_all_accounts(self) -> list[SimulationAccount]:
+        """Get all simulation accounts"""
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(select(SimulationAccount))
+            return list(result.scalars().all())
+
+    async def get_all_accounts_with_positions(
+        self,
+    ) -> list[tuple[SimulationAccount, list[SimulationPosition]]]:
+        """Get all accounts and their open positions in 2 queries (avoids N+1)."""
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(select(SimulationAccount))
+            accounts = list(result.scalars().all())
+
+            if not accounts:
+                return []
+
+            account_ids = [a.id for a in accounts]
+            pos_result = await session.execute(
+                select(SimulationPosition).where(
+                    SimulationPosition.account_id.in_(account_ids),
+                    SimulationPosition.status == TradeStatus.OPEN,
+                )
+            )
+            positions = list(pos_result.scalars().all())
+
+            # Group positions by account_id
+            positions_by_account: dict[str, list[SimulationPosition]] = {aid: [] for aid in account_ids}
+            for pos in positions:
+                positions_by_account.setdefault(pos.account_id, []).append(pos)
+
+            return [(acc, positions_by_account.get(acc.id, [])) for acc in accounts]
+
+    async def delete_account(self, account_id: str) -> bool:
+        """Delete a simulation account and all related records"""
+        async with AsyncSessionLocal() as session:
+            # Check if account exists
+            account = await session.get(SimulationAccount, account_id)
+            if not account:
+                return False
+
+            # Delete related positions
+            await session.execute(select(SimulationPosition).where(SimulationPosition.account_id == account_id))
+            positions = await session.execute(
+                select(SimulationPosition).where(SimulationPosition.account_id == account_id)
+            )
+            for pos in positions.scalars():
+                await session.delete(pos)
+
+            # Delete related trades
+            trades = await session.execute(select(SimulationTrade).where(SimulationTrade.account_id == account_id))
+            for trade in trades.scalars():
+                await session.delete(trade)
+
+            # Delete the account
+            await session.delete(account)
+            await session.commit()
+
+            logger.info("Deleted simulation account", account_id=account_id, name=account.name)
+
+            return True
+
+    async def execute_opportunity(
+        self,
+        account_id: str,
+        opportunity: Opportunity,
+        position_size: Optional[float] = None,
+        copied_from: Optional[str] = None,
+        take_profit_price: Optional[float] = None,
+        stop_loss_price: Optional[float] = None,
+    ) -> SimulationTrade:
+        """Execute an arbitrage opportunity in simulation"""
+        async with AsyncSessionLocal() as session:
+            # Get account
+            account = await session.get(SimulationAccount, account_id)
+            if not account:
+                raise ValueError(f"Account not found: {account_id}")
+
+            # Calculate position size
+            if position_size is None:
+                max_size = account.current_capital * (account.max_position_size_pct / 100)
+                position_size = min(max_size, opportunity.max_position_size)
+
+            if position_size > account.current_capital:
+                raise ValueError(f"Insufficient capital: {account.current_capital} < {position_size}")
+
+            # Calculate total cost with slippage
+            base_cost = opportunity.total_cost * position_size
+            slippage = self._calculate_slippage(
+                account.slippage_model,
+                base_cost,
+                position_size,
+                opportunity.min_liquidity,
+                account.slippage_bps,
+            )
+            total_cost = base_cost + slippage
+
+            # Create trade record
+            trade = SimulationTrade(
+                id=str(uuid.uuid4()),
+                account_id=account_id,
+                opportunity_id=opportunity.id,
+                strategy_type=opportunity.strategy,
+                positions_data=opportunity.positions_to_take,
+                total_cost=total_cost,
+                expected_profit=opportunity.net_profit * position_size,
+                slippage=slippage,
+                status=TradeStatus.OPEN,
+                copied_from_wallet=copied_from,
+            )
+            session.add(trade)
+
+            # Create position records
+            for pos in opportunity.positions_to_take:
+                market_id = pos.get("market_id") or pos.get("market", "")
+                market_question = pos.get("market_question") or pos.get("question") or market_id
+                position = SimulationPosition(
+                    id=str(uuid.uuid4()),
+                    account_id=account_id,
+                    opportunity_id=opportunity.id,
+                    market_id=market_id,
+                    market_question=market_question,
+                    token_id=pos.get("token_id"),
+                    side=PositionSide.YES if pos.get("outcome") == "YES" else PositionSide.NO,
+                    quantity=position_size,
+                    entry_price=pos.get("price", 0),
+                    entry_cost=pos.get("price", 0) * position_size,
+                    take_profit_price=take_profit_price,
+                    stop_loss_price=stop_loss_price,
+                    resolution_date=opportunity.resolution_date,
+                    status=TradeStatus.OPEN,
+                )
+                session.add(position)
+
+            # Update account balance
+            account.current_capital -= total_cost
+            account.total_trades += 1
+
+            await session.commit()
+            await session.refresh(trade)
+
+            logger.info(
+                "Executed simulation trade",
+                account_id=account_id,
+                trade_id=trade.id,
+                opportunity_id=opportunity.id,
+                position_size=position_size,
+                total_cost=total_cost,
+                slippage=slippage,
+            )
+
+            return trade
+
+    async def record_orchestrator_shadow_fill(
+        self,
+        *,
+        account_id: str,
+        trader_id: str,
+        signal_id: str,
+        market_id: str,
+        market_question: Optional[str],
+        direction: str,
+        notional_usd: float,
+        entry_price: float,
+        strategy_type: Optional[str] = None,
+        token_id: Optional[str] = None,
+        payload: Optional[dict[str, Any]] = None,
+        execution_fee_usd: Optional[float] = None,
+        execution_slippage_usd: Optional[float] = None,
+        session: AsyncSession = None,
+        commit: bool = True,
+    ) -> dict[str, Any]:
+        """Record a shadow autotrader fill into simulation account ledger."""
+        async with contextlib.AsyncExitStack() as stack:
+            if session is None:
+                session = await stack.enter_async_context(AsyncSessionLocal())
+                commit = True
+
+            normalized_notional = float(notional_usd or 0.0)
+            normalized_entry_price = float(entry_price or 0.0)
+            normalized_entry_fee = max(0.0, float(execution_fee_usd or 0.0))
+            normalized_entry_slippage = max(0.0, float(execution_slippage_usd or 0.0))
+            if normalized_notional <= 0:
+                raise ValueError("Shadow fill notional must be greater than 0.")
+            if normalized_entry_price <= 0:
+                raise ValueError("Shadow fill entry price must be greater than 0.")
+
+            account = await session.get(SimulationAccount, account_id)
+            if account is None:
+                raise ValueError(f"Shadow account not found: {account_id}")
+
+            required_capital = normalized_notional + normalized_entry_fee
+            available_capital = float(account.current_capital or 0.0)
+            if required_capital > available_capital:
+                raise ValueError(
+                    (
+                        "Insufficient shadow capital for autotrader fill: "
+                        f"required=${required_capital:.2f} available=${available_capital:.2f}"
+                    )
+                )
+
+            simulator_payload: dict[str, Any] = {}
+            if isinstance(payload, dict):
+                simulator_payload.update(payload)
+            if token_id and "token_id" not in simulator_payload:
+                simulator_payload["token_id"] = token_id
+            side, outcome = self._direction_to_position_side(direction, simulator_payload)
+            quantity = normalized_notional / normalized_entry_price
+            now = utcnow()
+            trade_id = str(uuid.uuid4())
+            position_id = str(uuid.uuid4())
+            market_id_value = str(market_id or "").strip()
+            question_value = str(market_question or market_id_value or "Unknown market")
+
+            position_payload = {
+                "market_id": market_id_value,
+                "market_question": question_value,
+                "token_id": token_id,
+                "outcome": outcome,
+                "price": normalized_entry_price,
+                "quantity": quantity,
+                "notional_usd": normalized_notional,
+                "entry_fee_usd": normalized_entry_fee,
+                "entry_slippage_usd": normalized_entry_slippage,
+                "source": "trader_orchestrator",
+                "trader_id": str(trader_id or ""),
+                "signal_id": str(signal_id or ""),
+            }
+            if isinstance(payload, dict):
+                position_payload["payload"] = payload
+            edge_percent = 0.0
+            if isinstance(payload, dict):
+                try:
+                    edge_percent = float(payload.get("edge_percent") or 0.0)
+                except Exception:
+                    edge_percent = 0.0
+
+            trade = SimulationTrade(
+                id=trade_id,
+                account_id=account_id,
+                opportunity_id=str(signal_id or ""),
+                strategy_type=str(strategy_type or "trader_orchestrator"),
+                positions_data=[position_payload],
+                total_cost=required_capital,
+                expected_profit=normalized_notional * (edge_percent / 100.0),
+                slippage=normalized_entry_slippage,
+                status=TradeStatus.OPEN,
+                copied_from_wallet=None,
+                fees_paid=normalized_entry_fee,
+                executed_at=now,
+            )
+            session.add(trade)
+
+            position = SimulationPosition(
+                id=position_id,
+                account_id=account_id,
+                opportunity_id=str(signal_id or ""),
+                market_id=market_id_value,
+                market_question=question_value,
+                token_id=token_id,
+                side=side,
+                quantity=quantity,
+                entry_price=normalized_entry_price,
+                entry_cost=required_capital,
+                current_price=normalized_entry_price,
+                unrealized_pnl=0.0,
+                status=TradeStatus.OPEN,
+                opened_at=now,
+            )
+            session.add(position)
+
+            account.current_capital = float(account.current_capital or 0.0) - required_capital
+            account.total_trades = int(account.total_trades or 0) + 1
+
+            if commit:
+                await session.commit()
+            else:
+                await session.flush()
+
+            return {
+                "account_id": account_id,
+                "trade_id": trade_id,
+                "position_id": position_id,
+                "market_id": market_id_value,
+                "direction": str(direction or ""),
+                "entry_price": normalized_entry_price,
+                "entry_notional_usd": normalized_notional,
+                "entry_fee_usd": normalized_entry_fee,
+                "entry_slippage_usd": normalized_entry_slippage,
+                "entry_cost": required_capital,
+                "quantity": quantity,
+                "opened_at": now.isoformat() + "Z",
+            }
+
+    async def close_orchestrator_shadow_fill(
+        self,
+        *,
+        account_id: str,
+        trade_id: str,
+        position_id: str,
+        close_price: float,
+        close_trigger: Optional[str] = None,
+        price_source: Optional[str] = None,
+        reason: Optional[str] = None,
+        close_fee_usd: Optional[float] = None,
+        session: AsyncSession = None,
+        commit: bool = True,
+    ) -> dict[str, Any]:
+        """Resolve an orchestrator-shadow simulation fill at a provided close mark."""
+        async with contextlib.AsyncExitStack() as stack:
+            if session is None:
+                session = await stack.enter_async_context(AsyncSessionLocal())
+                commit = True
+
+            normalized_close_price = max(0.0, float(close_price or 0.0))
+
+            account = await session.get(SimulationAccount, account_id)
+            if account is None:
+                raise ValueError(f"Shadow account not found: {account_id}")
+
+            trade = await session.get(SimulationTrade, trade_id)
+            if trade is None or str(trade.account_id) != str(account_id):
+                raise ValueError(f"Simulation trade not found for account: {trade_id}")
+
+            position = await session.get(SimulationPosition, position_id)
+            if position is None or str(position.account_id) != str(account_id):
+                raise ValueError(f"Simulation position not found for account: {position_id}")
+
+            if trade.status != TradeStatus.OPEN:
+                return {
+                    "closed": False,
+                    "already_closed": True,
+                    "trade_status": trade.status.value,
+                    "actual_payout": float(trade.actual_payout or 0.0),
+                    "actual_pnl": float(trade.actual_pnl or 0.0),
+                    "fees_paid": float(trade.fees_paid or 0.0),
+                    "resolved_at": trade.resolved_at.isoformat() + "Z" if trade.resolved_at else None,
+                }
+
+            entry_cost = float(position.entry_cost or trade.total_cost or 0.0)
+            gross_proceeds = float(position.quantity or 0.0) * normalized_close_price
+            gross_pnl = gross_proceeds - entry_cost
+            explicit_close_fee = max(0.0, float(close_fee_usd or 0.0))
+            winner_fee = max(0.0, gross_pnl) * self.POLYMARKET_FEE
+            total_close_fee = explicit_close_fee + winner_fee
+            proceeds = max(0.0, gross_proceeds - total_close_fee)
+            pnl = proceeds - entry_cost
+            close_trigger_key = str(close_trigger or "").strip().lower()
+            is_resolution = close_trigger_key in {"resolution", "resolution_inferred"}
+            terminal_status = (
+                TradeStatus.RESOLVED_WIN
+                if is_resolution and pnl >= 0
+                else TradeStatus.RESOLVED_LOSS
+                if is_resolution
+                else TradeStatus.CLOSED_WIN
+                if pnl >= 0
+                else TradeStatus.CLOSED_LOSS
+            )
+            now = utcnow()
+            prior_fees_paid = float(trade.fees_paid or 0.0)
+            total_fees_paid = prior_fees_paid + total_close_fee
+
+            trade.status = terminal_status
+            trade.actual_payout = proceeds
+            trade.actual_pnl = pnl
+            trade.fees_paid = total_fees_paid
+            trade.resolved_at = now
+
+            positions_data = trade.positions_data if isinstance(trade.positions_data, list) else []
+            if positions_data and isinstance(positions_data[0], dict):
+                first_leg = dict(positions_data[0])
+                first_leg.update(
+                    {
+                        "close_price": normalized_close_price,
+                        "close_trigger": str(close_trigger or ""),
+                        "price_source": str(price_source or ""),
+                        "gross_payout": gross_proceeds,
+                        "gross_pnl": gross_pnl,
+                        "winner_fee_usd": winner_fee,
+                        "close_fee_usd": explicit_close_fee,
+                        "total_close_fee_usd": total_close_fee,
+                        "realized_pnl": pnl,
+                        "resolved_at": now.isoformat() + "Z",
+                    }
+                )
+                positions_data[0] = first_leg
+                trade.positions_data = positions_data
+
+            position.status = terminal_status
+            position.current_price = normalized_close_price
+            position.unrealized_pnl = 0.0
+
+            account.current_capital = float(account.current_capital or 0.0) + proceeds
+            account.total_pnl = float(account.total_pnl or 0.0) + pnl
+            if pnl >= 0:
+                account.winning_trades = int(account.winning_trades or 0) + 1
+            else:
+                account.losing_trades = int(account.losing_trades or 0) + 1
+
+            if commit:
+                await session.commit()
+            else:
+                await session.flush()
+
+            return {
+                "closed": True,
+                "already_closed": False,
+                "trade_status": terminal_status.value,
+                "actual_payout": proceeds,
+                "actual_pnl": pnl,
+                "gross_payout_usd": gross_proceeds,
+                "gross_pnl_usd": gross_pnl,
+                "winner_fee_usd": winner_fee,
+                "close_fee_usd": explicit_close_fee,
+                "fees_paid": total_fees_paid,
+                "close_price": normalized_close_price,
+                "close_trigger": str(close_trigger or ""),
+                "price_source": str(price_source or ""),
+                "reason": str(reason or ""),
+                "resolved_at": now.isoformat() + "Z",
+            }
+
+    async def resolve_trade(
+        self,
+        trade_id: str,
+        winning_outcome: str,  # Which outcome won
+        session: AsyncSession = None,
+    ) -> SimulationTrade:
+        """Resolve a trade when market settles"""
+        async with contextlib.AsyncExitStack() as stack:
+            if session is None:
+                session = await stack.enter_async_context(AsyncSessionLocal())
+
+            trade = await session.get(SimulationTrade, trade_id)
+            if not trade:
+                raise ValueError(f"Trade not found: {trade_id}")
+
+            if trade.status != TradeStatus.OPEN:
+                raise ValueError(f"Trade already resolved: {trade.status}")
+
+            account = await session.get(SimulationAccount, trade.account_id)
+
+            # Calculate payout
+            payout = 0.0
+            for pos in trade.positions_data:
+                if pos.get("outcome") == winning_outcome:
+                    # This position won
+                    payout += 1.0 * (trade.total_cost / len(trade.positions_data))
+
+            # Apply fee on winnings
+            fee = payout * self.POLYMARKET_FEE if payout > 0 else 0
+            net_payout = payout - fee
+
+            # Calculate PnL
+            pnl = net_payout - trade.total_cost
+            is_win = pnl > 0
+
+            # Update trade
+            trade.status = TradeStatus.RESOLVED_WIN if is_win else TradeStatus.RESOLVED_LOSS
+            trade.actual_payout = net_payout
+            trade.actual_pnl = pnl
+            trade.fees_paid = fee
+            trade.resolved_at = utcnow()
+
+            # Update account
+            account.current_capital += net_payout
+            account.total_pnl += pnl
+            if is_win:
+                account.winning_trades += 1
+            else:
+                account.losing_trades += 1
+
+            # Close positions
+            positions = await session.execute(
+                select(SimulationPosition).where(SimulationPosition.opportunity_id == trade.opportunity_id)
+            )
+            for pos in positions.scalars():
+                pos.status = TradeStatus.RESOLVED_WIN if is_win else TradeStatus.RESOLVED_LOSS
+
+            await session.commit()
+            await session.refresh(trade)
+
+            logger.info(
+                "Resolved simulation trade",
+                trade_id=trade_id,
+                winning_outcome=winning_outcome,
+                payout=net_payout,
+                pnl=pnl,
+                is_win=is_win,
+            )
+
+            return trade
+
+    async def get_open_positions(self, account_id: str) -> list[SimulationPosition]:
+        """Get all open positions for an account"""
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                select(SimulationPosition).where(
+                    SimulationPosition.account_id == account_id,
+                    SimulationPosition.status == TradeStatus.OPEN,
+                )
+            )
+            return list(result.scalars().all())
+
+    async def get_trade_history(self, account_id: str, limit: int = 100) -> list[SimulationTrade]:
+        """Get trade history for an account"""
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                select(SimulationTrade)
+                .where(SimulationTrade.account_id == account_id)
+                .order_by(SimulationTrade.executed_at.desc())
+                .limit(limit)
+            )
+            return list(result.scalars().all())
+
+    async def get_account_stats(self, account_id: str) -> dict:
+        """Get comprehensive stats for an account"""
+        async with AsyncSessionLocal() as session:
+            account = await session.get(SimulationAccount, account_id)
+            if not account:
+                return None
+
+            # Calculate additional stats
+            win_rate = account.winning_trades / account.total_trades * 100 if account.total_trades > 0 else 0
+            roi = (account.current_capital - account.initial_capital) / account.initial_capital * 100
+
+            # Get open positions count
+            positions = await self.get_open_positions(account_id)
+
+            return {
+                "account_id": account.id,
+                "name": account.name,
+                "initial_capital": account.initial_capital,
+                "current_capital": account.current_capital,
+                "total_pnl": account.total_pnl,
+                "roi_percent": roi,
+                "total_trades": account.total_trades,
+                "winning_trades": account.winning_trades,
+                "losing_trades": account.losing_trades,
+                "win_rate": win_rate,
+                "open_positions": len(positions),
+                "max_positions": account.max_open_positions,
+                "created_at": account.created_at.isoformat(),
+            }
+
+    def _calculate_slippage(
+        self,
+        model: str,
+        base_cost: float,
+        size: float,
+        liquidity: float,
+        slippage_bps: float,
+    ) -> float:
+        """Calculate slippage based on model"""
+        if liquidity <= 0:
+            liquidity = 10000  # Default if unknown
+
+        if model == "linear":
+            factor = 1 + (size / liquidity) * slippage_bps / 10000
+        elif model == "sqrt":
+            factor = 1 + (size / liquidity) ** 0.5 * slippage_bps / 10000
+        else:  # fixed
+            factor = 1 + slippage_bps / 10000
+
+        return base_cost * (factor - 1)
+
+
+# Singleton instance
+simulation_service = SimulationService()

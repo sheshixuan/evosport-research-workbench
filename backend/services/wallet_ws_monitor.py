@@ -1,0 +1,2079 @@
+"""
+Real-time WebSocket-based wallet monitoring for copy trading.
+
+Connects to Polygon WebSocket RPC to subscribe to new blocks and detect
+``OrderFilled`` events from the Polymarket CLOB V2 exchange contracts
+in near real-time (<1 second latency vs 30-second polling).
+
+Polymarket cut over from CLOB V1 to V2 on 2026-04-28; this module
+targets the V2 contracts only — V1 addresses and the V1
+``OrderFilled`` topic emit zero events on Polygon since the cutover
+and are not retained as a fallback (clean-cut migration, plan 0039).
+"""
+
+import asyncio
+import json
+import time
+import uuid
+from contextlib import suppress
+from dataclasses import dataclass
+from datetime import datetime
+from utils.utcnow import utcnow, utcfromtimestamp
+from typing import Callable, Optional
+
+import httpx
+
+try:
+    import websockets
+except ImportError:
+    websockets = None  # type: ignore[assignment]
+
+from sqlalchemy import Column, String, Float, Integer, Index
+
+from config import settings
+from models.database import Base, AsyncSessionLocal, DateTime
+from services.live_pressure import maybe_mark_db_pressure
+from services.shared_state import _commit_with_retry
+from utils.logger import get_logger
+
+logger = get_logger("wallet_ws_monitor")
+
+# ==================== CONSTANTS ====================
+
+# Polymarket CLOB V2 exchange contracts on Polygon (chain_id=137) that
+# emit the V2 ``OrderFilled`` event. Sourced from
+# ``py_clob_client_v2.config.get_contract_config(137)`` and pinned at
+# import time below. Renaming the symbol off the legacy ``CTF_*`` form
+# is intentional — a future ``git grep`` for the V1 constants must
+# return zero hits in this module.
+POLYMARKET_EXCHANGE_ADDRESSES_V2 = (
+    "0xE111180000d2663C0091e4f400237545B87B996B",  # CTF Exchange V2
+    "0xe2222d279d744050d28e00520010520000310F59",  # Neg Risk CTF Exchange V2
+)
+POLYMARKET_EXCHANGE_ADDRESS_SET_V2 = {
+    address.lower() for address in POLYMARKET_EXCHANGE_ADDRESSES_V2
+}
+
+# OrderFilled(bytes32 indexed orderHash, address indexed maker,
+#             address indexed taker, uint8 side, uint256 tokenId,
+#             uint256 makerAmountFilled, uint256 takerAmountFilled,
+#             uint256 fee, bytes32 builder, bytes32 metadata)
+# keccak256 of the canonical V2 signature. Verified live 2026-05-10:
+# 30-block window on V2 exchanges yields ~3 977 OrderFilled logs
+# (3 084 from CTF V2 + 893 from Neg Risk V2). The V1 topic
+# (0xd0a08e8c…) is fully deprecated and emits zero events.
+ORDER_FILLED_TOPIC = (
+    "0xd543adfd945773f1a62f74f0ee55a5e3b9b1a28262980ba90b1a89f2ea84d8ee"
+)
+
+# Default Polygon WebSocket RPC endpoint
+DEFAULT_WS_URL = settings.POLYGON_WS_URL
+
+# Default HTTP RPC fallback endpoint
+DEFAULT_HTTP_RPC_URL = settings.POLYGON_RPC_URL
+
+DEFAULT_PUBLIC_HTTP_RPC_URL = "https://polygon-bor-rpc.publicnode.com"
+
+# Fallback RPC endpoints (tried in order after the configured primary).
+# Multiple no-auth public Polygon endpoints — eth_getLogs is supported on
+# all of them.  The 5/2026/05 10h soak showed the previous single-fallback
+# config produced 100 RPC failures (52 warnings + 48 ERROR-level "failed
+# across all endpoints") under transient publicnode.com ReadTimeouts.
+# A diverse pool eliminates the single-endpoint SPOF.  Order matters: the
+# loop in ``_rpc_request`` tries them in sequence until one succeeds, and
+# the first successful endpoint is promoted to ``_http_rpc_url`` for the
+# next call (see ``Wallet monitor RPC failover`` log message).
+FALLBACK_HTTP_RPC_URLS = (
+    DEFAULT_PUBLIC_HTTP_RPC_URL,           # publicnode (current primary)
+    "https://polygon-rpc.com",              # Polygon Foundation official
+    "https://polygon.llamarpc.com",         # LlamaNodes
+    "https://1rpc.io/matic",                # 1RPC (no-auth tier)
+)
+
+DEFAULT_HTTP_TIMEOUT = httpx.Timeout(connect=5.0, read=12.0, write=10.0, pool=8.0)
+RPC_ATTEMPTS_PER_ENDPOINT = 2
+
+# 2026-05-05: per-endpoint 429 cooldowns. Quiknode and other free-tier
+# providers rate-limit to ~25 req/s; bursts return 429 and the endpoint
+# stays brittle for the rest of the rate-limit window. Cooldown an
+# endpoint after the FIRST 429 so the round-robin skips it instead of
+# hammering, and back off exponentially per consecutive 429.
+_RPC_ENDPOINT_COOLDOWN_BASE_SECONDS = 30.0  # First 429 → 30s skip
+_RPC_ENDPOINT_COOLDOWN_MAX_SECONDS = 600.0  # Cap at 10 minutes
+_RPC_429_RETRY_AFTER_FALLBACK_SECONDS = 60.0  # If Retry-After header missing
+
+# 2026-05-07: eviction TTL for transient failures. Without this, a fallback
+# endpoint that times out 5 times in a row (consecutive-failure threshold)
+# stays evicted for the lifetime of the process — observed in scanner soak
+# logs as the "endpoints=['publicnode']" single-element error after fallbacks
+# silently dropped during a brief network blip. Re-include evicted endpoints
+# after this window to give them a chance to recover. Permanent evictions
+# (auth required / method-not-supported / 400 Bad Request on eth_getLogs)
+# pass ``permanent=True`` and stay out forever.
+_RPC_EVICTION_RETRY_AFTER_SECONDS = 1800.0  # 30 min
+
+# Coalesce on-chain OrderFilled scans into ONE ranged eth_getLogs at most this
+# often, instead of one call per Polygon block (~2s ⇒ ~30 calls/min — the
+# dominant RPC credit burn). The CLOB user-WS is the primary fill signal; this
+# on-chain scan is a reconciliation backstop, so a few seconds of coalescing
+# latency is fine and cuts the call volume (and provider credit spend) ~7x.
+_BLOCK_QUERY_INTERVAL_SECONDS = 15.0
+# Cap blocks per ranged getLogs so a long WS gap can't request an unbounded span
+# (eth_getLogs result-size limits); older gaps are the reconciliation backstop's
+# job, not this scan's.
+_MAX_BLOCK_QUERY_SPAN = 500
+
+
+# ==================== DATA MODEL ====================
+
+
+@dataclass
+class WalletTradeEvent:
+    """Represents a trade detected for a tracked wallet.
+
+    Two detection paths can produce this event:
+
+    - **on-chain** (WalletWebSocketMonitor): canonical. Polygon RPC
+      ``OrdersFilled`` event. Sets ``confirmed=True``.
+    - **RTDS** (services.wallet_rtds_feed): preliminary fast-path. Reads
+      the Polymarket activity firehose ~1-3s ahead of block confirmation.
+      Sets ``confirmed=False``. Does not persist to the DB — the on-chain
+      path is the system of record.
+    """
+
+    wallet_address: str
+    token_id: str
+    side: str  # BUY or SELL
+    size: float
+    price: float
+    tx_hash: str
+    order_hash: str
+    log_index: int
+    block_number: int
+    timestamp: datetime
+    detected_at: datetime  # When we detected it
+    latency_ms: float  # Detection latency
+    # ``True`` when the event came from on-chain RPC (system of record).
+    # ``False`` for preliminary RTDS detections — frontends should render
+    # these as "pending" and rely on the on-chain follow-up to confirm.
+    confirmed: bool = True
+    # ``"onchain"`` or ``"rtds"``. Lets downstream consumers branch on
+    # source without re-deriving from ``confirmed``.
+    source: str = "onchain"
+    # CLOB V2 ``OrderFilled`` carries two new ``bytes32`` fields beyond
+    # the V1 ABI: ``builder`` (referral / API-key tag the order was
+    # submitted under) and ``metadata`` (caller-supplied free-form
+    # context). Stored as ``"0x"``-prefixed lowercase hex for now; no
+    # downstream consumer interprets them yet — they are kept on the
+    # event so a future referral-attribution feature does not need a
+    # pipeline-wide schema change. Defaults are the all-zero word
+    # because RTDS-source events do not carry these fields at all.
+    builder: str = "0x" + "0" * 64
+    metadata: str = "0x" + "0" * 64
+
+
+# ==================== SQLALCHEMY MODEL ====================
+
+
+class WalletMonitorEvent(Base):
+    """Persisted record of a wallet trade event detected via WebSocket monitoring."""
+
+    __tablename__ = "wallet_monitor_events"
+
+    id = Column(String, primary_key=True)
+    wallet_address = Column(String, nullable=False, index=True)
+    token_id = Column(String, nullable=True)
+    side = Column(String, nullable=True)
+    size = Column(Float, nullable=True)
+    price = Column(Float, nullable=True)
+    tx_hash = Column(String, nullable=True)
+    order_hash = Column(String, nullable=True)
+    log_index = Column(Integer, nullable=True)
+    block_number = Column(Integer, nullable=True)
+    detection_latency_ms = Column(Float, nullable=True)
+    detected_at = Column(DateTime, default=utcnow)
+
+    __table_args__ = (
+        Index("idx_wme_wallet", "wallet_address"),
+        Index("idx_wme_block", "block_number"),
+        Index("idx_wme_tx_hash", "tx_hash"),
+        Index("idx_wme_order_hash", "order_hash"),
+        Index("idx_wme_tx_log", "tx_hash", "log_index"),
+    )
+
+
+# ==================== HELPERS ====================
+
+
+def _decode_uint256(hex_str: str) -> int:
+    """Decode a 256-bit unsigned integer from a hex-encoded ABI word."""
+    return int(hex_str, 16)
+
+
+def _exception_text(exc: Exception) -> str:
+    """Return a non-empty exception string for structured logging."""
+    text = str(exc).strip()
+    return text if text else repr(exc)
+
+
+def _should_reset_http_client(exc: Exception) -> bool:
+    return isinstance(
+        exc,
+        (
+            httpx.ConnectError,
+            httpx.ConnectTimeout,
+            httpx.ReadTimeout,
+            httpx.WriteTimeout,
+            httpx.RemoteProtocolError,
+            httpx.ReadError,
+            httpx.WriteError,
+            httpx.CloseError,
+            httpx.NetworkError,
+            httpx.PoolTimeout,
+        ),
+    )
+
+
+def _build_rpc_candidates(primary_url: str, *, excluded_urls: Optional[set[str]] = None) -> list[str]:
+    """Build de-duplicated RPC endpoints in failover order."""
+    excluded = {
+        normalized
+        for normalized in (_normalize_rpc_http_url(url) for url in (excluded_urls or set()))
+        if normalized
+    }
+    urls: list[str] = []
+    for raw_url in (primary_url, *FALLBACK_HTTP_RPC_URLS):
+        url = _normalize_rpc_http_url(raw_url)
+        if url and url not in excluded and url not in urls:
+            urls.append(url)
+    return urls
+
+
+def _rpc_error_text(error: object) -> str:
+    if isinstance(error, dict):
+        message = str(error.get("message") or "").strip()
+        if message:
+            return message.lower()
+    text = str(error or "").strip()
+    return text.lower()
+
+
+def _rpc_error_requires_auth(error: object) -> bool:
+    text = _rpc_error_text(error)
+    return any(marker in text for marker in ("unauthorized", "api key", "authenticate your request"))
+
+
+def _rpc_error_indicates_unsupported_logs_query(error: object) -> bool:
+    text = _rpc_error_text(error)
+    return (
+        "eth_getlogs" in text
+        and ("unsupported" in text or "not supported" in text or "method not found" in text)
+    )
+
+
+def _rpc_error_indicates_logs_block_not_ready(error: object) -> bool:
+    return "invalid block range params" in _rpc_error_text(error)
+
+
+def _mask_rpc_url(raw_url: object) -> str:
+    """Mask URL-path API keys for log output.
+
+    Many Polygon RPC providers (Ankr, Alchemy, QuickNode tier-2) embed
+    the API key directly in the URL path:
+    ``https://rpc.ankr.com/polygon/<32-hex-key>``. Logging the URL
+    verbatim would leak the key into operator output. Replace any path
+    segment longer than 16 chars (typical key length) with ``***``.
+    """
+    text = str(raw_url or "").strip()
+    if not text:
+        return ""
+    try:
+        from urllib.parse import urlsplit, urlunsplit
+        parts = urlsplit(text)
+        if not parts.path:
+            return text
+        masked_segments = []
+        for segment in parts.path.split("/"):
+            if len(segment) >= 16 and segment.replace("-", "").replace("_", "").isalnum():
+                masked_segments.append("***")
+            else:
+                masked_segments.append(segment)
+        return urlunsplit((parts.scheme, parts.netloc, "/".join(masked_segments), parts.query, parts.fragment))
+    except Exception:
+        # Fall back to a host-only mask on any parse error.
+        return text.split("?", 1)[0]
+
+
+def _normalize_rpc_http_url(raw_url: object) -> str:
+    text = str(raw_url or "").strip()
+    if not text:
+        return ""
+    lowered = text.lower()
+    if lowered.startswith("wss://"):
+        return "https://" + text[6:]
+    if lowered.startswith("ws://"):
+        return "http://" + text[5:]
+    if lowered.startswith("https://") or lowered.startswith("http://"):
+        return text
+    if "://" not in text:
+        return "https://" + text
+    return ""
+
+
+def _decode_address_from_topic(topic_hex: str) -> str:
+    """Extract an Ethereum address from a 32-byte ABI-encoded topic.
+
+    Addresses are left-padded with zeros in indexed event topics.
+    """
+    # Last 40 hex chars (20 bytes) represent the address
+    clean = topic_hex.lower().replace("0x", "")
+    return "0x" + clean[-40:]
+
+
+# Polymarket CLOB V2 ``Side`` enum (from ``ctf-exchange-v2/src/exchange/
+# interfaces/ITrading.sol``): the byte stored in ``OrderFilled.side``
+# describes the **maker order's** side. ``BUY=0`` means the maker is
+# buying outcome tokens (paying USDC, receiving ``tokenId``); ``SELL=1``
+# means the maker is selling outcome tokens (giving ``tokenId``,
+# receiving USDC).
+_V2_SIDE_BUY = 0
+_V2_SIDE_SELL = 1
+
+
+def _parse_order_filled_log(log: dict) -> Optional[dict]:
+    """Parse a Polymarket CLOB V2 ``OrderFilled`` event log.
+
+    V2 ABI layout (verified live 2026-05-10 against
+    ``0xE111…996B`` and ``0xe222…0F59``)::
+
+        topic[0]:  keccak256(OrderFilled(...))   = 0xd543adfd…d8ee
+        topic[1]:  orderHash         (bytes32, indexed)
+        topic[2]:  maker             (address, indexed)
+        topic[3]:  taker             (address, indexed)
+
+        data[0]:   side              (uint8, ABI-padded to 32 bytes)
+        data[1]:   tokenId           (uint256)
+        data[2]:   makerAmountFilled (uint256)
+        data[3]:   takerAmountFilled (uint256)
+        data[4]:   fee               (uint256)
+        data[5]:   builder           (bytes32)
+        data[6]:   metadata          (bytes32)
+
+    Returns ``None`` for any log that does not match the V2 shape
+    exactly. The V1 layouts (4t+5w "indexed-address" and 2t+7w
+    "non-indexed-address") are not retained — V1 contracts emit zero
+    events on Polygon since the 2026-04-28 cutover, so accepting
+    them would be dead code per the project's clean-cut migration
+    policy (plan 0039).
+    """
+    topics = log.get("topics", [])
+    data = log.get("data", "0x")
+    data_hex = data[2:] if data.startswith("0x") else data
+
+    if len(topics) < 4 or len(data_hex) < 64 * 7:
+        return None
+
+    words = [data_hex[i * 64 : (i + 1) * 64] for i in range(7)]
+
+    # ``side`` is a uint8 stored in a 32-byte word — the byte sits in
+    # the low bit, so ``& 0xff`` strips the ABI zero-padding and gives
+    # us ``0`` (BUY) or ``1`` (SELL).
+    side_byte = _decode_uint256(words[0]) & 0xFF
+
+    return {
+        "order_hash": topics[1],
+        "maker": _decode_address_from_topic(topics[2]),
+        "taker": _decode_address_from_topic(topics[3]),
+        "side": side_byte,
+        "token_id": str(_decode_uint256(words[1])),
+        "maker_amount_filled": _decode_uint256(words[2]),
+        "taker_amount_filled": _decode_uint256(words[3]),
+        "fee": _decode_uint256(words[4]),
+        "builder": "0x" + words[5],
+        "metadata": "0x" + words[6],
+    }
+
+
+def _determine_trade_side_and_details(parsed: dict, wallet_address: str) -> tuple[str, str, float, float]:
+    """Map a parsed V2 ``OrderFilled`` to ``(side, token_id, size, price)``
+    from the **leader wallet's** point of view.
+
+    V2 makes this almost trivial compared to V1: the log carries
+    ``side: uint8`` directly (the maker order's side per the
+    ``Side`` enum — ``0=BUY``, ``1=SELL``), and ``tokenId`` is always
+    the outcome token. USDC.e (``0x2791bca1f2de4661ed88a30c99a7a9449aa84174``,
+    6 decimals) is the implicit collateral leg — there is no
+    ``makerAssetId``/``takerAssetId`` USDC-vs-token disambiguation
+    trick, no asset-id 0 sentinel.
+
+    Semantics:
+
+    - ``makerAmountFilled`` / ``takerAmountFilled`` are denominated by
+      the maker order's intent. For ``side=BUY`` the maker pays USDC
+      (``makerAmountFilled`` is USDC) and receives outcome tokens
+      (``takerAmountFilled`` is tokens). For ``side=SELL`` the
+      direction is mirrored.
+    - When the leader wallet is the **maker**, their effective side
+      equals the log's ``side`` byte.
+    - When the leader is the **taker**, their effective side is the
+      logical inverse — they take liquidity against the maker's
+      order.
+
+    Both legs use 6-decimal scaling (Polymarket outcome tokens are
+    minted 1:1 against USDC.e, so the scaling matches).
+
+    Returns ``("", "", 0.0, 0.0)`` if the wallet is neither maker
+    nor taker (defensive — caller should already have filtered).
+    """
+    def _ratio(numerator: float, denominator: float) -> float:
+        if denominator <= 0.0:
+            return 0.0
+        return numerator / denominator
+
+    wallet_lower = wallet_address.lower()
+    maker_lower = parsed["maker"].lower()
+    taker_lower = parsed["taker"].lower()
+
+    log_side = int(parsed.get("side", -1))
+    token_id = str(parsed.get("token_id") or "")
+
+    maker_amount = parsed["maker_amount_filled"] / 1e6
+    taker_amount = parsed["taker_amount_filled"] / 1e6
+
+    # Outcome-token volume and the USDC counterparty volume are the
+    # same in either direction; only the assignment flips on side.
+    if log_side == _V2_SIDE_BUY:
+        # Maker bought tokens: maker paid USDC, received tokens.
+        outcome_size = taker_amount
+        usdc_size = maker_amount
+    elif log_side == _V2_SIDE_SELL:
+        # Maker sold tokens: maker received USDC, gave tokens.
+        outcome_size = maker_amount
+        usdc_size = taker_amount
+    else:
+        return "", "", 0.0, 0.0
+
+    price = _ratio(usdc_size, outcome_size)
+
+    if wallet_lower == maker_lower:
+        # Leader is the maker → leader's side == log's maker-side.
+        leader_side = "BUY" if log_side == _V2_SIDE_BUY else "SELL"
+    elif wallet_lower == taker_lower:
+        # Leader is the taker → opposite of the maker's side.
+        leader_side = "SELL" if log_side == _V2_SIDE_BUY else "BUY"
+    else:
+        return "", "", 0.0, 0.0
+
+    return leader_side, token_id, max(0.0, outcome_size), max(0.0, price)
+
+
+# ==================== MONITOR SERVICE ====================
+
+
+class WalletWebSocketMonitor:
+    """Real-time wallet monitoring via Polygon WebSocket RPC.
+
+    Subscribes to new block headers and, for each block, queries
+    OrdersFilled event logs from the Polymarket CTF Exchange contract,
+    filtering for tracked wallet addresses. Detected trades are emitted
+    via registered callbacks and persisted to the database.
+
+    Falls back to HTTP polling if the WebSocket connection drops, with
+    exponential backoff for reconnection attempts.
+    """
+
+    def __init__(self):
+        self._running: bool = False
+        # address -> set of logical sources that requested tracking
+        # (e.g. discovery_pool, traders_scope)
+        self._tracked_sources: dict[str, set[str]] = {}
+        self._callbacks: list[Callable] = []
+        self._ws_url: str = DEFAULT_WS_URL
+        self._http_rpc_url: str = _normalize_rpc_http_url(DEFAULT_HTTP_RPC_URL) or DEFAULT_PUBLIC_HTTP_RPC_URL
+        # Permanent eviction set (auth/method/400 errors — never auto-revive).
+        self._evicted_rpc_urls: set[str] = set()
+        # Transient eviction map: URL → monotonic deadline when eviction expires.
+        # Used for consecutive-failure evictions; cleared on
+        # ``_active_evicted_urls`` access if past the deadline.
+        self._evicted_rpc_urls_until: dict[str, float] = {}
+        self._rpc_urls: list[str] = _build_rpc_candidates(
+            self._http_rpc_url,
+            excluded_urls=self._active_evicted_urls(),
+        )
+        self._reconnect_delay: int = 5
+        self._max_reconnect_delay: int = 60
+        self._ws_connection = None
+        self._last_processed_block: Optional[int] = None
+        self._poll_fallback_task: Optional[asyncio.Task] = None
+        self._ws_task: Optional[asyncio.Task] = None
+        self._mempool_mode = False  # Enable for pre-confirmation (<1s) latency
+        self._rpc_failure_streak: int = 0
+        self._rpc_backoff_until: float = 0.0
+        self._rpc_backoff_base_seconds: float = 2.0
+        # 2026-05-08: raised from 30s → 120s. With the cap at 30s, a persistently
+        # timing-out endpoint (observed: polygon-bor-rpc.publicnode.com during
+        # soak) was retried every 30s even after the failure streak saturated
+        # the cap, producing ~60 WARNING log lines per 90-minute window for the
+        # same underlying condition. 120s gives the endpoint real recovery time
+        # while still bounding the WS-fallback catch-up window.
+        self._rpc_backoff_max_seconds: float = 120.0
+        self._max_block_failures_before_skip: int = 5
+        self._block_failure_counts: dict[int, int] = {}
+        self._rpc_last_endpoint_failure_log_at: float = 0.0
+        self._rpc_endpoint_failure_log_interval_seconds: float = 10.0
+        self._rpc_last_total_failure_log_at: float = 0.0
+        self._rpc_total_failure_log_interval_seconds: float = 30.0
+        # 2026-05-09: re-read polygon_rpc_url / polygon_ws_url from
+        # AppSettings on RPC-exhaustion paths so a SettingsPanel update
+        # takes effect without a backend restart. Throttled to one
+        # re-read per 60s so an actually-broken provider list doesn't
+        # hammer the AppSettings table on every failed eth_getLogs call.
+        # The 2026-05-09 soak showed an hour of every-1-3-min
+        # ``RPC failed across all endpoints`` while the configured
+        # Ankr URL was being entered in the UI but never picked up.
+        self._rpc_endpoints_db_reload_at: float = 0.0
+        self._rpc_endpoints_db_reload_interval_seconds: float = 60.0
+        # 2026-05-23: the operator-configured primary (AppSettings
+        # polygon_rpc_url) must not stay permanently evicted forever. A
+        # hard 403/auth error (e.g. Ankr "API key disabled" while billing/
+        # credits are sorted out) evicts it permanently; thereafter the
+        # 60s DB reload only revives it if the URL *changes*, so a
+        # re-enabled key never recovers without a restart and the bot
+        # silently runs on free public endpoints. We (1) alert loudly when
+        # the configured primary is evicted, and (2) periodically re-probe
+        # it so it rejoins rotation on its own once it's healthy again.
+        self._configured_primary_rpc_url: str = ""
+        self._configured_primary_reprobe_at: float = 0.0
+        # Faster recovery: re-probe the evicted primary every 2 min (was 5) so a
+        # re-funded key (credits topped up) rejoins rotation shortly. It re-admits
+        # to position 0 for the next request to validate; with the block-query
+        # coalescing throttle below that's ~1 request / 2 min, not a burst.
+        self._configured_primary_reprobe_interval_seconds: float = 120.0
+        # Alert-once latch so a still-dead key re-probing every 2 min doesn't
+        # re-spam the WARNING; cleared (and a RECOVERED line logged) when it works.
+        self._primary_eviction_alerted: bool = False
+        # eth_getLogs coalescing throttle (see _BLOCK_QUERY_INTERVAL_SECONDS).
+        self._last_block_query_mono: float = 0.0
+        self._block_query_interval_seconds: float = _BLOCK_QUERY_INTERVAL_SECONDS
+        self._max_block_query_span: int = _MAX_BLOCK_QUERY_SPAN
+        # Fix SS — per-endpoint consecutive-failure counter.  401/403 already
+        # evict immediately (auth required), and the existing
+        # ``_rpc_error_requires_auth`` / ``unsupported_logs_query`` heuristics
+        # cover known RPC-level signals.  But a provider returning persistent
+        # 400 Bad Request (observed: drpc.org no-auth tier across the
+        # 12h soak — every wallet_ws_monitor cycle for hours) burns two
+        # request attempts per cycle without ever evicting, since 400 isn't
+        # in the auth set and the JSON-RPC ``result.error`` path doesn't
+        # see the 400 (it's a transport-level status code on the response).
+        # A consecutive-failure counter handles all unknown-but-persistent
+        # failure modes without us having to enumerate status codes.
+        self._rpc_endpoint_consecutive_failures: dict[str, int] = {}
+        self._rpc_endpoint_evict_threshold: int = 5
+        # 2026-05-05: 429-aware temporary cooldowns. Quiknode's free tier
+        # rate-limits to ~25 req/s and returns 429 when burst-loaded. The
+        # generic eviction counter fires after _rpc_endpoint_evict_threshold
+        # 429s, but each cycle in between still hammers the endpoint and
+        # adds to event-loop stalls. ``_rpc_endpoint_cooldown_until[ep]``
+        # holds a wall-clock monotonic deadline before which the endpoint
+        # is skipped from the round-robin. After cooldown expiry the
+        # endpoint is tried again — if it 429s once more we extend the
+        # cooldown exponentially up to ``_RPC_ENDPOINT_COOLDOWN_MAX_SECONDS``.
+        # This is per-endpoint so a healthy fallback URL still serves the
+        # request while the throttled one rests.
+        self._rpc_endpoint_cooldown_until: dict[str, float] = {}
+        self._rpc_endpoint_cooldown_attempts: dict[str, int] = {}
+        self._rpc_client: Optional[httpx.AsyncClient] = None
+        self._rpc_client_lock = asyncio.Lock()
+        self._stats = {
+            "blocks_processed": 0,
+            "events_detected": 0,
+            "ws_reconnects": 0,
+            "fallback_polls": 0,
+            "errors": 0,
+            "mempool_txns_seen": 0,
+            "last_block_seen_at": "",
+            "last_block_seen_number": 0,
+            "last_block_processed_at": "",
+            "last_block_processed_number": 0,
+            "last_event_detected_at": "",
+            "last_fallback_poll_at": "",
+        }
+
+    def _active_evicted_urls(self) -> set[str]:
+        """Return currently-active eviction set, expiring stale transient entries.
+
+        Permanent evictions (auth / method-not-supported / 400) stay forever.
+        Transient ones (consecutive-failure threshold) expire after
+        ``_RPC_EVICTION_RETRY_AFTER_SECONDS`` so the endpoint gets re-tried.
+        """
+        now = time.monotonic()
+        if self._evicted_rpc_urls_until:
+            expired = [url for url, deadline in self._evicted_rpc_urls_until.items() if deadline <= now]
+            for url in expired:
+                self._evicted_rpc_urls_until.pop(url, None)
+        return set(self._evicted_rpc_urls) | set(self._evicted_rpc_urls_until)
+
+    def _refresh_rpc_candidates(self) -> None:
+        self._rpc_urls = _build_rpc_candidates(
+            self._http_rpc_url,
+            excluded_urls=self._active_evicted_urls(),
+        )
+
+    def _evict_rpc_endpoint(self, endpoint: str, *, permanent: bool = True) -> None:
+        normalized = _normalize_rpc_http_url(endpoint)
+        if not normalized:
+            return
+        if permanent:
+            self._evicted_rpc_urls.add(normalized)
+            self._evicted_rpc_urls_until.pop(normalized, None)
+        else:
+            self._evicted_rpc_urls_until[normalized] = (
+                time.monotonic() + _RPC_EVICTION_RETRY_AFTER_SECONDS
+            )
+        self._rpc_urls = [url for url in self._rpc_urls if url != normalized]
+        self._rpc_endpoint_consecutive_failures.pop(normalized, None)
+        if self._http_rpc_url == normalized:
+            self._http_rpc_url = self._rpc_urls[0] if self._rpc_urls else ""
+        # Loud alert: the operator-configured primary going down is an
+        # actionable degrade (we're now on free public endpoints), not the
+        # routine eviction of a free fallback. Surface it at WARNING with
+        # the masked URL so it isn't buried among the per-endpoint failures.
+        if normalized == self._configured_primary_rpc_url:
+            # Alert-once: a still-dead key re-probing every interval re-enters
+            # this path and would otherwise re-spam the WARNING each cycle.
+            if not self._primary_eviction_alerted:
+                logger.warning(
+                    "Wallet monitor: CONFIGURED primary RPC evicted — now running on "
+                    "fallback endpoints. Check the provider (key disabled / credits / "
+                    "billing). It will be re-probed automatically every %ds and switch "
+                    "back on its own once it's healthy.",
+                    int(self._configured_primary_reprobe_interval_seconds),
+                    primary_rpc_url=_mask_rpc_url(normalized),
+                    permanent=permanent,
+                )
+                self._primary_eviction_alerted = True
+            # Arm the re-probe clock from the eviction moment so the first
+            # retry waits a full interval rather than firing immediately.
+            self._configured_primary_reprobe_at = time.monotonic()
+
+    def _maybe_reprobe_configured_primary(self) -> None:
+        """Periodically re-admit the operator-configured primary RPC.
+
+        Permanent eviction otherwise sticks for the process lifetime, so a
+        re-enabled / re-funded key (e.g. Ankr after billing is sorted)
+        never recovers without a restart.  Every
+        ``_configured_primary_reprobe_interval_seconds`` we clear the
+        eviction + failure counter and restore the primary to position 0
+        so the next request tries it; if it's still dead it simply
+        re-evicts (and re-alerts).
+        """
+        primary = self._configured_primary_rpc_url
+        if not primary:
+            return
+        if primary not in self._evicted_rpc_urls and primary not in self._evicted_rpc_urls_until:
+            return  # already in rotation
+        now = time.monotonic()
+        if (now - self._configured_primary_reprobe_at) < self._configured_primary_reprobe_interval_seconds:
+            return
+        self._configured_primary_reprobe_at = now
+        self._evicted_rpc_urls.discard(primary)
+        self._evicted_rpc_urls_until.pop(primary, None)
+        self._rpc_endpoint_consecutive_failures.pop(primary, None)
+        self._rpc_endpoint_cooldown_until.pop(primary, None)
+        # Restore as primary so _build_rpc_candidates re-includes it at
+        # position 0 (it isn't in the static fallback list).
+        self._http_rpc_url = primary
+        self._refresh_rpc_candidates()
+        logger.info(
+            "Wallet monitor: re-probing configured primary RPC after eviction",
+            primary_rpc_url=_mask_rpc_url(primary),
+        )
+
+    def _note_rpc_endpoint_success(self, endpoint: str) -> None:
+        normalized = _normalize_rpc_http_url(endpoint)
+        if normalized:
+            self._rpc_endpoint_consecutive_failures.pop(normalized, None)
+            # Configured primary came back (e.g. credits topped up and the
+            # re-probe re-admitted it) — clear the alert latch and log the
+            # recovery so the operator sees it switch back on its own.
+            if normalized == self._configured_primary_rpc_url and self._primary_eviction_alerted:
+                self._primary_eviction_alerted = False
+                logger.warning(
+                    "Wallet monitor: configured primary RPC RECOVERED — back in "
+                    "rotation (provider healthy again).",
+                    primary_rpc_url=_mask_rpc_url(normalized),
+                )
+
+    def _note_rpc_endpoint_failure(self, endpoint: str) -> bool:
+        """Increment the consecutive-failure counter.
+
+        Returns True when the threshold has been reached and the endpoint
+        was evicted; False otherwise.
+        """
+        normalized = _normalize_rpc_http_url(endpoint)
+        if not normalized:
+            return False
+        count = self._rpc_endpoint_consecutive_failures.get(normalized, 0) + 1
+        self._rpc_endpoint_consecutive_failures[normalized] = count
+        if count >= self._rpc_endpoint_evict_threshold:
+            logger.warning(
+                "Wallet monitor evicting RPC endpoint after consecutive failures",
+                endpoint=normalized,
+                consecutive_failures=count,
+                threshold=self._rpc_endpoint_evict_threshold,
+                retry_after_seconds=_RPC_EVICTION_RETRY_AFTER_SECONDS,
+            )
+            # Transient: failure-threshold evictions get retried after TTL —
+            # network blips shouldn't take a fallback out of rotation forever.
+            self._evict_rpc_endpoint(normalized, permanent=False)
+            return True
+        return False
+
+    def _rpc_endpoint_in_cooldown(self, endpoint: str, *, now_mono: Optional[float] = None) -> bool:
+        """Return True iff ``endpoint`` is currently rate-limited and
+        should be skipped on this request.
+
+        Cooldowns are stored as monotonic-clock deadlines. We expire
+        entries lazily — once the deadline passes, the endpoint is tried
+        again (and re-cooled if it 429s again). Per-endpoint state means
+        a healthy fallback can serve the request while a throttled one
+        rests, instead of all endpoints sharing one global backoff.
+        """
+        normalized = _normalize_rpc_http_url(endpoint)
+        if not normalized:
+            return False
+        deadline = self._rpc_endpoint_cooldown_until.get(normalized)
+        if deadline is None:
+            return False
+        current = now_mono if now_mono is not None else time.monotonic()
+        if current >= deadline:
+            # Cooldown expired — clear and let the endpoint retry.
+            self._rpc_endpoint_cooldown_until.pop(normalized, None)
+            return False
+        return True
+
+    def _cool_down_rpc_endpoint(
+        self,
+        endpoint: str,
+        *,
+        retry_after_seconds: Optional[float] = None,
+    ) -> float:
+        """Mark ``endpoint`` rate-limited; skip it from the round-robin
+        until the cooldown expires.
+
+        Args:
+            endpoint: The RPC URL that returned 429.
+            retry_after_seconds: When the provider returns a Retry-After
+                header (in seconds), honor it as the floor of the cooldown
+                window. If unset, fall back to exponential backoff over
+                the per-endpoint attempt counter.
+
+        Returns the cooldown duration applied (for logging).
+        """
+        normalized = _normalize_rpc_http_url(endpoint)
+        if not normalized:
+            return 0.0
+        attempts = self._rpc_endpoint_cooldown_attempts.get(normalized, 0) + 1
+        self._rpc_endpoint_cooldown_attempts[normalized] = attempts
+        # Exponential backoff: 30s, 60s, 120s, ... capped at MAX. First
+        # 429 → 30s; sustained throttling → up to 10 min before each retry.
+        backoff = min(
+            _RPC_ENDPOINT_COOLDOWN_BASE_SECONDS * (2 ** max(0, attempts - 1)),
+            _RPC_ENDPOINT_COOLDOWN_MAX_SECONDS,
+        )
+        if retry_after_seconds is not None and retry_after_seconds > 0:
+            # Honor server-suggested retry interval as a floor — we may
+            # extend further via exponential backoff, but never retry
+            # sooner than the provider asked us to.
+            backoff = max(backoff, float(retry_after_seconds))
+        backoff = min(backoff, _RPC_ENDPOINT_COOLDOWN_MAX_SECONDS)
+        self._rpc_endpoint_cooldown_until[normalized] = time.monotonic() + backoff
+        return backoff
+
+    def _clear_rpc_endpoint_cooldown(self, endpoint: str) -> None:
+        """Clear the 429 cooldown for an endpoint after a successful request.
+
+        Resets the attempt counter so the next 429 starts from the base
+        backoff again. Without this, an endpoint that recovers and then
+        gets throttled again much later would jump straight to a multi-
+        minute cooldown.
+        """
+        normalized = _normalize_rpc_http_url(endpoint)
+        if not normalized:
+            return
+        self._rpc_endpoint_cooldown_until.pop(normalized, None)
+        self._rpc_endpoint_cooldown_attempts.pop(normalized, None)
+
+    # ==================== WALLET MANAGEMENT ====================
+
+    def _tracked_addresses(self) -> set[str]:
+        """Flatten source-scoped memberships into a set of tracked addresses."""
+        return set(self._tracked_sources.keys())
+
+    def add_wallet(self, address: str, source: str = "default"):
+        """Add a wallet address to the tracked set for a specific source.
+
+        Args:
+            address: Ethereum address (checksummed or lowercase).
+            source: Logical owner of this membership.
+        """
+        normalized = address.lower()
+        memberships = self._tracked_sources.setdefault(normalized, set())
+        memberships.add(source)
+        logger.info(
+            "Added wallet to WS monitor",
+            address=normalized,
+            source=source,
+            total_tracked=len(self._tracked_sources),
+        )
+
+    def remove_wallet(self, address: str, source: str = "default"):
+        """Remove a source membership for a wallet.
+
+        Args:
+            address: Ethereum address to stop tracking.
+            source: Logical owner whose membership should be removed.
+        """
+        normalized = address.lower()
+        memberships = self._tracked_sources.get(normalized)
+        if memberships is None:
+            return
+        memberships.discard(source)
+        if not memberships:
+            self._tracked_sources.pop(normalized, None)
+        logger.info(
+            "Removed wallet from WS monitor",
+            address=normalized,
+            source=source,
+            total_tracked=len(self._tracked_sources),
+        )
+
+    def set_wallets_for_source(self, source: str, addresses: list[str]):
+        """Replace all tracked wallets for a source in one operation."""
+        target = {a.lower() for a in addresses if a}
+        current = {addr for addr, memberships in self._tracked_sources.items() if source in memberships}
+
+        for address in current - target:
+            self.remove_wallet(address, source=source)
+        for address in target - current:
+            self.add_wallet(address, source=source)
+
+        logger.info(
+            "Updated source-scoped tracked wallets",
+            source=source,
+            total_tracked=len(self._tracked_sources),
+            source_wallets=len(target),
+        )
+
+    def add_callback(self, callback: Callable):
+        """Register a callback to be invoked when a tracked wallet trade is detected.
+
+        The callback receives a single argument: a WalletTradeEvent instance.
+        If the callback is a coroutine function, it will be awaited.
+
+        Args:
+            callback: Sync or async callable accepting a WalletTradeEvent.
+        """
+        self._callbacks.append(callback)
+
+    # ==================== MEMPOOL MONITORING ====================
+
+    def enable_mempool_mode(self):
+        """Enable mempool monitoring for pre-confirmation detection.
+
+        When enabled, the monitor will additionally subscribe to
+        ``newPendingTransactions`` on the WebSocket connection, providing
+        sub-second detection latency for tracked wallet activity before
+        the transaction is included in a block.
+        """
+        self._mempool_mode = True
+        logger.info("Mempool monitoring enabled - pre-confirmation detection active")
+
+    def disable_mempool_mode(self):
+        """Disable mempool monitoring, reverting to block-based detection only."""
+        self._mempool_mode = False
+        logger.info("Mempool monitoring disabled")
+
+    async def _subscribe_mempool(self, ws):
+        """Subscribe to pending transactions for pre-confirmation detection."""
+        subscribe_msg = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "eth_subscribe",
+                "params": ["newPendingTransactions"],
+            }
+        )
+        await ws.send(subscribe_msg)
+
+        response = await ws.recv()
+        sub_result = json.loads(response)
+
+        if "error" in sub_result:
+            logger.warning(
+                "Mempool subscription failed (node may not support it)",
+                error=sub_result["error"],
+            )
+            return None
+
+        subscription_id = sub_result.get("result")
+        logger.info(
+            "Subscribed to mempool (pending transactions)",
+            subscription_id=subscription_id,
+        )
+        return subscription_id
+
+    # ==================== LIFECYCLE ====================
+
+    async def _load_endpoints_from_db(self) -> None:
+        """Override env-var defaults with DB-stored Polygon RPC URLs.
+
+        AppSettings.polygon_rpc_url / polygon_ws_url are encrypted via
+        ``set_encrypted_secret`` from the SettingsPanel UI and override
+        the POLYGON_RPC_URL / POLYGON_WS_URL env vars at runtime. Empty
+        / NULL DB values leave the env-var defaults in place. Read
+        failures are non-fatal — the monitor still starts on env-var
+        defaults plus the public fallback list.
+
+        2026-05-09: instrumented at INFO level. The 2026-05-09 soak
+        showed a user who entered an Ankr URL "many restarts ago" yet
+        the monitor was still failing over publicnode endpoints. The
+        Ankr URL didn't appear in active or evicted lists — meaning
+        ``_load_endpoints_from_db`` was returning empty. The five most
+        likely reasons (column missing, NULL value, decrypt failure
+        from APP_SECRETS_KEY mismatch, normalize rejected the value,
+        or ws override applied without rpc) are now logged distinctly
+        so the next startup tells the operator exactly which.
+        """
+        try:
+            from sqlalchemy import select
+            from models.database import AsyncSessionLocal, AppSettings
+            from utils.secrets import decrypt_secret, is_encrypted
+
+            async with AsyncSessionLocal() as session:
+                result = await session.execute(
+                    select(AppSettings).where(AppSettings.id == "default")
+                )
+                row = result.scalar_one_or_none()
+                if row is None:
+                    logger.info(
+                        "Wallet WS monitor: AppSettings row 'default' missing; "
+                        "running on env-var/public defaults"
+                    )
+                    return
+                rpc_raw = getattr(row, "polygon_rpc_url", None)
+                ws_raw = getattr(row, "polygon_ws_url", None)
+                stored_rpc = decrypt_secret(rpc_raw) or ""
+                stored_ws = decrypt_secret(ws_raw) or ""
+        except Exception as exc:
+            logger.warning(
+                "Wallet WS monitor: failed to read Polygon RPC overrides from AppSettings; "
+                "falling back to env-var defaults",
+                exc_info=exc,
+            )
+            return
+
+        # Surface per-field state at INFO so the operator can see
+        # exactly what happened to the values they typed into the UI.
+        # We log only metadata (presence, length, encryption flag) —
+        # the URL itself is masked further down once it lands in
+        # ``_http_rpc_url`` / ``_ws_url``.
+        rpc_present = bool(rpc_raw)
+        ws_present = bool(ws_raw)
+        rpc_decrypted_ok = bool(stored_rpc) if rpc_present else None
+        ws_decrypted_ok = bool(stored_ws) if ws_present else None
+        rpc_normalized = _normalize_rpc_http_url(stored_rpc)
+        if rpc_present and not rpc_decrypted_ok:
+            logger.warning(
+                "Wallet WS monitor: polygon_rpc_url is set in AppSettings but "
+                "decrypt_secret returned empty — APP_SECRETS_KEY may have "
+                "changed since the value was saved, OR the encryption key "
+                "isn't loaded on this process. Re-enter the URL in the "
+                "SettingsPanel UI to re-encrypt with the current key.",
+                rpc_stored_len=len(rpc_raw or ""),
+                rpc_is_encrypted=is_encrypted(rpc_raw),
+            )
+        elif rpc_present and rpc_decrypted_ok and not rpc_normalized:
+            logger.warning(
+                "Wallet WS monitor: polygon_rpc_url decrypted OK but "
+                "_normalize_rpc_http_url rejected it (must be http(s):// "
+                "or ws(s):// or a bare host)",
+                rpc_decoded_starts=stored_rpc[:12],
+            )
+        elif not rpc_present:
+            logger.info(
+                "Wallet WS monitor: polygon_rpc_url not set in AppSettings; "
+                "running on POLYGON_RPC_URL env var or public fallbacks. "
+                "Set it via SettingsPanel → Blockchain RPC."
+            )
+        else:
+            logger.info(
+                "Wallet WS monitor: loaded polygon_rpc_url from AppSettings",
+                rpc_was_encrypted=is_encrypted(rpc_raw),
+                rpc_normalized_starts=rpc_normalized[:12],
+            )
+
+        if ws_present and not ws_decrypted_ok:
+            logger.warning(
+                "Wallet WS monitor: polygon_ws_url is set but decrypt_secret "
+                "returned empty (APP_SECRETS_KEY mismatch?). Falling back to "
+                "env-var/default WS URL.",
+                ws_stored_len=len(ws_raw or ""),
+                ws_is_encrypted=is_encrypted(ws_raw),
+            )
+
+        if rpc_normalized:
+            self._http_rpc_url = rpc_normalized
+            # Remember the operator's configured primary so we can re-probe
+            # it after eviction and alert when it goes down (see
+            # ``_maybe_reprobe_configured_primary`` / ``_evict_rpc_endpoint``).
+            self._configured_primary_rpc_url = rpc_normalized
+            # Recompute the failover list so the new primary lands at
+            # position 0 (with the public fallbacks still available
+            # behind it for resilience if the paid endpoint hiccups).
+            self._refresh_rpc_candidates()
+
+        if stored_ws:
+            ws_text = str(stored_ws).strip().rstrip("/")
+            if ws_text and ws_text != self._ws_url:
+                self._ws_url = ws_text
+
+    async def start(self):
+        """Start WebSocket monitoring.
+
+        Launches the WebSocket loop as a background task. If the monitor
+        is already running, this is a no-op.
+
+        Also starts the RTDS fast-path subscription so the frontend sees
+        preliminary trade events ahead of block confirmation. RTDS-sourced
+        events are emitted via the same callback list as on-chain events
+        but carry ``confirmed=False`` so consumers can dedupe by
+        ``tx_hash``.
+        """
+        if self._running:
+            logger.debug("WS monitor start skipped; already running")
+            return
+
+        if websockets is None:
+            logger.error("websockets library not installed. Install with: pip install websockets")
+            return
+
+        # Pick up DB-stored RPC/WS URLs (set via SettingsPanel UI) before
+        # spawning loops so the very first request goes to the configured
+        # provider, not the env-var default.
+        await self._load_endpoints_from_db()
+
+        self._running = True
+        self._ws_task = asyncio.create_task(self._ws_loop())
+        await self._start_rtds_fast_path()
+        # Surface the configured primary RPC + the active failover
+        # order at startup so the operator can verify which provider
+        # is being used. URLs are masked to hide path-embedded API
+        # keys (Ankr / Alchemy / QuickNode pattern). The configured
+        # primary should be FIRST in the list — if it's a public
+        # endpoint (publicnode / llamarpc / etc.) the operator hasn't
+        # set POLYGON_RPC_URL and is running on free-tier endpoints
+        # that rate-limit aggressively.
+        primary_is_public = any(
+            self._http_rpc_url == fallback
+            for fallback in (DEFAULT_PUBLIC_HTTP_RPC_URL, *FALLBACK_HTTP_RPC_URLS)
+        )
+        logger.info(
+            "Started wallet WS monitor",
+            ws_url=self._ws_url,
+            primary_rpc_url=_mask_rpc_url(self._http_rpc_url),
+            primary_is_authenticated=not primary_is_public,
+            rpc_failover_order=[_mask_rpc_url(u) for u in self._rpc_urls],
+            tracked_wallets=len(self._tracked_sources),
+        )
+        if primary_is_public:
+            logger.warning(
+                "Wallet WS monitor: POLYGON_RPC_URL is unset or pointing at a public "
+                "endpoint — eth_getLogs will rate-limit under sustained load. Set "
+                "POLYGON_RPC_URL to an authenticated provider (Ankr / Alchemy / QuickNode) "
+                "to eliminate the wallet-monitor failure cascade observed in soak.",
+                primary_rpc_url=_mask_rpc_url(self._http_rpc_url),
+            )
+
+    async def _start_rtds_fast_path(self) -> None:
+        """Start the Polymarket RTDS activity fast-path feed."""
+        try:
+            from services.wallet_rtds_feed import get_wallet_rtds_feed
+
+            rtds = get_wallet_rtds_feed(
+                get_tracked_wallets=self._tracked_addresses
+            )
+            rtds.add_callback(self._emit_rtds_event)
+            await rtds.start()
+            self._rtds_feed = rtds
+        except Exception as exc:
+            # RTDS is optional fast-path; never fail start() because of it.
+            self._rtds_feed = None
+            logger.warning(
+                "Failed to start RTDS wallet fast path; on-chain monitoring "
+                "continues unaffected.",
+                error=str(exc),
+            )
+
+    async def _emit_rtds_event(self, event: WalletTradeEvent) -> None:
+        """Emit a preliminary RTDS-sourced trade event.
+
+        Routed through the same callback list as on-chain events, but does
+        NOT persist to the DB — the on-chain path is the system of record.
+        Subscribers should dedupe by ``tx_hash`` and treat ``confirmed=False``
+        as "pending."
+        """
+        await self._emit_callbacks(event)
+
+    def stop(self):
+        """Stop the WebSocket monitor and all background tasks."""
+        self._running = False
+
+        if self._ws_task and not self._ws_task.done():
+            self._ws_task.cancel()
+        if self._poll_fallback_task and not self._poll_fallback_task.done():
+            self._poll_fallback_task.cancel()
+
+        rtds = getattr(self, "_rtds_feed", None)
+        if rtds is not None:
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(rtds.stop())
+            except RuntimeError:
+                pass
+
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(self._close_rpc_client())
+        except RuntimeError:
+            pass
+
+        logger.info(
+            "Stopped wallet WS monitor",
+            stats=self._stats,
+        )
+
+    # ==================== WEBSOCKET LOOP ====================
+
+    async def _ws_loop(self):
+        """Main WebSocket loop with auto-reconnect and exponential backoff.
+
+        Connects to the Polygon WebSocket RPC, subscribes to newHeads,
+        and processes each new block for relevant events. On disconnection,
+        starts a polling fallback and attempts to reconnect with exponential
+        backoff up to _max_reconnect_delay seconds.
+        """
+        current_delay = self._reconnect_delay
+
+        while self._running:
+            try:
+                logger.info("Connecting to Polygon WS RPC", url=self._ws_url)
+
+                async with websockets.connect(
+                    self._ws_url,
+                    ping_interval=None,
+                    ping_timeout=None,
+                    open_timeout=10,
+                    close_timeout=10,
+                ) as ws:
+                    self._ws_connection = ws
+                    current_delay = self._reconnect_delay  # Reset on success
+
+                    # Stop fallback polling if it was running
+                    if self._poll_fallback_task and not self._poll_fallback_task.done():
+                        self._poll_fallback_task.cancel()
+                        self._poll_fallback_task = None
+                        logger.info("Stopped fallback polling, WS reconnected")
+
+                    # Subscribe to newHeads
+                    subscribe_msg = json.dumps(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": 1,
+                            "method": "eth_subscribe",
+                            "params": ["newHeads"],
+                        }
+                    )
+                    await ws.send(subscribe_msg)
+
+                    # Read subscription confirmation
+                    response = await ws.recv()
+                    sub_result = json.loads(response)
+
+                    if "error" in sub_result:
+                        logger.error(
+                            "WS subscription failed",
+                            error=sub_result["error"],
+                        )
+                        raise ConnectionError(f"Subscription failed: {sub_result['error']}")
+
+                    subscription_id = sub_result.get("result")
+                    logger.info(
+                        "Subscribed to newHeads",
+                        subscription_id=subscription_id,
+                    )
+
+                    # Optionally subscribe to mempool for pre-confirmation detection
+                    if self._mempool_mode:
+                        await self._subscribe_mempool(ws)
+
+                    # Custom heartbeat loop (more reliable than built-in ping)
+                    heartbeat_task = asyncio.create_task(
+                        self._heartbeat_loop(ws), name="wallet-ws-heartbeat",
+                    )
+
+                    # Process incoming messages
+                    try:
+                        async for message in ws:
+                            if not self._running:
+                                break
+
+                            try:
+                                data = json.loads(message)
+                                params = data.get("params", {})
+                                result = params.get("result", {})
+
+                                block_number_hex = result.get("number")
+                                if block_number_hex:
+                                    block_number = int(block_number_hex, 16)
+                                    block_timestamp_hex = result.get("timestamp", "0x0")
+                                    await self._handle_block(
+                                        block_number,
+                                        block_timestamp_hex=block_timestamp_hex,
+                                    )
+
+                            except json.JSONDecodeError:
+                                self._stats["errors"] += 1
+                            except Exception:
+                                self._stats["errors"] += 1
+                    finally:
+                        if not heartbeat_task.done():
+                            heartbeat_task.cancel()
+
+            except asyncio.CancelledError:
+                logger.info("WS loop cancelled")
+                break
+
+            except Exception as e:
+                self._ws_connection = None
+                self._stats["ws_reconnects"] += 1
+
+                logger.warning(
+                    "WS connection lost, will reconnect",
+                    error_type=type(e).__name__,
+                    error=_exception_text(e),
+                    reconnect_delay=current_delay,
+                )
+
+                # Start fallback polling while disconnected
+                if self._poll_fallback_task is None or self._poll_fallback_task.done():
+                    self._poll_fallback_task = asyncio.create_task(self._poll_fallback_loop())
+
+                if self._running:
+                    await asyncio.sleep(current_delay)
+                    # Exponential backoff
+                    current_delay = min(current_delay * 2, self._max_reconnect_delay)
+
+        self._ws_connection = None
+        await self._close_rpc_client()
+
+    async def _heartbeat_loop(self, ws) -> None:
+        """Proactive ping/pong keepalive — tolerates up to 3 consecutive misses."""
+        _INTERVAL = 30.0
+        _PONG_TIMEOUT = 10.0
+        _MAX_MISSES = 3
+        consecutive_misses = 0
+        try:
+            while True:
+                await asyncio.sleep(_INTERVAL)
+                try:
+                    pong = await ws.ping()
+                    await asyncio.wait_for(pong, timeout=_PONG_TIMEOUT)
+                    consecutive_misses = 0
+                except asyncio.TimeoutError:
+                    consecutive_misses += 1
+                    if consecutive_misses >= _MAX_MISSES:
+                        logger.warning(
+                            "Wallet WS heartbeat pong timeout",
+                            misses=consecutive_misses,
+                            threshold=_MAX_MISSES,
+                        )
+                        await ws.close()
+                        return
+                except Exception:
+                    return
+        except asyncio.CancelledError:
+            return
+
+    async def _close_rpc_client(self) -> None:
+        async with self._rpc_client_lock:
+            client = self._rpc_client
+            self._rpc_client = None
+        if client is None:
+            return
+        with suppress(Exception):
+            await client.aclose()
+
+    async def _get_rpc_client(self) -> httpx.AsyncClient:
+        async with self._rpc_client_lock:
+            client = self._rpc_client
+            if client is not None:
+                return client
+            limits = httpx.Limits(
+                max_connections=max(6, len(self._rpc_urls) * 2),
+                max_keepalive_connections=max(2, len(self._rpc_urls)),
+            )
+            client = httpx.AsyncClient(timeout=DEFAULT_HTTP_TIMEOUT, limits=limits)
+            self._rpc_client = client
+            return client
+
+    # ==================== BLOCK PROCESSING ====================
+
+    async def _handle_block(
+        self,
+        block_number: int,
+        block_timestamp_hex: str = "0x0",
+    ):
+        """Process a new block by querying for OrdersFilled events.
+
+        Calls eth_getLogs on the HTTP RPC endpoint for the specific block,
+        filtering by Polymarket exchange addresses and the OrderFilled event topic.
+        Any matching logs involving tracked wallets are processed.
+
+        Args:
+            block_number: The block number to process.
+            block_timestamp_hex: Hex-encoded block timestamp.
+        """
+        seen_at = utcnow()
+        self._stats["last_block_seen_at"] = seen_at.isoformat().replace("+00:00", "Z")
+        self._stats["last_block_seen_number"] = int(block_number)
+
+        if not self._tracked_sources:
+            return
+
+        # Avoid processing the same block twice
+        if self._last_processed_block is not None and block_number <= self._last_processed_block:
+            return
+
+        if self._rpc_backoff_until > time.monotonic():
+            return
+
+        # Coalesce blocks into a single ranged eth_getLogs at most every
+        # _block_query_interval_seconds. This previously fired one eth_getLogs
+        # per block (~30/min on Polygon) — the dominant RPC credit burn. We now
+        # wait out the interval, then query EVERY block since the last scan in
+        # one ranged call, so no block is dropped — just batched.
+        now_mono = time.monotonic()
+        if (now_mono - self._last_block_query_mono) < self._block_query_interval_seconds:
+            return
+        self._last_block_query_mono = now_mono
+
+        from_block = (
+            self._last_processed_block + 1
+            if self._last_processed_block is not None
+            else block_number
+        )
+        if from_block < block_number - self._max_block_query_span:
+            from_block = block_number - self._max_block_query_span
+        if from_block > block_number:
+            from_block = block_number
+
+        block_hex = hex(block_number)
+        from_hex = hex(from_block)
+
+        try:
+            block_timestamp = int(block_timestamp_hex, 16)
+        except (ValueError, TypeError):
+            block_timestamp = 0
+
+        try:
+            # Query logs via HTTP RPC (more reliable for getLogs) — ranged
+            # [from_block, block_number] so coalesced blocks are all covered.
+            logs = await self._get_logs_for_block(block_hex, from_block_hex=from_hex)
+            if logs is None:
+                failures = self._block_failure_counts.get(block_number, 0) + 1
+                self._block_failure_counts[block_number] = failures
+                if failures >= self._max_block_failures_before_skip:
+                    logger.warning(
+                        "Skipping block after repeated RPC failures",
+                        block_number=block_number,
+                        failures=failures,
+                    )
+                    # Advance cursor to avoid permanently stalling the monitor
+                    # on a single problematic block.
+                    self._last_processed_block = block_number
+                    self._block_failure_counts.pop(block_number, None)
+                return
+            self._block_failure_counts.pop(block_number, None)
+
+            for log_entry in logs:
+                try:
+                    await self._process_log(
+                        log_entry,
+                        block_number=block_number,
+                        block_timestamp=block_timestamp,
+                    )
+                except Exception as e:
+                    self._stats["errors"] += 1
+                    logger.error(
+                        "Error processing log entry",
+                        block_number=block_number,
+                        tx_hash=log_entry.get("transactionHash"),
+                        error_type=type(e).__name__,
+                        error=_exception_text(e),
+                        exc_info=True,
+                    )
+
+            # Only advance the cursor after a successful RPC call so failed
+            # blocks can be retried by fallback polling.
+            self._last_processed_block = block_number
+            self._stats["blocks_processed"] += 1
+            self._stats["last_block_processed_at"] = utcnow().isoformat().replace("+00:00", "Z")
+            self._stats["last_block_processed_number"] = int(block_number)
+
+        except Exception as e:
+            logger.warning(
+                "Error handling block",
+                block_number=block_number,
+                error_type=type(e).__name__,
+                error=_exception_text(e),
+            )
+            self._stats["errors"] += 1
+
+    async def _get_logs_for_block(
+        self, block_hex: str, from_block_hex: Optional[str] = None
+    ) -> Optional[list[dict]]:
+        """Fetch OrderFilled event logs for a block (or block range) from RPC.
+
+        Args:
+            block_hex: The latest (to) block number as a hex string.
+            from_block_hex: Range start; defaults to ``block_hex`` (single block).
+
+        Returns:
+            List of log entries matching the filter criteria.
+        """
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "eth_getLogs",
+            "params": [
+                {
+                    "fromBlock": from_block_hex or block_hex,
+                    "toBlock": block_hex,
+                    "address": list(POLYMARKET_EXCHANGE_ADDRESSES_V2),
+                    "topics": [ORDER_FILLED_TOPIC],
+                }
+            ],
+        }
+
+        result = await self._rpc_request(
+            payload,
+            method="eth_getLogs",
+            block_hex=block_hex,
+        )
+        if result is None:
+            return None
+
+        if "error" in result:
+            logger.warning(
+                "RPC error fetching logs",
+                error=result["error"],
+                block=block_hex,
+            )
+            return None
+
+        logs = result.get("result", [])
+        if isinstance(logs, list):
+            return logs
+        logger.warning(
+            "Unexpected eth_getLogs result shape",
+            block=block_hex,
+            result_type=type(logs).__name__,
+        )
+        return []
+
+    async def _rpc_request(
+        self,
+        payload: dict,
+        *,
+        method: str,
+        block_hex: str = "",
+    ) -> Optional[dict]:
+        """Send an HTTP JSON-RPC request with endpoint failover."""
+        last_error: Optional[Exception] = None
+        # Periodically re-admit the operator-configured primary so a
+        # re-enabled/re-funded key recovers without a backend restart.
+        self._maybe_reprobe_configured_primary()
+        if not self._rpc_urls:
+            self._refresh_rpc_candidates()
+        if not self._rpc_urls:
+            return None
+
+        for endpoint in self._rpc_urls:
+            # 2026-05-05: skip endpoints currently in 429 cooldown so we
+            # don't burn a request attempt against a known-throttled
+            # provider. Healthy fallbacks still serve the request below.
+            if self._rpc_endpoint_in_cooldown(endpoint):
+                continue
+            endpoint_error: Optional[Exception] = None
+            for endpoint_attempt in range(RPC_ATTEMPTS_PER_ENDPOINT):
+                try:
+                    client = await self._get_rpc_client()
+                    response = await client.post(endpoint, json=payload)
+                    response.raise_for_status()
+                    result = response.json()
+
+                    if not isinstance(result, dict):
+                        endpoint_error = RuntimeError(f"Unexpected RPC payload type: {type(result).__name__}")
+                        if endpoint_attempt < RPC_ATTEMPTS_PER_ENDPOINT - 1:
+                            await asyncio.sleep(0.15 * (endpoint_attempt + 1))
+                            continue
+                        logger.warning(
+                            "Unexpected RPC response payload",
+                            method=method,
+                            endpoint=endpoint,
+                            response_type=type(result).__name__,
+                        )
+                        break
+
+                    rpc_error = result.get("error")
+                    if rpc_error is not None:
+                        endpoint_error = RuntimeError(f"RPC error from endpoint {endpoint}: {rpc_error}")
+                        unsupported_logs_query = (
+                            method == "eth_getLogs"
+                            and _rpc_error_indicates_unsupported_logs_query(rpc_error)
+                        )
+                        block_not_ready = (
+                            method == "eth_getLogs"
+                            and _rpc_error_indicates_logs_block_not_ready(rpc_error)
+                        )
+                        should_evict_endpoint = _rpc_error_requires_auth(rpc_error) or unsupported_logs_query
+                        if should_evict_endpoint:
+                            self._evict_rpc_endpoint(endpoint)
+                        if endpoint_attempt < RPC_ATTEMPTS_PER_ENDPOINT - 1:
+                            await asyncio.sleep(0.15 * (endpoint_attempt + 1))
+                            continue
+                        if block_not_ready:
+                            logger.info(
+                                "Wallet monitor RPC block not yet available on endpoint",
+                                method=method,
+                                endpoint=endpoint,
+                                block=block_hex or None,
+                                error=rpc_error,
+                            )
+                            return None
+                        now = time.monotonic()
+                        if (now - self._rpc_last_endpoint_failure_log_at) >= self._rpc_endpoint_failure_log_interval_seconds:
+                            self._rpc_last_endpoint_failure_log_at = now
+                            logger.warning(
+                                "RPC endpoint returned error",
+                                method=method,
+                                endpoint=endpoint,
+                                block=block_hex or None,
+                                error=rpc_error,
+                            )
+                        else:
+                            logger.debug(
+                                "RPC endpoint returned error (suppressed)",
+                                method=method,
+                                endpoint=endpoint,
+                                block=block_hex or None,
+                            )
+                        break
+
+                    if endpoint != self._http_rpc_url:
+                        logger.info(
+                            "Wallet monitor RPC failover",
+                            previous_endpoint=self._http_rpc_url,
+                            active_endpoint=endpoint,
+                        )
+                        self._http_rpc_url = endpoint
+                        self._refresh_rpc_candidates()
+
+                    self._rpc_failure_streak = 0
+                    self._rpc_backoff_until = 0.0
+                    self._note_rpc_endpoint_success(endpoint)
+                    # 2026-05-05: clear the 429 cooldown attempt counter
+                    # on success so the next throttling event starts from
+                    # the base backoff rather than the previous escalated
+                    # window.
+                    self._clear_rpc_endpoint_cooldown(endpoint)
+                    return result
+                except Exception as e:
+                    endpoint_error = e
+                    if _should_reset_http_client(e):
+                        await self._close_rpc_client()
+                    # 401/403 = auth required or forbidden — skip retries on this endpoint
+                    _status = getattr(getattr(e, "response", None), "status_code", None)
+                    if _status in (401, 403):
+                        self._evict_rpc_endpoint(endpoint)
+                        break
+                    if _status == 400 and method == "eth_getLogs":
+                        response_error: object = None
+                        try:
+                            response_obj = getattr(e, "response", None)
+                            if response_obj is not None:
+                                response_json = response_obj.json()
+                                if isinstance(response_json, dict):
+                                    response_error = response_json.get("error") or response_json
+                        except Exception:
+                            response_error = None
+                        self._evict_rpc_endpoint(endpoint)
+                        now_log = time.monotonic()
+                        if (
+                            now_log - self._rpc_last_endpoint_failure_log_at
+                        ) >= self._rpc_endpoint_failure_log_interval_seconds:
+                            self._rpc_last_endpoint_failure_log_at = now_log
+                            logger.warning(
+                                "Wallet monitor RPC endpoint rejected eth_getLogs; evicting endpoint",
+                                method=method,
+                                endpoint=endpoint,
+                                block=block_hex or None,
+                                status_code=_status,
+                                rpc_error=response_error,
+                            )
+                        break
+                    # 2026-05-05: 429 = rate-limited. Honor Retry-After if
+                    # present, fall back to exponential cooldown. Mark the
+                    # endpoint cooled-down so the round-robin skips it on
+                    # subsequent calls until the window expires.
+                    if _status == 429:
+                        retry_after_seconds: Optional[float] = None
+                        try:
+                            response_obj = getattr(e, "response", None)
+                            if response_obj is not None:
+                                retry_after_header = response_obj.headers.get("Retry-After")
+                                if retry_after_header:
+                                    try:
+                                        retry_after_seconds = float(retry_after_header)
+                                    except (TypeError, ValueError):
+                                        retry_after_seconds = (
+                                            _RPC_429_RETRY_AFTER_FALLBACK_SECONDS
+                                        )
+                        except Exception:
+                            retry_after_seconds = None
+                        cooldown_seconds = self._cool_down_rpc_endpoint(
+                            endpoint,
+                            retry_after_seconds=retry_after_seconds,
+                        )
+                        # Suppressed-rate logging — same throttle as the
+                        # generic endpoint-failure log so we don't drown
+                        # the operator console during sustained throttling.
+                        now_log = time.monotonic()
+                        if (
+                            now_log - self._rpc_last_endpoint_failure_log_at
+                        ) >= self._rpc_endpoint_failure_log_interval_seconds:
+                            self._rpc_last_endpoint_failure_log_at = now_log
+                            logger.warning(
+                                "Wallet monitor RPC 429 — cooling down endpoint",
+                                method=method,
+                                endpoint=endpoint,
+                                cooldown_seconds=round(cooldown_seconds, 1),
+                                retry_after_seconds=retry_after_seconds,
+                            )
+                        # Don't burn the second attempt against a 429'd
+                        # endpoint — move on to the next URL immediately.
+                        break
+                    if endpoint_attempt < RPC_ATTEMPTS_PER_ENDPOINT - 1:
+                        await asyncio.sleep(0.2 * (endpoint_attempt + 1))
+                        continue
+                    # 2026-05-08: once all attempts on this endpoint are
+                    # exhausted with a transport-level error (timeout,
+                    # connection reset, network error), mark the endpoint
+                    # cooled-down so the round-robin skips it on the next
+                    # call. Otherwise a single flaky endpoint (observed:
+                    # polygon-bor-rpc.publicnode.com) keeps getting retried
+                    # every cycle at position 0, contributing ~60 warnings
+                    # per 90-minute window to the soak log and delaying
+                    # legitimate WS-fallback work. Reuses the 429 cooldown
+                    # machinery (exponential attempts-based backoff, capped
+                    # at _RPC_ENDPOINT_COOLDOWN_MAX_SECONDS) so a briefly
+                    # slow endpoint recovers quickly while a persistently
+                    # broken one gets skipped longer.
+                    timeout_cooldown_seconds: Optional[float] = None
+                    if _should_reset_http_client(e):
+                        timeout_cooldown_seconds = self._cool_down_rpc_endpoint(
+                            endpoint,
+                        )
+                    now = time.monotonic()
+                    if (now - self._rpc_last_endpoint_failure_log_at) >= self._rpc_endpoint_failure_log_interval_seconds:
+                        self._rpc_last_endpoint_failure_log_at = now
+                        logger.warning(
+                            "Wallet monitor RPC request failed",
+                            method=method,
+                            endpoint=endpoint,
+                            block=block_hex or None,
+                            error_type=type(e).__name__,
+                            error=_exception_text(e),
+                            cooldown_seconds=(
+                                round(timeout_cooldown_seconds, 1)
+                                if timeout_cooldown_seconds is not None
+                                else None
+                            ),
+                        )
+                    else:
+                        logger.debug(
+                            "Wallet monitor RPC request failed (suppressed)",
+                            method=method,
+                            endpoint=endpoint,
+                            block=block_hex or None,
+                            error_type=type(e).__name__,
+                        )
+                    break
+            if endpoint_error is not None:
+                # Fix SS — bump per-endpoint consecutive-failure counter
+                # so a provider that consistently fails (e.g. drpc.org's
+                # no-auth tier returning 400 Bad Request) gets evicted
+                # after ``_rpc_endpoint_evict_threshold`` cycles instead
+                # of burning two attempts per request indefinitely.
+                self._note_rpc_endpoint_failure(endpoint)
+                last_error = endpoint_error
+
+        if last_error is not None:
+            await self._close_rpc_client()
+            self._rpc_failure_streak += 1
+            cooldown_seconds = min(
+                self._rpc_backoff_base_seconds * (2 ** max(0, self._rpc_failure_streak - 1)),
+                self._rpc_backoff_max_seconds,
+            )
+            self._rpc_backoff_until = time.monotonic() + cooldown_seconds
+            now = time.monotonic()
+            # 2026-05-09: every-endpoint failure → re-poll AppSettings.
+            # If the operator just configured an authenticated endpoint
+            # (Ankr/Alchemy/QuickNode) via the SettingsPanel UI, this
+            # is when it takes effect without a backend restart.
+            # Throttled so we don't hammer the DB during a real
+            # all-endpoint outage.
+            if (now - self._rpc_endpoints_db_reload_at) >= self._rpc_endpoints_db_reload_interval_seconds:
+                self._rpc_endpoints_db_reload_at = now
+                prev_primary = self._http_rpc_url
+                try:
+                    await self._load_endpoints_from_db()
+                except Exception as reload_exc:
+                    logger.debug(
+                        "Wallet monitor: AppSettings reload during RPC exhaustion failed; "
+                        "continuing with current endpoint list",
+                        error_type=type(reload_exc).__name__,
+                    )
+                else:
+                    if self._http_rpc_url != prev_primary:
+                        # Picked up a new URL — clear transient evictions
+                        # so the new endpoint gets a clean attempt before
+                        # the old failure-streak shadow is held against it.
+                        self._evicted_rpc_urls_until.clear()
+                        self._rpc_failure_streak = 0
+                        self._rpc_backoff_until = 0.0
+                        logger.info(
+                            "Wallet monitor: picked up new Polygon RPC URL from AppSettings",
+                            primary_rpc_url=_mask_rpc_url(self._http_rpc_url),
+                            failover_order=[_mask_rpc_url(u) for u in self._rpc_urls],
+                        )
+            if (now - self._rpc_last_total_failure_log_at) >= self._rpc_total_failure_log_interval_seconds:
+                self._rpc_last_total_failure_log_at = now
+                # Surface evicted endpoints alongside the active list so the
+                # operator can tell single-endpoint exhaustion ("everything is
+                # evicted, only publicnode remains") from genuine all-endpoint
+                # outage. Without this, the log line ``endpoints=['publicnode']``
+                # is ambiguous and looks like a config bug.
+                logger.error(
+                    "Wallet monitor RPC failed across all endpoints",
+                    method=method,
+                    block=block_hex or None,
+                    endpoints=self._rpc_urls,
+                    evicted_permanent=sorted(self._evicted_rpc_urls),
+                    evicted_transient=sorted(self._evicted_rpc_urls_until),
+                    failure_streak=self._rpc_failure_streak,
+                    cooldown_seconds=round(cooldown_seconds, 2),
+                    error_type=type(last_error).__name__,
+                    error=_exception_text(last_error),
+                )
+            else:
+                logger.debug(
+                    "Wallet monitor RPC all-endpoint failure (suppressed)",
+                    method=method,
+                    block=block_hex or None,
+                    failure_streak=self._rpc_failure_streak,
+                )
+        return None
+
+    # ==================== LOG PROCESSING ====================
+
+    async def _process_log(
+        self,
+        log: dict,
+        block_number: int = 0,
+        block_timestamp: int = 0,
+    ):
+        """Process a single OrderFilled event log.
+
+        Parses the event data, checks if the maker or taker is in our
+        tracked set, and if so, creates a WalletTradeEvent, persists it,
+        and invokes all registered callbacks.
+
+        Args:
+            log: Raw event log dict from eth_getLogs.
+            block_number: The block number this log belongs to.
+            block_timestamp: Unix timestamp of the block.
+        """
+        detected_at = utcnow()
+
+        parsed = _parse_order_filled_log(log)
+        if parsed is None:
+            return
+
+        # Check whether maker or taker is one of our tracked wallets. In
+        # CLOB V2 both legs are real EOAs / proxy wallets — the exchange
+        # contract never appears as ``maker`` or ``taker`` (the V1
+        # third-party-leg anti-pattern is structurally absent), so a
+        # plain set-membership check is sufficient.
+        maker_lower = parsed["maker"].lower()
+        taker_lower = parsed["taker"].lower()
+
+        if maker_lower in self._tracked_sources:
+            matched_wallet = maker_lower
+        elif taker_lower in self._tracked_sources:
+            matched_wallet = taker_lower
+        else:
+            return  # Neither maker nor taker is tracked
+
+        # Determine trade details
+        side, token_id, size, price = _determine_trade_side_and_details(parsed, matched_wallet)
+        if side not in {"BUY", "SELL"} or not token_id or token_id == "0":
+            return
+
+        tx_hash = log.get("transactionHash", "")
+        raw_log_index = log.get("logIndex")
+        log_index = 0
+        if isinstance(raw_log_index, str):
+            try:
+                log_index = int(raw_log_index, 16)
+            except Exception:
+                log_index = 0
+        elif isinstance(raw_log_index, int):
+            log_index = raw_log_index
+
+        # Calculate block timestamp as datetime
+        if block_timestamp > 0:
+            block_dt = utcfromtimestamp(block_timestamp)
+        else:
+            block_dt = detected_at
+
+        # Calculate detection latency
+        latency_ms = (detected_at - block_dt).total_seconds() * 1000.0
+
+        trade_event = WalletTradeEvent(
+            wallet_address=matched_wallet,
+            token_id=token_id,
+            side=side,
+            size=size,
+            price=price,
+            tx_hash=tx_hash,
+            order_hash=str(parsed.get("order_hash") or ""),
+            log_index=int(log_index),
+            block_number=block_number,
+            timestamp=block_dt,
+            detected_at=detected_at,
+            latency_ms=max(latency_ms, 0.0),
+            builder=str(parsed.get("builder") or ("0x" + "0" * 64)),
+            metadata=str(parsed.get("metadata") or ("0x" + "0" * 64)),
+        )
+
+        self._stats["events_detected"] += 1
+        self._stats["last_event_detected_at"] = detected_at.isoformat().replace("+00:00", "Z")
+
+        logger.debug(
+            "Trade detected via WS",
+            wallet=matched_wallet,
+            side=side,
+            token_id=token_id,
+            size=size,
+            price=price,
+            block=block_number,
+            latency_ms=round(latency_ms, 1),
+            tx_hash=tx_hash,
+        )
+
+        # Persist to database
+        await self._persist_event(trade_event)
+
+        # Invoke callbacks
+        await self._emit_callbacks(trade_event)
+
+    # ==================== PERSISTENCE ====================
+
+    async def _persist_event(self, event: WalletTradeEvent):
+        """Save a wallet trade event to the database.
+
+        Args:
+            event: The WalletTradeEvent to persist.
+        """
+        try:
+            async def _write() -> None:
+                async with AsyncSessionLocal() as session:
+                    db_event = WalletMonitorEvent(
+                        id=str(uuid.uuid4()),
+                        wallet_address=event.wallet_address,
+                        token_id=event.token_id,
+                        side=event.side,
+                        size=event.size,
+                        price=event.price,
+                        tx_hash=event.tx_hash,
+                        order_hash=event.order_hash,
+                        log_index=event.log_index,
+                        block_number=event.block_number,
+                        detection_latency_ms=event.latency_ms,
+                        detected_at=event.detected_at,
+                    )
+                    session.add(db_event)
+                    await _commit_with_retry(session)
+
+            await asyncio.shield(_write())
+        except Exception as e:
+            maybe_mark_db_pressure(e, component="wallet_ws_monitor:persist_event", ttl_seconds=45.0)
+            logger.error(
+                "Failed to persist wallet monitor event",
+                error_type=type(e).__name__,
+                error=_exception_text(e),
+                wallet=event.wallet_address,
+                tx_hash=event.tx_hash,
+                exc_info=e,
+            )
+
+    # ==================== CALLBACKS ====================
+
+    async def _emit_callbacks(self, event: WalletTradeEvent):
+        """Invoke all registered callbacks with the trade event.
+
+        Supports both synchronous and asynchronous callbacks.
+
+        Args:
+            event: The WalletTradeEvent to emit.
+        """
+        for callback in self._callbacks:
+            try:
+                result = callback(event)
+                if asyncio.iscoroutine(result):
+                    await result
+            except Exception as e:
+                logger.error(
+                    "Callback error",
+                    error_type=type(e).__name__,
+                    error=_exception_text(e),
+                    callback=getattr(callback, "__name__", str(callback)),
+                )
+
+    # ==================== POLLING FALLBACK ====================
+
+    async def _poll_fallback_loop(self):
+        """Fallback polling loop used when the WebSocket connection is down.
+
+        Polls for the latest block number via HTTP RPC and processes any
+        blocks that were missed since the last processed block. Runs
+        every 2 seconds until the WebSocket reconnects.
+        """
+        logger.warning("Starting fallback HTTP polling")
+        poll_interval = 2  # seconds
+
+        while self._running:
+            try:
+                self._stats["last_fallback_poll_at"] = utcnow().isoformat().replace("+00:00", "Z")
+                self._stats["fallback_polls"] += 1
+                latest_block = await self._get_latest_block_number()
+
+                if latest_block is None:
+                    await asyncio.sleep(poll_interval)
+                    continue
+
+                if self._last_processed_block is None:
+                    # First run in fallback: just process the latest block
+                    await self._handle_block(latest_block)
+                else:
+                    # Process any missed blocks (cap at 10 to avoid overload)
+                    start = self._last_processed_block + 1
+                    end = min(latest_block, start + 9)
+
+                    for block_num in range(start, end + 1):
+                        if not self._running:
+                            break
+                        await self._handle_block(block_num)
+
+            except asyncio.CancelledError:
+                logger.info("Fallback polling cancelled")
+                break
+            except Exception as e:
+                logger.error(
+                    "Fallback polling error",
+                    error_type=type(e).__name__,
+                    error=_exception_text(e),
+                )
+                self._stats["errors"] += 1
+
+            await asyncio.sleep(poll_interval)
+
+    async def _get_latest_block_number(self) -> Optional[int]:
+        """Get the latest block number from the HTTP RPC endpoint.
+
+        Returns:
+            The latest block number, or None if the request fails.
+        """
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "eth_blockNumber",
+            "params": [],
+        }
+
+        result = await self._rpc_request(payload, method="eth_blockNumber")
+        if result is None:
+            return None
+
+        if "error" in result:
+            logger.error(
+                "RPC error getting block number",
+                error=result["error"],
+            )
+            return None
+
+        block_hex = result.get("result")
+        if not isinstance(block_hex, str):
+            logger.warning(
+                "Unexpected eth_blockNumber result shape",
+                result_type=type(block_hex).__name__,
+            )
+            return None
+        try:
+            return int(block_hex, 16)
+        except (TypeError, ValueError) as e:
+            logger.warning(
+                "Failed to parse block number result",
+                raw_value=block_hex,
+                error_type=type(e).__name__,
+                error=_exception_text(e),
+            )
+            return None
+
+    # ==================== STATUS ====================
+
+    def get_status(self) -> dict:
+        """Get current monitor status and statistics.
+
+        Returns:
+            Dict with running state, connection info, tracked wallets,
+            and cumulative statistics.
+        """
+        return {
+            "running": self._running,
+            "ws_connected": self._ws_connection is not None,
+            "ws_url": self._ws_url,
+            "tracked_wallets": len(self._tracked_sources),
+            "tracked_addresses": list(self._tracked_sources.keys()),
+            "tracked_sources": {addr: sorted(list(sources)) for addr, sources in self._tracked_sources.items()},
+            "last_processed_block": self._last_processed_block,
+            "fallback_polling": (self._poll_fallback_task is not None and not self._poll_fallback_task.done()),
+            "stats": dict(self._stats),
+        }
+
+
+# ==================== SINGLETON ====================
+
+wallet_ws_monitor = WalletWebSocketMonitor()

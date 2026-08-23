@@ -1,0 +1,966 @@
+"""Top-level backtest engine: ties book replay, matching, portfolio,
+and the exit_executor's laddered-exit planner into a deterministic
+strategy-fitness simulator.
+
+Inputs
+======
+
+* ``trade_intents``: a chronological list of ``TradeIntent`` records that
+  represent strategy entries (the upstream DETECT + EVALUATE pipeline
+  produces these). Each intent carries (token, side, size, limit price,
+  TIF, post_only, strategy slug, opening trigger).
+* ``strategy``: a ``BaseStrategy`` instance whose ``should_exit`` is
+  invoked on each snapshot for every open position. Strategies that
+  attach an ``ExitPolicy`` (per-decision or via ``exit_policies``) get
+  the laddered/chunked execution path.
+* ``book_replay``: any object with ``iter_snapshots`` returning
+  chronological ``BookSnapshot`` objects (DB or in-memory).
+
+Output
+======
+
+``BacktestResult`` with the equity history, full fill ledger, closed-
+position summary, and ``BacktestMetrics`` (with bootstrap CIs).
+
+Determinism
+===========
+
+Given identical inputs (same intents, same strategy state, same latency
+seed, same book replay), the engine produces identical fills and metrics.
+The matching engine uses an injectable ``LatencyModel`` whose RNG is
+seeded; every other component is pure.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
+from typing import Any, AsyncIterator, Optional, Protocol, Sequence
+
+from services.backtest.book_replay import BookSnapshot
+from services.backtest.latency_model import LatencyModel
+from services.backtest.matching_engine import (
+    BacktestOrder,
+    Fill,
+    FeeModel,
+    ImpactModel,
+    MatchingEngine,
+    OrderState,
+    make_order_id,
+)
+from services.backtest.metrics import (
+    BacktestMetrics,
+    TradeOutcome,
+    compute_metrics,
+)
+from services.backtest.portfolio import Portfolio, PortfolioConfig
+from services.backtest.venue_model import (
+    PolymarketVenue,
+    Venue,
+    TIF_GTC,
+    TIF_IOC,
+)
+from services.backtest.settlement import TokenSettlement
+
+logger = logging.getLogger(__name__)
+
+
+# ── Inputs / outputs ────────────────────────────────────────────────────
+
+
+@dataclass
+class TradeIntent:
+    """An entry signal emitted by the DETECT + EVALUATE pipeline."""
+
+    intent_id: str
+    emitted_at: datetime
+    token_id: str
+    side: str  # BUY (or SELL for shorts on supporting venues)
+    size: float
+    limit_price: float
+    tif: str = TIF_GTC
+    post_only: bool = False
+    strategy_slug: Optional[str] = None
+    trader_id: Optional[str] = None
+    meta: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class BacktestConfig:
+    portfolio: PortfolioConfig = field(default_factory=PortfolioConfig)
+    latency: Optional[LatencyModel] = None
+    fees: Optional[FeeModel] = None
+    venue: Optional[Venue] = None
+    impact: Optional["ImpactModel"] = None
+    final_close_at_last_mid: bool = True  # mark-to-market unclosed positions
+    max_force_exit_attempts: int = 3
+    seed: Optional[int] = 42
+    log_progress_every: int = 0  # 0 = silent
+    fill_model_snapshot: Optional[Any] = None
+    # Fill probability returned when a loaded model can't score an order;
+    # 1.0 = defer to the queue gate (see MatchingEngine).
+    fill_probability_fallback: float = 1.0
+    # Fraction of disappeared book depth attributed to trades (vs cancels)
+    # for FIFO maker-queue advancement; <1.0 avoids over-filling resting
+    # orders (see MatchingEngine.queue_progress_trade_fraction).
+    queue_progress_trade_fraction: float = 1.0
+    fail_on_strategy_error: bool = False
+    # Golden-source settlement map: token_id -> TokenSettlement.  A held
+    # position whose market resolves within the run window settles at the
+    # binary outcome ($1.00 winner / $0.00 loser) at resolution time, not
+    # at the last observed mid.  Populated OFFLINE by the settlement store
+    # (no decision-time look-ahead).  Empty => legacy mark-to-mid behavior.
+    settlements: dict[str, TokenSettlement] = field(default_factory=dict)
+
+
+@dataclass
+class BacktestResult:
+    config: BacktestConfig
+    final_equity_usd: float
+    initial_capital_usd: float
+    metrics: BacktestMetrics
+    closed_position_count: int
+    open_position_count: int
+    total_fills: int
+    rejected_orders: int
+    cancelled_orders: int
+    equity_history: list[tuple[datetime, float]] = field(default_factory=list)
+    fills: list[Fill] = field(default_factory=list)
+    trade_outcomes: list[TradeOutcome] = field(default_factory=list)
+    correlation_matrix: dict[tuple[str, str], float] = field(default_factory=dict)
+    fees_per_fill_usd: float = 0.0
+    fees_resolution_usd: float = 0.0
+    positions_summary: list[dict[str, Any]] = field(default_factory=list)
+    notes: dict[str, Any] = field(default_factory=dict)
+
+
+class _BookSource(Protocol):
+    async def iter_snapshots(self) -> AsyncIterator[BookSnapshot]: ...
+    async def snapshot_at(
+        self, *, token_id: str, ts: datetime
+    ) -> Optional[BookSnapshot]: ...
+
+
+# ── Engine ───────────────────────────────────────────────────────────────
+
+
+class BacktestEngine:
+    """Drives a single backtest run from snapshots and trade intents."""
+
+    def __init__(
+        self,
+        *,
+        config: Optional[BacktestConfig] = None,
+        strategy: Optional[Any] = None,
+    ):
+        self.config = config or BacktestConfig()
+        self.strategy = strategy
+        # Single FeeModel instance is shared between matching engine
+        # (per-fill fees) and portfolio (resolution-time fees) so both
+        # see consistent parameters.
+        fees = self.config.fees or FeeModel()
+        portfolio_config = self.config.portfolio
+        if portfolio_config.fee_model is None:
+            portfolio_config = replace(portfolio_config, fee_model=fees)
+        self.portfolio = Portfolio(portfolio_config)
+        self.matching = MatchingEngine(
+            venue=self.config.venue or PolymarketVenue(),
+            latency=self.config.latency or LatencyModel(seed=self.config.seed),
+            fees=fees,
+            impact=self.config.impact or ImpactModel(),
+            fill_model_snapshot=self.config.fill_model_snapshot,
+            fill_probability_fallback=self.config.fill_probability_fallback,
+            queue_progress_trade_fraction=self.config.queue_progress_trade_fraction,
+        )
+        # Snapshot of the "current best" book per token, used by the
+        # exit-decision hook to feed market_state into should_exit().
+        self._latest_book: dict[str, BookSnapshot] = {}
+        # Order IDs we've already fired ``strategy.on_cancel`` for.
+        # See _advance_one_snapshot step 6 — we scan once per tick for
+        # newly-cancelled orders since the matching engine has multiple
+        # cancel paths and threading a callback through each is brittle.
+        self._cancelled_notified: set[str] = set()
+        # Indexed view of pending intents, keyed by emitted_at, drained
+        # as time advances.
+        self._pending_intents: list[TradeIntent] = []
+        self._intents_drained = 0
+        # Maps (position_key, child_id) → matching engine order_id.
+        self._exit_orders_by_position: dict[tuple, list[str]] = {}
+        # Snapshot count for periodic progress logging.
+        self._snapshots_processed = 0
+        # Time-ordered (resolution_time, token_id) schedule driving the
+        # settlement sweep (see _settle_due).  Built at the start of run().
+        self._resolution_schedule: list[tuple[datetime, str]] = []
+        self._resolution_ptr: int = 0
+        self._settled_position_count: int = 0
+        self._marked_to_mid_count: int = 0
+
+    # ── Public driver ─────────────────────────────────────────────────
+
+    async def run(
+        self,
+        *,
+        book_source: _BookSource,
+        trade_intents: Sequence[TradeIntent],
+        progress_callback: Optional[Any] = None,
+        progress_every: int = 1000,
+    ) -> BacktestResult:
+        """Drive the engine through every snapshot in the replay window.
+
+        Args:
+            book_source: snapshot iterator (BookReplay or BookDeltaReplay).
+            trade_intents: pre-fetched intents to drain by emitted_at.
+            progress_callback: optional ``async def cb(processed, equity, open_count)``
+                fired every ``progress_every`` snapshots.  Used by the
+                worker process to write progress to the job row so the
+                UI can render a live progress bar without polling the
+                full replay state.  Synchronous work is fine; we just
+                ``await`` it to allow async callbacks too.
+            progress_every: cadence of callback invocations + asyncio
+                yield points.  1000 snapshots → ~1-3% progress each tick
+                for typical 30-100k snapshot runs.
+
+        ── Why we yield to the event loop here ─────────────────────────
+        The per-snapshot work below is pure-Python (matching, portfolio
+        marks, exit decisions).  Without explicit yields, the entire
+        backtest hogs the asyncio event loop — the FastAPI server stops
+        responding to ``/health`` and every other endpoint until done.
+        Yielding every ``progress_every`` snapshots gives other
+        coroutines (API handlers, WS callbacks) a chance to run.
+
+        For full crash + GIL isolation, run this method inside the
+        dedicated backtest worker process (services/backtest/job_runner.py).
+        """
+        self._pending_intents = sorted(trade_intents, key=lambda t: t.emitted_at)
+        self._intents_drained = 0
+        self._snapshots_processed = 0
+        progress_every = max(1, int(progress_every))
+
+        # Settlement sweep schedule: a position whose market resolves
+        # mid-window is redeemed at $1/$0 at resolution time (capital
+        # recycles correctly) rather than deferred to run-end.  Only
+        # markets with a KNOWN winner (settle_price set) join the sweep;
+        # resolution-known-but-winner-unknown markets fall through to the
+        # strategy's own is_resolved-aware exit logic.
+        self._resolution_schedule = sorted(
+            (
+                (s.resolution_time, tid)
+                for tid, s in self.config.settlements.items()
+                if s.resolution_time is not None and s.settle_price is not None
+            ),
+            key=lambda x: x[0],
+        )
+        self._resolution_ptr = 0
+
+        async for snapshot in book_source.iter_snapshots():
+            await self._on_snapshot(snapshot)
+            self._snapshots_processed += 1
+            if self._snapshots_processed % progress_every == 0:
+                # Yield to the event loop so the API stays responsive.
+                # asyncio.sleep(0) is the canonical "yield without
+                # waiting" — costs ~50µs per call, fires ~once per 1k
+                # snapshots → negligible overhead at 50ns/snapshot inner
+                # work.
+                await asyncio.sleep(0)
+                if progress_callback is not None:
+                    try:
+                        result = progress_callback(
+                            self._snapshots_processed,
+                            self.portfolio.equity_usd(),
+                            self.portfolio.open_position_count(),
+                        )
+                        # Support both sync + async callbacks.
+                        if hasattr(result, "__await__"):
+                            await result
+                    except Exception as exc:  # never let a callback kill the run
+                        logger.warning("progress_callback raised: %s", exc)
+                if (
+                    self.config.log_progress_every > 0
+                    and self._snapshots_processed % self.config.log_progress_every == 0
+                ):
+                    logger.info(
+                        "backtest progress: %d snapshots, %d open, equity=%.2f",
+                        self._snapshots_processed,
+                        self.portfolio.open_position_count(),
+                        self.portfolio.equity_usd(),
+                    )
+
+        if self.config.final_close_at_last_mid:
+            self._final_mark_to_market()
+
+        return self._build_result()
+
+    # ── Per-snapshot work ─────────────────────────────────────────────
+
+    async def _on_snapshot(self, snapshot: BookSnapshot) -> None:
+        # Redeem any position whose market has resolved at-or-before this
+        # snapshot's time at $1/$0.  Runs BEFORE the fast-path bail and on
+        # every snapshot (O(1) when nothing is due) because a resolved
+        # market stops producing snapshots — settlement must be driven by
+        # the global sim clock, not by the resolved token's own (absent)
+        # ticks.
+        self._settle_due(now=snapshot.observed_at)
+        # ── Fast-path bail ─────────────────────────────────────────────
+        # When the snapshot is for a token with NO pending intents
+        # ready to drain AND NO active orders (PENDING / WORKING /
+        # PARTIAL) AND NO open positions, every step below is a no-op
+        # — but each step still does dict lookups, list iteration, and
+        # set operations that add up.  At 1.5M snapshots × 363 tokens,
+        # ~99% of snapshots are for "uninvolved" tokens at any given
+        # moment.  Skipping them is a 10-50x speedup on the full-
+        # replay path.
+        #
+        # ``has_active_orders_for_token`` covers PENDING (not yet
+        # admitted by the matcher), WORKING (resting on the book), and
+        # PARTIAL (mid-fill).  Terminal states (FILLED, CANCELLED,
+        # REJECTED) don't keep the active-count up.
+        token_id = snapshot.token_id
+        intents_ready_to_drain = (
+            self._intents_drained < len(self._pending_intents)
+            and self._pending_intents[self._intents_drained].emitted_at <= snapshot.observed_at
+        )
+        has_active_orders = self.matching.has_active_orders_for_token(token_id)
+        has_position_for_token = any(
+            key[0] == token_id for key in self.portfolio.positions.keys()
+        )
+        if not (
+            intents_ready_to_drain
+            or has_active_orders
+            or has_position_for_token
+        ):
+            # Still mark the latest book per-token so future point-in-
+            # time queries (snapshot_at) work, but skip everything else.
+            self._latest_book[token_id] = snapshot
+            return
+
+        # 1. Drain any pending intents whose emit time has now passed.
+        while (
+            self._intents_drained < len(self._pending_intents)
+            and self._pending_intents[self._intents_drained].emitted_at <= snapshot.observed_at
+        ):
+            intent = self._pending_intents[self._intents_drained]
+            self._intents_drained += 1
+            self._submit_entry(intent, snapshot)
+
+        # 2. Advance the matching engine — this picks up newly-admitted
+        #    orders and re-evaluates resting orders against the new book.
+        fills = self.matching.advance_to(snapshot)
+
+        # 3. Apply fills to the portfolio (cash + positions update).
+        for fill in fills:
+            order = self.matching.order(fill.order_id)
+            if order is None:
+                continue
+            self.portfolio.apply_fill(fill, strategy_slug=order.strategy_slug)
+            # Fire strategy.on_fill / on_partial_fill notifications so
+            # strategies that update internal state on fills (running
+            # priors, calibration, etc.) see the same hook flow as
+            # live.  Live calls these from position_lifecycle when an
+            # order transitions to ``executed``.  Errors are swallowed
+            # — the hook is informational; a strategy bug shouldn't
+            # crash the backtest.
+            if self.strategy is not None:
+                try:
+                    is_partial = bool(getattr(order, "remaining_size", 0) > 1e-12)
+                    if is_partial and hasattr(self.strategy, "on_partial_fill"):
+                        self.strategy.on_partial_fill(
+                            order,
+                            mode="shadow",
+                            filled_shares=float(fill.size),
+                            remaining_shares=float(getattr(order, "remaining_size", 0) or 0),
+                            average_price=float(fill.price),
+                        )
+                    elif hasattr(self.strategy, "on_fill"):
+                        self.strategy.on_fill(
+                            order,
+                            mode="shadow",
+                            filled_shares=float(fill.size),
+                            average_price=float(fill.price),
+                            notional_usd=float(fill.size) * float(fill.price),
+                            ensemble_snapshot=None,
+                        )
+                except Exception:
+                    if self.config.fail_on_strategy_error:
+                        raise
+
+        # 4. Mark portfolio at the new mid (if available).
+        self._latest_book[snapshot.token_id] = snapshot
+        if snapshot.mid is not None:
+            self.portfolio.mark(
+                token_id=snapshot.token_id,
+                price=float(snapshot.mid),
+                at=snapshot.observed_at,
+            )
+
+        # 5. Run exit decisions on every position currently held in this
+        #    token. We do this *after* applying fills so a position that
+        #    just opened can also have its exit logic evaluated this tick
+        #    if appropriate (matches live behavior).
+        if self.strategy is not None:
+            self._evaluate_exits_for_token(snapshot)
+
+        # 6. Fire strategy.on_cancel for newly-cancelled orders.  The
+        #    matching engine has multiple cancel paths (post_only-
+        #    rejected, IOC-leftover, FOK-failed, GTC-cancel-on-cancel)
+        #    and rather than thread a callback through each we scan
+        #    once per tick for orders that have transitioned to
+        #    CANCELLED and we haven't yet notified about.  Live calls
+        #    on_cancel from position_lifecycle when an order ends up
+        #    cancelled without filling.
+        if self.strategy is not None and hasattr(self.strategy, "on_cancel"):
+            try:
+                for o in self.matching.all_orders():
+                    if o.state != OrderState.CANCELLED:
+                        continue
+                    if o.order_id in self._cancelled_notified:
+                        continue
+                    self._cancelled_notified.add(o.order_id)
+                    unfilled = float(getattr(o, "remaining_size", 0) or 0)
+                    reason = "expired" if getattr(o, "tif", "GTC") in {"IOC", "FAK"} else "user_cancel"
+                    try:
+                        self.strategy.on_cancel(
+                            o,
+                            mode="shadow",
+                            reason=reason,
+                            unfilled_shares=unfilled,
+                        )
+                    except Exception:
+                        if self.config.fail_on_strategy_error:
+                            raise
+            except Exception:
+                if self.config.fail_on_strategy_error:
+                    raise
+
+    def _submit_entry(self, intent: TradeIntent, snapshot: BookSnapshot) -> None:
+        ok, reason = self.portfolio.can_submit(
+            token_id=intent.token_id,
+            side=intent.side,
+            price=intent.limit_price,
+            size=intent.size,
+            strategy_slug=intent.strategy_slug,
+        )
+        if not ok:
+            logger.debug(
+                "entry intent rejected at portfolio gate: %s (intent=%s)",
+                reason,
+                intent.intent_id,
+            )
+            return
+        order = BacktestOrder(
+            order_id=intent.intent_id or make_order_id(),
+            token_id=intent.token_id,
+            side=intent.side,
+            price=float(intent.limit_price),
+            size=float(intent.size),
+            tif=intent.tif,
+            post_only=bool(intent.post_only),
+            submitted_at=intent.emitted_at,
+            trader_id=intent.trader_id,
+            strategy_slug=intent.strategy_slug,
+            meta={"role": "entry", **(intent.meta or {})},
+        )
+        self.matching.submit(order)
+
+    # ── Exit decision + laddered execution ────────────────────────────
+
+    def _evaluate_exits_for_token(self, snapshot: BookSnapshot) -> None:
+        """For each open position whose token matches this snapshot, run
+        ``strategy.should_exit`` and route the resulting decision through
+        the exit-execution path (single order or laddered).
+        """
+        token_id = snapshot.token_id
+        # Collect positions to evaluate (avoid mutating during iteration)
+        targets = [
+            (key, pos)
+            for key, pos in list(self.portfolio.positions.items())
+            if key[0] == token_id and pos.size > 1e-12
+        ]
+        for key, pos in targets:
+            decision = self._call_should_exit(pos, snapshot)
+            if decision is None:
+                continue
+            action = getattr(decision, "action", None)
+            if action == "hold":
+                continue
+            if action == "reduce":
+                fraction = float(getattr(decision, "reduce_fraction", 0.0) or 0.0)
+                if fraction <= 0.0:
+                    continue
+                self._submit_exit_for(
+                    position=pos,
+                    decision=decision,
+                    fraction=min(1.0, fraction),
+                    snapshot=snapshot,
+                )
+                continue
+            if action == "close":
+                self._submit_exit_for(
+                    position=pos,
+                    decision=decision,
+                    fraction=1.0,
+                    snapshot=snapshot,
+                )
+
+    def _call_should_exit(self, pos, snapshot: BookSnapshot) -> Optional[Any]:
+        """Run the strategy's exit hook with a position view + market state."""
+        if self.strategy is None or not hasattr(self.strategy, "should_exit"):
+            return None
+        # Lightweight position view that mirrors what live trading passes.
+        class _BTPosView:
+            pass
+        view = _BTPosView()
+        view.entry_price = pos.entry_price
+        view.current_price = float(snapshot.mid) if snapshot.mid is not None else pos.entry_price
+        view.highest_price = max(pos.entry_price, float(snapshot.mid or pos.entry_price))
+        view.lowest_price = min(pos.entry_price, float(snapshot.mid or pos.entry_price))
+        # Age in minutes since position open
+        if pos.opened_at is not None:
+            view.age_minutes = max(
+                0.0, (snapshot.observed_at - pos.opened_at).total_seconds() / 60.0
+            )
+        else:
+            view.age_minutes = 0.0
+        if pos.entry_price > 0:
+            view.pnl_percent = (
+                (view.current_price - pos.entry_price) / pos.entry_price * 100.0
+            )
+        else:
+            view.pnl_percent = 0.0
+        view.filled_size = pos.size
+        view.notional_usd = pos.size * pos.entry_price
+        view.strategy_context = pos and {} or {}
+        view.config = {}
+        view.outcome_idx = 0
+
+        # Reflect real resolution state so hold-to-resolution strategies
+        # behave correctly: a resolved market is no longer tradable and its
+        # winning outcome is known.  (Markets with a known winner are
+        # redeemed by the settlement sweep before this runs; this path
+        # carries the resolution signal for markets resolved-but-winner-
+        # unknown, where the strategy should stop trading.)
+        settlement = self.config.settlements.get(pos.token_id)
+        resolved = bool(
+            settlement is not None
+            and settlement.resolution_time is not None
+            and snapshot.observed_at >= settlement.resolution_time
+        )
+        market_state = {
+            "current_price": view.current_price,
+            "market_tradable": not resolved,
+            "is_resolved": resolved,
+            "winning_outcome": settlement.winning_outcome if resolved else None,
+            "token_id": pos.token_id,
+        }
+        try:
+            return self.strategy.should_exit(view, market_state)
+        except Exception as exc:
+            if self.config.fail_on_strategy_error:
+                raise
+            logger.warning(
+                "strategy.should_exit raised in backtest: %s", exc, exc_info=exc
+            )
+            return None
+
+    def _submit_exit_for(
+        self,
+        *,
+        position,
+        decision: Any,
+        fraction: float,
+        snapshot: BookSnapshot,
+    ) -> None:
+        """Convert an ExitDecision into one or more BacktestOrders.
+
+        If the decision (or the strategy's ``exit_policies`` map) supplies
+        an ``ExitPolicy``, this delegates to ``exit_executor.plan_children``
+        to produce a laddered child plan that we submit individually.
+        Otherwise we submit a single closing order at the decision price.
+        """
+        target_size = position.size * fraction
+        if target_size <= 0:
+            return
+        close_price = (
+            float(getattr(decision, "close_price", None) or snapshot.mid or position.entry_price)
+        )
+        close_trigger = str(getattr(decision, "reason", "exit") or "exit")
+        # Side that closes the position
+        close_side = "SELL" if position.side == "BUY" else "BUY"
+
+        policy = self._resolve_exit_policy(decision, close_trigger)
+        if policy is None:
+            self._submit_single_exit(
+                position=position,
+                token_id=position.token_id,
+                side=close_side,
+                size=target_size,
+                price=close_price,
+                tif=TIF_IOC,
+                post_only=False,
+                snapshot=snapshot,
+                role="exit",
+            )
+            return
+
+        # Laddered exit — defer to the live planner so the same logic runs
+        # in backtest as in production.
+        from services.trader_orchestrator import exit_executor
+
+        # Exit ladders are intentionally aggressive: their offset_ticks pulls
+        # the inside-most rung past the trigger so each child is marketable
+        # on submit. Default the planner to ``post_only=False`` so children
+        # don't get post-only-crosses-book rejected by the venue model. For
+        # specifically-passive exit policies (e.g., a take-profit limit
+        # waiting for the book to come up), set chunk size and offset_ticks=0
+        # in the policy and use a separate code path with post_only=True.
+        plans = exit_executor.plan_children(
+            target_size=target_size,
+            trigger_price=close_price,
+            side=close_side,
+            policy=policy,
+            tick_size=exit_executor.DEFAULT_TICK_SIZE,
+            default_post_only=False,
+            default_tif=TIF_IOC if close_trigger == "stop_loss" else TIF_GTC,
+        )
+        if not plans:
+            self._submit_single_exit(
+                position=position,
+                token_id=position.token_id,
+                side=close_side,
+                size=target_size,
+                price=close_price,
+                tif=TIF_IOC,
+                post_only=False,
+                snapshot=snapshot,
+                role="exit_fallback",
+            )
+            return
+
+        for plan in plans:
+            self._submit_single_exit(
+                position=position,
+                token_id=position.token_id,
+                side=close_side,
+                size=plan.size,
+                price=plan.price,
+                tif=plan.tif,
+                post_only=plan.post_only,
+                snapshot=snapshot,
+                role="exit_child",
+                child_meta={
+                    "child_index": plan.index,
+                    "bucket": plan.distribution_bucket,
+                },
+            )
+
+    def _resolve_exit_policy(self, decision: Any, close_trigger: str):
+        """Resolve an ExitPolicy from (decision override, strategy map)."""
+        if self.strategy is not None and hasattr(self.strategy, "resolve_exit_policy"):
+            try:
+                return self.strategy.resolve_exit_policy(decision, close_trigger)
+            except Exception:
+                if self.config.fail_on_strategy_error:
+                    raise
+                return None
+        # Fallback: just look at the decision-level field.
+        return getattr(decision, "exit_policy", None)
+
+    def _submit_single_exit(
+        self,
+        *,
+        position,
+        token_id: str,
+        side: str,
+        size: float,
+        price: float,
+        tif: str,
+        post_only: bool,
+        snapshot: BookSnapshot,
+        role: str,
+        child_meta: Optional[dict[str, Any]] = None,
+    ) -> None:
+        order = BacktestOrder(
+            order_id=make_order_id(),
+            token_id=token_id,
+            side=side,
+            price=float(price),
+            size=float(size),
+            tif=tif,
+            post_only=post_only,
+            submitted_at=snapshot.observed_at,
+            trader_id=None,
+            strategy_slug=position.strategy_slug,
+            meta={"role": role, "exit_for_position": position.side, **(child_meta or {})},
+        )
+        self.matching.submit(order)
+
+    # ── Finalization ──────────────────────────────────────────────────
+
+    def _close_position_at(
+        self,
+        key,
+        pos,
+        *,
+        price: float,
+        at: datetime,
+        is_settlement: bool,
+        notes: Optional[dict[str, Any]] = None,
+    ) -> None:
+        """Close a position with a synthetic fill at ``price`` and apply the
+        resolution fee on any realized gain.
+
+        Single shared close path for both the mid-run settlement sweep
+        (:meth:`_settle_due`) and the final mark-to-market, so the close +
+        fee accounting lives in exactly one place.
+        """
+        fee_model = self.portfolio.config.fee_model
+        synthetic_fill = Fill(
+            order_id=f"{'settle' if is_settlement else 'final_mtm'}_{key[0]}",
+            token_id=pos.token_id,
+            side=("SELL" if pos.side == "BUY" else "BUY"),
+            price=float(price),
+            size=pos.size,
+            fee_usd=0.0,
+            occurred_at=at,
+            fill_index=0,
+            notes=notes or {},
+        )
+        prior_realized = pos.realized_pnl_usd
+        pos.apply_close_fill(synthetic_fill)
+        self.portfolio._on_cash_change_from_close(pos, synthetic_fill)
+        if fee_model is not None:
+            gained = pos.realized_pnl_usd - prior_realized
+            if gained > 0:
+                res_fee = fee_model.resolution_fee(gross_winnings_usd=gained)
+                if res_fee > 0:
+                    pos.fees_paid_usd += res_fee
+                    pos.realized_pnl_usd -= res_fee
+                    self.portfolio.cash_usd -= res_fee
+                    self.portfolio._resolution_fees_paid_usd += res_fee
+        self.portfolio.closed_positions.append(pos)
+        del self.portfolio.positions[key]
+
+    def _settle_due(self, *, now: datetime) -> None:
+        """Redeem open positions whose market has resolved at-or-before
+        ``now`` at the binary outcome ($1/$0).
+
+        Advances a time-ordered pointer so total work across the run is
+        O(#resolutions); the common case (nothing due this snapshot) is a
+        single comparison.
+        """
+        sched = self._resolution_schedule
+        while self._resolution_ptr < len(sched) and sched[self._resolution_ptr][0] <= now:
+            _, token_id = sched[self._resolution_ptr]
+            self._resolution_ptr += 1
+            settlement = self.config.settlements.get(token_id)
+            if settlement is None or settlement.settle_price is None:
+                continue
+            for key, pos in list(self.portfolio.positions.items()):
+                if key[0] != token_id or pos.size <= 1e-12:
+                    continue
+                self._close_position_at(
+                    key,
+                    pos,
+                    price=float(settlement.settle_price),
+                    at=settlement.resolution_time or now,
+                    is_settlement=True,
+                    notes={
+                        "settlement": True,
+                        "winning_outcome": settlement.winning_outcome,
+                        "settle_price": float(settlement.settle_price),
+                        "source": settlement.source,
+                    },
+                )
+                self._settled_position_count += 1
+
+    def _final_mark_to_market(self) -> None:
+        """Close positions still open at run end.
+
+        A position whose market RESOLVED within the run window settles at
+        the binary outcome ($1/$0); a position whose market is still
+        unresolved at window end is marked to the last observed mid — an
+        honest mark-to-market, explicitly flagged as NOT a settlement.  The
+        mid-run sweep (:meth:`_settle_due`) has already redeemed positions
+        that resolved before run end, so this handles the remainder: markets
+        still open at window end, and resolved markets whose position opened
+        after the sweep pointer had already advanced past resolution.
+        """
+        run_end = self.matching.now
+        for key, pos in list(self.portfolio.positions.items()):
+            if pos.size <= 1e-12:
+                continue
+            settlement = self.config.settlements.get(pos.token_id)
+            resolved_in_window = bool(
+                settlement is not None
+                and settlement.settle_price is not None
+                and settlement.resolution_time is not None
+                and run_end is not None
+                and run_end >= settlement.resolution_time
+            )
+            if resolved_in_window:
+                self._close_position_at(
+                    key,
+                    pos,
+                    price=float(settlement.settle_price),
+                    at=settlement.resolution_time or run_end,
+                    is_settlement=True,
+                    notes={
+                        "settlement": True,
+                        "winning_outcome": settlement.winning_outcome,
+                        "settle_price": float(settlement.settle_price),
+                        "source": settlement.source,
+                    },
+                )
+                self._settled_position_count += 1
+            else:
+                mark = pos.last_mark_price or pos.entry_price
+                close_at = (
+                    pos.last_mark_at
+                    or pos.opened_at
+                    or run_end
+                    or datetime.now(timezone.utc)
+                )
+                self._close_position_at(
+                    key,
+                    pos,
+                    price=float(mark),
+                    at=close_at,
+                    is_settlement=False,
+                    notes={"final_mark_to_market": True, "settlement_status": "unsettled"},
+                )
+                self._marked_to_mid_count += 1
+
+        # Anchor the equity curve at the post-close-out value so the
+        # displayed final equity matches ``portfolio.equity_usd()`` (the
+        # source of ``total_return_pct``). Without this anchor, callers
+        # that read ``equity_history[-1]`` see the mark just BEFORE the
+        # synthetic close-out — which can differ from the true final
+        # equity by held-position unrealized PnL + resolution fees,
+        # producing a chart that disagrees with the headline return.
+        # Use the latest mark timestamp we've seen; fall back to the
+        # last history entry's timestamp or now if neither exists.
+        anchor_at: datetime | None = None
+        if self.portfolio.equity_history:
+            anchor_at = self.portfolio.equity_history[-1][0]
+        for pos in reversed(self.portfolio.closed_positions):
+            if pos.closed_at is not None:
+                if anchor_at is None or pos.closed_at >= anchor_at:
+                    anchor_at = pos.closed_at
+                break
+        if anchor_at is None:
+            anchor_at = datetime.now(timezone.utc)
+        self.portfolio.equity_history.append(
+            (anchor_at, self.portfolio.equity_usd())
+        )
+        self.portfolio.cash_history.append(
+            (anchor_at, self.portfolio.cash_usd)
+        )
+
+    def _build_result(self) -> BacktestResult:
+        all_fills = self.matching.all_fills()
+        rejected = sum(
+            1 for o in self.matching.all_orders() if o.state == OrderState.REJECTED
+        )
+        cancelled = sum(
+            1 for o in self.matching.all_orders() if o.state == OrderState.CANCELLED
+        )
+        # Build per-trade outcome list from closed positions
+        outcomes: list[TradeOutcome] = []
+        for pos in self.portfolio.closed_positions:
+            entry_notional = max(0.0, pos.entry_price * (pos.size + pos.realized_pnl_usd / max(0.0001, pos.entry_price)))
+            # Use cost basis at open as the denominator for return %
+            denom = pos.cost_basis_usd + pos.realized_pnl_usd if pos.cost_basis_usd > 0 else max(1e-9, entry_notional)
+            return_pct = (pos.realized_pnl_usd / denom) * 100.0 if denom > 0 else 0.0
+            holding_s = 0.0
+            if pos.opened_at and pos.closed_at:
+                holding_s = max(0.0, (pos.closed_at - pos.opened_at).total_seconds())
+            outcomes.append(
+                TradeOutcome(
+                    pnl_usd=pos.realized_pnl_usd,
+                    return_pct=return_pct,
+                    holding_seconds=holding_s,
+                    won=pos.realized_pnl_usd > 0,
+                )
+            )
+
+        metrics = compute_metrics(
+            initial_capital_usd=self.config.portfolio.initial_capital_usd,
+            final_equity_usd=self.portfolio.equity_usd(),
+            equity_history=self.portfolio.equity_history,
+            trades=outcomes,
+            fees_paid_usd=self.portfolio.fees_paid_usd(),
+            seed=self.config.seed,
+        )
+
+        # Build a lightweight per-position summary suitable for the
+        # outcome-netting + capital-lockup analysis.  Each entry has
+        # enough fields for the resolver to group by parent market and
+        # measure how long capital was tied up.
+        positions_summary: list[dict[str, Any]] = []
+        for pos in list(self.portfolio.closed_positions) + list(self.portfolio.positions.values()):
+            positions_summary.append(
+                {
+                    "token_id": pos.token_id,
+                    "side": pos.side,
+                    "strategy_slug": pos.strategy_slug,
+                    "size": float(pos.size),
+                    "entry_price": float(pos.entry_price),
+                    "cost_basis_usd": float(pos.cost_basis_usd),
+                    "realized_pnl_usd": float(pos.realized_pnl_usd),
+                    "fees_paid_usd": float(pos.fees_paid_usd),
+                    "fill_count": int(pos.fill_count),
+                    "opened_at": pos.opened_at.isoformat() if pos.opened_at else None,
+                    "closed_at": pos.closed_at.isoformat() if pos.closed_at else None,
+                    "is_open": pos.closed_at is None and pos.size > 1e-12,
+                }
+            )
+
+        return BacktestResult(
+            config=self.config,
+            final_equity_usd=self.portfolio.equity_usd(),
+            initial_capital_usd=self.config.portfolio.initial_capital_usd,
+            metrics=metrics,
+            closed_position_count=self.portfolio.closed_position_count(),
+            open_position_count=self.portfolio.open_position_count(),
+            total_fills=len(all_fills),
+            rejected_orders=rejected,
+            cancelled_orders=cancelled,
+            equity_history=list(self.portfolio.equity_history),
+            fills=all_fills,
+            trade_outcomes=outcomes,
+            correlation_matrix=self.portfolio.correlation_matrix(),
+            fees_per_fill_usd=self.portfolio.per_fill_fees_paid_usd(),
+            fees_resolution_usd=self.portfolio.resolution_fees_paid_usd,
+            positions_summary=positions_summary,
+            notes={
+                "snapshots_processed": self._snapshots_processed,
+                "settlement": {
+                    "settled_positions": self._settled_position_count,
+                    "marked_to_mid_positions": self._marked_to_mid_count,
+                    "settlements_available": len(self.config.settlements),
+                },
+                "fill_probability_model": (
+                    {
+                        "family": getattr(self.config.fill_model_snapshot, "family", None),
+                        "strata_key": getattr(self.config.fill_model_snapshot, "strata_key", None),
+                        "n_events": getattr(self.config.fill_model_snapshot, "n_events", None),
+                        "concordance_index": getattr(
+                            self.config.fill_model_snapshot,
+                            "concordance_index",
+                            None,
+                        ),
+                    }
+                    if self.config.fill_model_snapshot is not None
+                    else None
+                ),
+            },
+        )
+
+
+__all__ = [
+    "TradeIntent",
+    "BacktestConfig",
+    "BacktestResult",
+    "BacktestEngine",
+]

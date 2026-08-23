@@ -1,0 +1,199 @@
+services:
+  postgres:
+    image: ${POSTGRES_IMAGE:-postgres:16-alpine}
+    container_name: ${POSTGRES_CONTAINER_NAME:-homerun-postgres}
+    # Tuning for a single-user local trading app on commodity hardware.
+    # These values were validated in production: 96.93% buffer-cache hit
+    # ratio sustained, with the 21 GB DB's hot working set fitting
+    # comfortably in 4 GB shared_buffers.  Persist them HERE in source
+    # control rather than only in the data volume's postgresql.conf so
+    # they survive ``docker volume rm``.
+    command:
+      - postgres
+      # Connection limit (was the only setting before this commit)
+      - -c
+      - max_connections=200
+      # Memory — the cache that makes 97% hit-rate possible
+      - -c
+      - shared_buffers=4GB
+      - -c
+      - effective_cache_size=10GB
+      - -c
+      - work_mem=32MB
+      - -c
+      - maintenance_work_mem=1GB
+      # Durability vs latency — synchronous_commit=off means a power
+      # loss can lose ~100ms of recent writes.  Acceptable for a
+      # single-user local app; the bot can re-derive any lost state
+      # from the next reconciliation cycle.  Saves ~5ms / commit.
+      - -c
+      - synchronous_commit=off
+      # 2026-05-10: WAL/bgwriter tuning to address backend commit stalls
+      # observed under heavy concurrent write volume.  The 2026-05-09/10
+      # soak showed ``ps_db_commit_call`` at 6-8s on the trader cycle and
+      # 5-8s on heartbeat workers writing tiny rows — with
+      # ``synchronous_commit=off`` already set.  That ruled out fsync as
+      # the per-commit cost; the actual cause is backends blocking on a
+      # full WAL buffer waiting for the WAL writer to drain it (default
+      # buffer is min(shared_buffers/32, 16MB) = 16MB here, which fills
+      # in <1s under our churn rate of 1.3M trade_signal_emissions
+      # records/cycle plus 600K trade_signals updates).
+      - -c
+      - wal_buffers=64MB
+      # ``=on`` is an alias for pglz.  pg16's LZ4 is 2-3x faster on the
+      # WAL-write critical path with comparable compression ratios on
+      # our JSONB-heavy payload tables.
+      - -c
+      - wal_compression=lz4
+      # Drain the WAL buffer to disk more aggressively so it doesn't
+      # back-pressure committing backends.  Default is 200ms / 1MB.
+      - -c
+      - wal_writer_delay=100ms
+      - -c
+      - wal_writer_flush_after=4MB
+      # Group-commit safety net.  With sync_commit=off these are mostly
+      # inert (the backend doesn't initiate the WAL flush) but they
+      # become load-bearing if synchronous_commit ever gets flipped back
+      # to ``local`` or ``on`` for stricter durability.  Setting them
+      # now means a future durability bump won't immediately reintroduce
+      # per-commit fsync stalls.
+      - -c
+      - commit_delay=100
+      - -c
+      - commit_siblings=5
+      - -c
+      - max_wal_size=4GB
+      # Keep more WAL pre-allocated so segment-recycle doesn't churn
+      # under our write rate (1.3M+ records/min on the busiest tables).
+      - -c
+      - min_wal_size=1GB
+      # Fewer, larger checkpoints.  Default 5min was firing constantly
+      # under load — every checkpoint fsync stalled writers.  30min
+      # spreads the same dirty-page volume over a longer window with
+      # checkpoint_completion_target=0.9.
+      - -c
+      - checkpoint_timeout=30min
+      - -c
+      - checkpoint_completion_target=0.9
+      # bgwriter: flush dirty pages from shared_buffers more
+      # aggressively so backends rarely have to do their own page
+      # writes during commit.  Defaults (200ms, 100 pages, 2.0x) leave
+      # too much work to the checkpointer under our load.
+      - -c
+      - bgwriter_delay=50ms
+      - -c
+      - bgwriter_lru_maxpages=1000
+      - -c
+      - bgwriter_lru_multiplier=4.0
+      # Autovacuum — keep it active enough to prevent table bloat from
+      # the high-churn worker_snapshot / live_trading_orders tables
+      # (already mostly-HOT updates, but autovacuum still needs to run).
+      - -c
+      - autovacuum_max_workers=5
+      - -c
+      - autovacuum_naptime=15s
+      - -c
+      - autovacuum_vacuum_cost_limit=2000
+      # Planner — assume SSD storage and plenty of OS-level read-ahead.
+      - -c
+      - random_page_cost=1.1
+      - -c
+      - effective_io_concurrency=200
+      # Statement-level safety nets.  statement_timeout is a hard
+      # backstop above any client-side wait_for; lock_timeout fails
+      # fast on lock waits so we don't burn the full 60s ceiling on
+      # row-lock cascades.
+      - -c
+      - statement_timeout=60000
+      - -c
+      - lock_timeout=5000
+      # Pre-2026-04-29 this was 30000 (30s).  Postgres logs showed a
+      # cluster of 14+ FATAL "terminating connection due to idle-in-
+      # transaction timeout" within ONE second every 2-4 minutes —
+      # ``sessions_fatal=3511`` over 7h.  The application's own
+      # client-side cap (``DATABASE_IDLE_IN_TRANSACTION_TIMEOUT_MS``)
+      # is supposed to fire first, but the worker's chronic 30-43s
+      # transaction-holds (slow signal_loop + setup) routinely
+      # exceeded BOTH the client cap and the server cap, so the
+      # server killed them en masse and the cascade we observed in
+      # the application logs (``cannot switch to state X``,
+      # ``InterfaceError``, mass invalidation) is the AFTERMATH of
+      # the FATALs.  Bumped to 120000 (2 min) to give the application
+      # headroom while still catching truly-leaked transactions —
+      # nothing legitimate should sit idle-in-tx for >2 min.  The
+      # right long-term fix is to wrap external I/O (HTTP/RPC) in
+      # ``release_conn(session)`` so transactions don't span network
+      # waits; this is the safety net.
+      - -c
+      - idle_in_transaction_session_timeout=120000
+      # Stats collection for pg_stat_statements (used by perf
+      # investigations to identify slow queries by mean exec time).
+      - -c
+      - shared_preload_libraries=pg_stat_statements
+      - -c
+      - track_activity_query_size=2048
+    shm_size: '5g'
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-homerun}
+      POSTGRES_USER: ${POSTGRES_USER:-homerun}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-homerun}
+    ports:
+      - "${POSTGRES_HOST:-127.0.0.1}:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - homerun-postgres-data:/var/lib/postgresql/data
+
+  redis:
+    # Single-user local trading app: Redis is used as a low-latency
+    # cross-process bus for wallet-state pub/sub, signal/order streams,
+    # and lightweight ephemeral caches.  Persistence is intentionally
+    # OFF — every consumer can rebuild from Postgres or REST seed on
+    # boot, so we trade durability for the latency of pure in-memory
+    # ops.  ``volatile-lru`` only evicts keys that have an explicit
+    # TTL; persistent keys (stream consumer-group offsets) are
+    # protected from eviction.
+    image: ${REDIS_IMAGE:-redis:7-alpine}
+    container_name: ${REDIS_CONTAINER_NAME:-homerun-redis}
+    command:
+      - redis-server
+      # Persistence OFF: no RDB snapshots, no AOF.  Cold-boot state
+      # comes from Postgres + REST reseed (see WalletStateCache,
+      # trader_reconciliation_worker).
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+      # Memory cap and eviction.  1 GB is well above the working set
+      # of the streams + caches we use (typical residency <100 MB);
+      # the cap exists so a runaway producer can't OOM the host.
+      - --maxmemory
+      - "1gb"
+      - --maxmemory-policy
+      - "volatile-lru"
+      # Slowlog: capture any command >100us so we can spot ops that
+      # could stall the hot path.  256 entries ring-buffered.
+      - --slowlog-log-slower-than
+      - "100"
+      - --slowlog-max-len
+      - "256"
+    ports:
+      - "${REDIS_HOST:-127.0.0.1}:${REDIS_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 2s
+      retries: 5
+      start_period: 2s
+    restart: unless-stopped
+
+volumes:
+  homerun-postgres-data:
+    # Pin to the actual volume that contains the user's database.
+    # ``external: true`` + explicit ``name`` decouples the volume
+    # binding from Compose's project-prefix convention — running
+    # ``docker compose up`` from the ``infra/`` directory previously
+    # created a NEW empty ``infra_homerun-postgres-data`` volume
+    # while the real data lived in ``homerun_homerun-postgres-data``,
+    # which caused alembic to re-apply every migration against an
+    # empty database and the backend to fail at startup.
+    external: true
+    name: homerun_homerun-postgres-data

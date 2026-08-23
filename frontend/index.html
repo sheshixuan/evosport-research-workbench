@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Homerun</title>
+    <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>$</text></svg>" />
+  </head>
+  <body>
+    <script>
+      try {
+        var storedTheme = JSON.parse(localStorage.getItem('theme'));
+        var systemTheme = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+        var theme = storedTheme === 'light' || storedTheme === 'dark' ? storedTheme : systemTheme;
+        var root = document.documentElement;
+        root.classList.add(theme === 'light' ? 'theme-light' : 'theme-dark');
+        root.classList.toggle('dark', theme === 'dark');
+        root.style.colorScheme = theme;
+      } catch (e) {
+        var fallbackTheme = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+        var fallbackRoot = document.documentElement;
+        fallbackRoot.classList.add(fallbackTheme === 'light' ? 'theme-light' : 'theme-dark');
+        fallbackRoot.classList.toggle('dark', fallbackTheme === 'dark');
+        fallbackRoot.style.colorScheme = fallbackTheme;
+      }
+    </script>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
